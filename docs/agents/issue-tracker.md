@@ -40,11 +40,13 @@ steps in `$to-spec` and `$to-tickets`. An approved specification is not delivery
 permission. Apply `ready-for-agent` only to approved delivery work whose blockers
 are complete; planning tickets do not receive it.
 
-A capability is the specification issue itself, labelled `workflow:capability`.
+For new work, the capability is the specification issue itself, labelled
+`workflow:capability`.
 Start its body with `## Summary` containing a short brief, then `## Source map`
 with a named issue link, or `None (standalone)` when no map produced it. Preserve
 the remaining `$to-spec` sections. A map may produce several capabilities;
-decision tickets remain children of their map.
+decision tickets remain children of their map. For adopted capabilities with
+separate specifications, follow Existing repositories below.
 
 Delivery tickets carry `workflow:ticket` and are native sub-issues of their
 capability. Preserve the `$to-tickets` template and its parent link; the native
@@ -60,8 +62,10 @@ returning to ongoing work reuses its current thread.
 
 Each director takes on at most 10 distinct delivery tickets. Count a ticket when
 it enters the batch, including attempts that later fail or become blocked.
-Retries and reviews of a ticket already in the batch use the same slot. Re-read
-live readiness before claiming or dispatching work.
+Retries and reviews of a ticket already in the batch use the same slot. In an
+adopted slice/task hierarchy, count the delivery slice once; its smaller tasks
+remain within that unit. Containers and decision maps do not consume delivery
+slots. Re-read live readiness before claiming or dispatching work.
 
 Before taking on another batch, stop admissions and settle or explicitly stop
 the current workers and reviewers. Retain a handoff in durable workflow history
@@ -140,15 +144,50 @@ waiting and interrupted work can still have an open issue. A finished turn does
 not resolve the issue. Preserve old evidence when reopening work; an old
 resolution does not satisfy the reopened prerequisite.
 
+Check explicit prerequisites beyond native blockers, including human preparation,
+resource availability and alternatives such as "A or B". Preserve the source of
+each condition and record how it was satisfied in reassessment evidence. Hold
+the affected action when a condition is unmet or unclear; show what needs review.
+Keep references and queue order separate from dependencies. Human-in-the-loop
+planning is intentional work, not itself an unmet prerequisite.
+
 ## Existing repositories
 
-Offer a proposed classification and linking plan for owner confirmation before
-adopting existing issues into this workflow. Keep missing metadata visible for
-correction. After adoption, use the agreed conventions for new issues; titles
-remain display names rather than machine identity.
+Adopt a selected branch from an issue link or discovered root. Preview its
+existing graph, proposed classifications and exact tracker changes for owner
+review. Let the owner correct or exclude candidates before applying changes.
+Preserve issue IDs, names, existing labels and useful hierarchy; add the
+canonical workflow metadata needed for the selected work. Classification,
+adoption and readiness are separate: adoption does not approve or start work.
+
+Recognize roles from repository conventions and issue evidence. A label or tree
+depth alone may be ambiguous. Keep initiative and wave issues as containers;
+they organize work rather than receiving implementation actions. A capability
+can contain delivery slices and a decision map, with smaller tasks beneath its
+slices. Only approved delivery tickets enter its director's batch. Keep native
+parents, blockers, source links and supersession references distinct. Confirm
+parent changes explicitly; body mentions alone do not establish ownership.
+
+An adopted capability may retain a separate specification as a linked source.
+Keep the capability's own scope and approval records explicit, including the
+approved content. Approval of a broader source specification does not approve
+every capability or its delivery breakdown. Show missing or uncertain source-map
+metadata for correction. Use the in-issue specification convention for new work.
+
+Re-read affected issues before applying the reviewed changes. Retain a record
+of actual changes and partial failures. A reviewed undo restores only changes
+made by adoption, after checking for subsequent edits, and preserves history.
+Unselected work remains readable context; verify relevant prerequisites beyond
+the adopted branch. Surface conflicts with repository execution policy during
+preflight rather than importing historical director settings automatically.
 
 Do not infer an approval or resolution when adding labels or relationships.
-Adoption may add record markers to existing comments only when their content
-already supplies the required facts; otherwise show the missing evidence.
+Review legacy evidence as needed for the requested next action. Propose a
+normalized record with source links only when the evidence supplies the required
+facts; otherwise show what is missing. Preserve partial approvals and later
+supersession. An agent's assertion alone does not establish owner approval.
+Use live issue state for current progress, with evidence verification separate;
+retain old checklists and comments as history. A rejected prototype can resolve
+its decision, while a superseded delivery slice is not successful delivery.
 
 **PRs as a request surface: no.**

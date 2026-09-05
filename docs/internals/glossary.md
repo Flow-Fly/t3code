@@ -48,15 +48,17 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 
 ## Workflow planning
 
-| Term              | Meaning                                                                                             |
-| ----------------- | --------------------------------------------------------------------------------------------------- |
-| Wayfinder map     | An effort's destination, decision index, remaining unknowns and scope boundaries.                   |
-| Decision ticket   | A question whose resolution records a decision rather than delivering code.                         |
-| Decision frontier | A map's unclaimed, open decision tickets with satisfied dependencies and no pending reassessment.   |
-| Capability        | A coherent piece of functionality described by one specification and delivered through its tickets. |
-| Workflow director | An agent that coordinates a capability's delivery tickets and independent review.                   |
-| Director batch    | The distinct delivery tickets taken on by one director before handing over to a successor.          |
-| Delivery ticket   | A bounded piece of implementation work with acceptance criteria and explicit blockers.              |
-| Workflow approval | The owner's acceptance of a specific specification or ticket breakdown.                             |
-| Resolution record | An outcome and supporting evidence for a decision, delivery ticket or capability.                   |
-| Reassessment      | Review of affected work after its scope or prerequisites change or their completion is unverified.  |
+| Term              | Meaning                                                                                                  |
+| ----------------- | -------------------------------------------------------------------------------------------------------- |
+| Wayfinder map     | An effort's destination, decision index, remaining unknowns and scope boundaries.                        |
+| Container         | A grouping issue, such as an initiative or wave, that organizes maps and capabilities.                   |
+| Decision ticket   | A question whose resolution records a decision rather than delivering code.                              |
+| Decision frontier | A map's unclaimed, open decision tickets with satisfied dependencies and no pending reassessment.        |
+| Capability        | A coherent piece of functionality described by one specification and delivered through its tickets.      |
+| Workflow director | An agent that coordinates a capability's delivery tickets and independent review.                        |
+| Director batch    | The distinct delivery tickets taken on by one director before handing over to a successor.               |
+| Delivery ticket   | A bounded implementation slice with acceptance criteria and prerequisites; it may contain smaller tasks. |
+| Adoption          | Owner-reviewed classification and linking of existing work into the workflow.                            |
+| Workflow approval | The owner's acceptance of a specific specification or ticket breakdown.                                  |
+| Resolution record | An outcome and supporting evidence for a decision, delivery ticket or capability.                        |
+| Reassessment      | Review of affected work after its scope or prerequisites change or their completion is unverified.       |
