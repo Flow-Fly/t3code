@@ -143,6 +143,7 @@ function prerequisiteConditions(body: string): ReadonlyArray<string> {
 function recordDeclarationLines(body: string): ReadonlyArray<string> {
   const lines: string[] = [];
   let fence: { character: string; length: number } | null = null;
+  let quotedParagraph = false;
   for (const line of body.split("\n")) {
     const fenceMatch = /^\s*(`{3,}|~{3,})/u.exec(line)?.[1];
     if (fenceMatch) {
@@ -151,7 +152,16 @@ function recordDeclarationLines(body: string): ReadonlyArray<string> {
       else if (fence.character === character && fenceMatch.length >= fence.length) fence = null;
       continue;
     }
-    if (fence || /^(?:\s*>| {4}|\t|\s*["'])/u.test(line)) continue;
+    if (fence) continue;
+    const quotedLine = /^\s*>\s?(.*)$/u.exec(line);
+    if (quotedLine) {
+      quotedParagraph = Boolean(quotedLine[1]?.trim());
+      continue;
+    }
+    const paragraphBoundary = !line.trim() || /^ {0,3}#{1,6}(?:[ \t]+|$)/u.test(line);
+    if (quotedParagraph && !paragraphBoundary) continue;
+    if (paragraphBoundary) quotedParagraph = false;
+    if (/^(?: {4}|\t|\s*["'])/u.test(line)) continue;
     lines.push(line);
   }
   return lines;
@@ -294,7 +304,9 @@ function markSuperseded(
   const superseded = new Set<string>();
   const commentsById = new Map(comments.map((comment) => [comment.id, comment]));
   for (const supersedingRecord of records) {
-    if (supersedingRecord.state !== "current") continue;
+    if (supersedingRecord.state !== "current" || supersedingRecord.sourceAccess === "unavailable") {
+      continue;
+    }
     const comment = commentsById.get(supersedingRecord.id);
     if (!comment) continue;
     const targets = new Set(
@@ -383,7 +395,7 @@ function closedReadiness(
       ],
     };
   }
-  const outcome = current.findLast((record) => record.outcome)?.outcome;
+  const outcome = current.findLast((record) => record.sourceAccess !== "unavailable")?.outcome;
   if (outcome === "out-of-scope") {
     return {
       status: "out-of-scope",

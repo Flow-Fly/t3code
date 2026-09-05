@@ -18,17 +18,26 @@ function comment(input: { id: string; body: string; createdAt?: string }): Workf
 }
 
 function resolution(id: string, evidence: string, createdAt?: string): WorkflowEvidenceComment {
+  return resolutionWithOutcome({ id, evidence, ...(createdAt ? { createdAt } : {}) });
+}
+
+function resolutionWithOutcome(input: {
+  id: string;
+  evidence: string;
+  outcome?: "resolved" | "cancelled" | "out-of-scope";
+  createdAt?: string;
+}): WorkflowEvidenceComment {
   return comment({
-    id,
-    ...(createdAt ? { createdAt } : {}),
+    id: input.id,
+    ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     body: [
       "## Resolution",
       "<!-- t3-workflow:v1 resolution -->",
-      "Outcome: resolved",
+      `Outcome: ${input.outcome ?? "resolved"}`,
       "### Summary",
       "The work was completed.",
       "### Evidence",
-      evidence,
+      input.evidence,
     ].join("\n"),
   });
 }
@@ -331,5 +340,157 @@ describe("interpretWorkflowEvidence", () => {
       ["fenced-original", "current"],
       ["fenced-newer", "current"],
     ]);
+  });
+
+  it("ignores a supersession declaration in a lazy blockquote continuation", () => {
+    const original = resolution(
+      "quoted-original",
+      "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+    );
+    const newer = resolution(
+      "quoted-newer",
+      [
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/def)",
+        "> Historical example:",
+        `Supersedes: ${original.url}`,
+      ].join("\n"),
+      "2026-09-06T00:00:00Z",
+    );
+    const result = interpretWorkflowEvidence({
+      issue: issue({
+        state: "closed",
+        stateReason: "completed",
+        comments: [original, newer],
+      }),
+    });
+
+    expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+      ["quoted-original", "current"],
+      ["quoted-newer", "current"],
+    ]);
+  });
+
+  it("accepts a supersession declaration after a heading ends a blockquote paragraph", () => {
+    const original = resolution(
+      "quote-boundary-original",
+      "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+    );
+    const newer = resolution(
+      "quote-boundary-newer",
+      [
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/def)",
+        "> Historical example only.",
+        "### Record metadata",
+        `Supersedes: ${original.url}`,
+      ].join("\n"),
+      "2026-09-06T00:00:00Z",
+    );
+    const result = interpretWorkflowEvidence({
+      issue: issue({
+        state: "closed",
+        stateReason: "completed",
+        comments: [original, newer],
+      }),
+    });
+
+    expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+      ["quote-boundary-original", "superseded"],
+      ["quote-boundary-newer", "current"],
+    ]);
+  });
+
+  it.each(["cancelled", "out-of-scope"] as const)(
+    "does not accept unavailable %s evidence as an outcome",
+    (outcome) => {
+      const unavailable = resolutionWithOutcome({
+        id: `unavailable-${outcome}`,
+        outcome,
+        evidence: "Evidence unavailable: [proof](https://github.com/Flow-Fly/t3code/commit/abc)",
+      });
+      const result = interpretWorkflowEvidence({
+        issue: issue({
+          state: "closed",
+          stateReason: "completed",
+          comments: [unavailable],
+        }),
+      });
+
+      expect(result.readiness.status).toBe("closed-unverified");
+      expect(result.evidence.records[0]).toMatchObject({
+        state: "current",
+        sourceAccess: "unavailable",
+        outcome,
+      });
+    },
+  );
+
+  it.each(["cancelled", "out-of-scope"] as const)(
+    "does not let unavailable %s evidence supersede a supported resolution",
+    (outcome) => {
+      const original = resolution(
+        `supported-before-${outcome}`,
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      );
+      const unavailable = resolutionWithOutcome({
+        id: `unavailable-after-${outcome}`,
+        outcome,
+        evidence: [
+          "Evidence unavailable: [proof](https://github.com/Flow-Fly/t3code/commit/def)",
+          "",
+          `Supersedes: ${original.url}`,
+        ].join("\n"),
+        createdAt: "2026-09-06T00:00:00Z",
+      });
+      const result = interpretWorkflowEvidence({
+        issue: issue({
+          state: "closed",
+          stateReason: "completed",
+          comments: [original, unavailable],
+        }),
+      });
+
+      expect(result.readiness.status).toBe("resolved");
+      expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+        [original.id, "current"],
+        [unavailable.id, "current"],
+      ]);
+    },
+  );
+
+  it("accepts supported cancellation evidence", () => {
+    const result = interpretWorkflowEvidence({
+      issue: issue({
+        state: "closed",
+        stateReason: "completed",
+        comments: [
+          resolutionWithOutcome({
+            id: "supported-cancellation",
+            outcome: "cancelled",
+            evidence: "[Decision](https://github.com/Flow-Fly/t3code/issues/2#issuecomment-1)",
+          }),
+        ],
+      }),
+    });
+
+    expect(result.readiness.status).toBe("cancelled");
+  });
+
+  it("preserves native not-planned cancellation when record evidence is unavailable", () => {
+    const result = interpretWorkflowEvidence({
+      issue: issue({
+        state: "closed",
+        stateReason: "not_planned",
+        comments: [
+          resolutionWithOutcome({
+            id: "unavailable-native-cancellation",
+            outcome: "cancelled",
+            evidence:
+              "Evidence unavailable: [decision](https://github.com/Flow-Fly/t3code/issues/2#issuecomment-1)",
+          }),
+        ],
+      }),
+    });
+
+    expect(result.readiness.status).toBe("cancelled");
   });
 });
