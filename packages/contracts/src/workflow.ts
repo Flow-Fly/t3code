@@ -29,6 +29,130 @@ export const WorkflowRepository = Schema.Struct({
 });
 export type WorkflowRepository = typeof WorkflowRepository.Type;
 
+export const WorkflowReadinessStatus = Schema.Literals([
+  "ready",
+  "claimed",
+  "blocked",
+  "needs-review",
+  "unapproved",
+  "resolved",
+  "closed-unverified",
+  "cancelled",
+  "out-of-scope",
+  "superseded",
+]);
+export type WorkflowReadinessStatus = typeof WorkflowReadinessStatus.Type;
+
+export const WorkflowReadinessReasonKind = Schema.Literals([
+  "approved-scope",
+  "missing-approval",
+  "scope-changed",
+  "claimed",
+  "open-blocker",
+  "unverified-blocker",
+  "cancelled-blocker",
+  "superseded-blocker",
+  "reassessment",
+  "manual-condition",
+  "resolution",
+  "missing-resolution",
+  "cancelled",
+  "out-of-scope",
+  "superseded",
+]);
+export type WorkflowReadinessReasonKind = typeof WorkflowReadinessReasonKind.Type;
+
+export const WorkflowReadinessReason = Schema.Struct({
+  kind: WorkflowReadinessReasonKind,
+  message: TrimmedNonEmptyString,
+  source: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type WorkflowReadinessReason = typeof WorkflowReadinessReason.Type;
+
+export const WorkflowReadiness = Schema.Struct({
+  status: WorkflowReadinessStatus,
+  reasons: Schema.Array(WorkflowReadinessReason),
+});
+export type WorkflowReadiness = typeof WorkflowReadiness.Type;
+
+export const WorkflowFrontierStatus = Schema.Literals([
+  "available",
+  "complete",
+  "empty-claimed",
+  "empty-blocked",
+  "empty-reassessment",
+  "empty-unapproved",
+  "empty-review",
+  "empty-inactive",
+  "empty",
+]);
+export type WorkflowFrontierStatus = typeof WorkflowFrontierStatus.Type;
+
+export const WorkflowFrontier = Schema.Struct({
+  status: WorkflowFrontierStatus,
+  message: TrimmedNonEmptyString,
+  readyIssueIds: Schema.Array(TrimmedNonEmptyString),
+});
+export type WorkflowFrontier = typeof WorkflowFrontier.Type;
+
+export const WorkflowEvidenceRecordKind = Schema.Literals([
+  "approval",
+  "resolution",
+  "reassessment",
+]);
+export type WorkflowEvidenceRecordKind = typeof WorkflowEvidenceRecordKind.Type;
+
+export const WorkflowEvidenceRecordState = Schema.Literals(["current", "superseded", "invalid"]);
+export type WorkflowEvidenceRecordState = typeof WorkflowEvidenceRecordState.Type;
+
+export const WorkflowEvidenceSourceAccess = Schema.Literals([
+  "verified",
+  "reported",
+  "unavailable",
+]);
+export type WorkflowEvidenceSourceAccess = typeof WorkflowEvidenceSourceAccess.Type;
+
+export const WorkflowEvidenceScope = Schema.Literals(["current", "changed", "not-applicable"]);
+export type WorkflowEvidenceScope = typeof WorkflowEvidenceScope.Type;
+
+export const WorkflowApprovalAuthority = Schema.Literals(["verified", "reported", "unknown"]);
+export type WorkflowApprovalAuthority = typeof WorkflowApprovalAuthority.Type;
+
+export const WorkflowEvidenceRecord = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  url: TrimmedNonEmptyString,
+  createdAt: TrimmedNonEmptyString,
+  kind: WorkflowEvidenceRecordKind,
+  state: WorkflowEvidenceRecordState,
+  sourceAccess: WorkflowEvidenceSourceAccess,
+  scope: WorkflowEvidenceScope,
+  summary: TrimmedNonEmptyString,
+  approvalKind: Schema.optionalKey(Schema.Literals(["specification", "ticket-breakdown"])),
+  authority: Schema.optionalKey(WorkflowApprovalAuthority),
+  approvedBy: Schema.optionalKey(TrimmedNonEmptyString),
+  source: Schema.optionalKey(TrimmedNonEmptyString),
+  approvedContent: Schema.optionalKey(TrimmedNonEmptyString),
+  outcome: Schema.optionalKey(
+    Schema.Literals(["resolved", "cancelled", "out-of-scope", "cleared", "scope-change"]),
+  ),
+  evidence: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type WorkflowEvidenceRecord = typeof WorkflowEvidenceRecord.Type;
+
+export const WorkflowManualCondition = Schema.Struct({
+  description: TrimmedNonEmptyString,
+  source: TrimmedNonEmptyString,
+  status: Schema.Literals(["review-required", "satisfied"]),
+  evidence: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type WorkflowManualCondition = typeof WorkflowManualCondition.Type;
+
+export const WorkflowEvidence = Schema.Struct({
+  records: Schema.Array(WorkflowEvidenceRecord),
+  manualConditions: Schema.Array(WorkflowManualCondition),
+});
+export type WorkflowEvidence = typeof WorkflowEvidence.Type;
+
 export const WorkflowIssueSummary = Schema.Struct({
   id: TrimmedNonEmptyString,
   repository: WorkflowRepositoryNameWithOwner,
@@ -42,6 +166,7 @@ export const WorkflowIssueSummary = Schema.Struct({
   childCount: Schema.Number,
   parentNumber: Schema.NullOr(PositiveInt),
   labels: Schema.Array(TrimmedNonEmptyString),
+  readiness: Schema.optionalKey(WorkflowReadiness),
 });
 export type WorkflowIssueSummary = typeof WorkflowIssueSummary.Type;
 
@@ -76,6 +201,7 @@ export type WorkflowChildrenInput = typeof WorkflowChildrenInput.Type;
 export const WorkflowChildrenResult = Schema.Struct({
   parentNumber: PositiveInt,
   children: Schema.Array(WorkflowIssueSummary),
+  frontier: Schema.optionalKey(WorkflowFrontier),
 });
 export type WorkflowChildrenResult = typeof WorkflowChildrenResult.Type;
 
@@ -89,6 +215,7 @@ export const WorkflowIssueDetail = Schema.Struct({
   ...WorkflowIssueSummary.fields,
   body: Schema.String,
   blockedBy: Schema.Array(WorkflowIssueSummary),
+  evidence: Schema.optionalKey(WorkflowEvidence),
 });
 export type WorkflowIssueDetail = typeof WorkflowIssueDetail.Type;
 

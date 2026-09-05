@@ -34,8 +34,23 @@ export function filterWorkflowRoots(
 }
 
 export function workflowIssueStateLabel(
-  issue: Pick<WorkflowIssueSummary, "state" | "stateReason">,
+  issue: Pick<WorkflowIssueSummary, "state" | "stateReason" | "readiness">,
 ): string {
+  if (issue.readiness) {
+    const labels = {
+      ready: "Ready",
+      claimed: "Claimed",
+      blocked: "Blocked",
+      "needs-review": "Needs review",
+      unapproved: "Approval required",
+      resolved: "Resolved",
+      "closed-unverified": "Closed — unverified",
+      cancelled: "Cancelled",
+      "out-of-scope": "Out of scope",
+      superseded: "Superseded",
+    } as const;
+    return labels[issue.readiness.status];
+  }
   if (issue.state === "open") return "Open";
   if (issue.stateReason === "not_planned") return "Closed — not planned";
   return "Closed — unverified";

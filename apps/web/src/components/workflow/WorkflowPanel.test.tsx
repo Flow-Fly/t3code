@@ -10,7 +10,13 @@ const query = vi.hoisted(() => {
     calls.push({ kind, request });
     return { kind, request };
   };
-  return { calls, descriptor, moved: false, destinationRepository: "Flow-Fly/t3code" };
+  return {
+    calls,
+    descriptor,
+    moved: false,
+    evidence: false,
+    destinationRepository: "Flow-Fly/t3code",
+  };
 });
 
 vi.mock("~/state/workflow", () => ({
@@ -108,6 +114,16 @@ vi.mock("~/state/query", () => ({
         ...idle,
         data: {
           parentNumber: parentNumber ?? 10,
+          ...(query.evidence
+            ? {
+                frontier: {
+                  status: "empty-blocked",
+                  message:
+                    "Nothing can proceed because prerequisites are blocking the visible work.",
+                  readyIssueIds: [],
+                },
+              }
+            : {}),
           children:
             query.moved && parentNumber === 11
               ? []
@@ -126,6 +142,20 @@ vi.mock("~/state/query", () => ({
                     childCount: parentNumber === 11 || parentNumber === 20 ? 0 : 1,
                     parentNumber: parentNumber ?? 10,
                     labels: ["workflow:ticket"],
+                    ...(query.evidence
+                      ? {
+                          readiness: {
+                            status: "blocked",
+                            reasons: [
+                              {
+                                kind: "unverified-blocker",
+                                message: "Prerequisite #1 Map is closed-unverified.",
+                                source: "https://github.com/Flow-Fly/t3code/issues/1",
+                              },
+                            ],
+                          },
+                        }
+                      : {}),
                   },
                 ],
         },
@@ -164,6 +194,47 @@ vi.mock("~/state/query", () => ({
               labels: ["wayfinder:map"],
             },
           ],
+          ...(query.evidence
+            ? {
+                readiness: {
+                  status: "needs-review",
+                  reasons: [
+                    {
+                      kind: "reassessment",
+                      message:
+                        "Ticket approval matches scope, but owner authority is not verified.",
+                      source: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
+                    },
+                  ],
+                },
+                evidence: {
+                  records: [
+                    {
+                      id: "approval-record",
+                      url: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
+                      createdAt: "2026-09-05T19:32:15Z",
+                      kind: "approval",
+                      state: "current",
+                      sourceAccess: "reported",
+                      scope: "current",
+                      summary: "Approval: ticket-breakdown",
+                      approvalKind: "ticket-breakdown",
+                      approvedBy: "Flow-Fly",
+                      authority: "reported",
+                      source: "T3 thread thread-1",
+                      approvedContent: "Approved ticket snapshot",
+                    },
+                  ],
+                  manualConditions: [
+                    {
+                      description: "Provide a staging account or an approved fixture.",
+                      source: "https://github.com/acme/runbook/issues/4",
+                      status: "review-required",
+                    },
+                  ],
+                },
+              }
+            : {}),
         },
       };
     }
@@ -273,6 +344,7 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} });
   query.moved = false;
+  query.evidence = false;
   query.destinationRepository = "Flow-Fly/t3code";
 });
 
@@ -330,6 +402,69 @@ describe("WorkflowPanel browsing", () => {
         environmentId: draft.environmentId,
         input: { projectId: draft.projectId },
       });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("explains an empty frontier and keeps approval provenance distinct in details", async () => {
+    query.evidence = true;
+    const props = {
+      environmentId: EnvironmentId.make("remote-environment"),
+      environmentLabel: "Remote environment",
+      projectId: ProjectId.make("project-draft"),
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(<WorkflowPanel {...props} />);
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const frontier = renderer!.root.findByProps({ "aria-label": "Workflow frontier" });
+      const frontierText = frontier.findAllByType("span").map((span) => span.children.join(""));
+      expect(frontierText).toContain("Frontier empty");
+      expect(frontierText.join(" ")).toContain("prerequisites are blocking");
+
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+
+      const articleText = renderer!.root
+        .findByType("article")
+        .findAllByType("p")
+        .flatMap((node) => node.children.map(String));
+      const readiness = renderer!.root.findByProps({ "aria-label": "Readiness evidence" });
+      expect(readiness.findAllByType("a")[0]?.children.join("")).toContain(
+        "owner authority is not verified",
+      );
+      const normalizedArticleText = articleText.join(" ").replace(/\s+/g, " ");
+      expect(normalizedArticleText).toContain(
+        "Source is reported by the record; this query did not independently verify it.",
+      );
+      expect(normalizedArticleText).toContain("authority reported");
+      expect(
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow evidence ledger" })
+          .findAllByType("summary")
+          .map((summary) => summary.children.join("")),
+      ).toEqual(["Approved snapshot"]);
+      expect(
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow evidence ledger" })
+          .findAllByType("a")
+          .some((link) => link.children.join("").includes("Review required")),
+      ).toBe(true);
     } finally {
       await act(() => renderer?.unmount());
     }

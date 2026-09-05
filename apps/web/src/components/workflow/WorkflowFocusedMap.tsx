@@ -2,6 +2,7 @@ import type {
   EnvironmentId,
   ProjectId,
   WorkflowChildrenResult,
+  WorkflowFrontier,
   WorkflowIssueSummary,
   WorkflowSearchMatch,
 } from "@t3tools/contracts";
@@ -144,6 +145,7 @@ function WorkflowDetails(props: {
     seen.add(id);
     return true;
   });
+  const evidence = query.data.evidence;
   return (
     <article
       className="grid gap-3 border-t border-border p-3"
@@ -171,6 +173,29 @@ function WorkflowDetails(props: {
       <p className="whitespace-pre-wrap text-muted-foreground text-xs leading-relaxed">
         {workflowIssueBrief(query.data) ?? "No description provided."}
       </p>
+      {query.data.readiness ? (
+        <section aria-label="Readiness evidence">
+          <h3 className="font-medium text-xs">Readiness · {workflowIssueStateLabel(query.data)}</h3>
+          <ul className="mt-1 grid gap-1 text-xs">
+            {query.data.readiness.reasons.map((item, index) => (
+              <li key={`${item.kind}-${item.source ?? index}`} className="text-muted-foreground">
+                {item.source ? (
+                  <a
+                    className="text-info hover:underline"
+                    href={item.source}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                  >
+                    {item.message}
+                  </a>
+                ) : (
+                  item.message
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       {query.data.blockedBy.length > 0 || links.length > 0 ? (
         <div>
           <h3 className="font-medium text-xs">Relationships</h3>
@@ -202,6 +227,89 @@ function WorkflowDetails(props: {
             ))}
           </ul>
         </div>
+      ) : null}
+      {evidence && (evidence.records.length > 0 || evidence.manualConditions.length > 0) ? (
+        <section aria-label="Workflow evidence ledger">
+          <h3 className="font-medium text-xs">Evidence</h3>
+          {evidence.records.length > 0 ? (
+            <ol className="mt-1 grid gap-2">
+              {evidence.records.map((record) => (
+                <li key={record.id} className="rounded-md border border-border p-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-x-1 font-medium">
+                    <a
+                      className="capitalize text-info hover:underline"
+                      href={record.url}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                    >
+                      {record.kind}
+                      {record.approvalKind ? ` · ${record.approvalKind}` : ""}
+                    </a>
+                    <span className="text-muted-foreground">· {record.state}</span>
+                    {record.scope !== "not-applicable" ? (
+                      <span className="text-muted-foreground">· scope {record.scope}</span>
+                    ) : null}
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{record.summary}</p>
+                  {record.approvedBy ? (
+                    <p className="mt-1 text-muted-foreground">
+                      Approved by {record.approvedBy} · authority {record.authority ?? "unknown"}
+                    </p>
+                  ) : null}
+                  {record.source ? (
+                    <p className="mt-1 break-words">Source: {record.source}</p>
+                  ) : null}
+                  <p className="mt-1 text-muted-foreground">
+                    {record.sourceAccess === "verified"
+                      ? "Source is available in the loaded GitHub evidence."
+                      : record.sourceAccess === "reported"
+                        ? "Source is reported by the record; this query did not independently verify it."
+                        : "Source is unavailable; provenance remains unknown and does not prove invalidation."}
+                  </p>
+                  {record.evidence ? (
+                    <details className="mt-1">
+                      <summary className="cursor-pointer font-medium">Recorded evidence</summary>
+                      <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
+                        {record.evidence}
+                      </p>
+                    </details>
+                  ) : null}
+                  {record.approvedContent ? (
+                    <details className="mt-1">
+                      <summary className="cursor-pointer font-medium">Approved snapshot</summary>
+                      <pre className="mt-1 whitespace-pre-wrap font-sans text-muted-foreground">
+                        {record.approvedContent}
+                      </pre>
+                    </details>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          ) : null}
+          {evidence.manualConditions.length > 0 ? (
+            <div className="mt-2">
+              <h4 className="font-medium text-xs">Reviewed conditions</h4>
+              <ul className="mt-1 grid gap-1 text-xs">
+                {evidence.manualConditions.map((condition) => (
+                  <li key={`${condition.source}-${condition.description}`}>
+                    <a
+                      className="text-info hover:underline"
+                      href={condition.source}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                    >
+                      {condition.status === "satisfied" ? "Satisfied" : "Review required"} ·{" "}
+                      {condition.description}
+                    </a>
+                    {condition.evidence ? (
+                      <p className="text-muted-foreground">Evidence: {condition.evidence}</p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </section>
       ) : null}
       {query.data.body.trim() ? (
         <details className="rounded-md border border-border p-2">
@@ -235,6 +343,7 @@ export function WorkflowFocusedMap(props: {
     [rootId]: props.root,
   });
   const [childrenByParent, setChildrenByParent] = useState<Record<string, readonly string[]>>({});
+  const [frontierByParent, setFrontierByParent] = useState<Record<string, WorkflowFrontier>>({});
   const [searchDraft, setSearchDraft] = useState("");
   const [submittedSearch, setSubmittedSearch] = useState("");
   const [recoverSelection, setRecoverSelection] = useState(false);
@@ -266,7 +375,15 @@ export function WorkflowFocusedMap(props: {
           existing.state !== child.state ||
           existing.stateReason !== child.stateReason ||
           existing.title !== child.title ||
-          existing.childCount !== child.childCount
+          existing.childCount !== child.childCount ||
+          existing.readiness?.status !== child.readiness?.status ||
+          existing.readiness?.reasons.length !== child.readiness?.reasons.length ||
+          existing.readiness?.reasons.some(
+            (reason, index) =>
+              reason.kind !== child.readiness?.reasons[index]?.kind ||
+              reason.message !== child.readiness?.reasons[index]?.message ||
+              reason.source !== child.readiness?.reasons[index]?.source,
+          )
         );
       });
       return changed
@@ -287,6 +404,16 @@ export function WorkflowFocusedMap(props: {
       }
       return { ...current, [parentId]: childIds };
     });
+    if (result.frontier) {
+      const frontier = result.frontier;
+      setFrontierByParent((current) =>
+        current[parentId]?.status === frontier.status &&
+        current[parentId]?.message === frontier.message &&
+        current[parentId]?.readyIssueIds.join("\n") === frontier.readyIssueIds.join("\n")
+          ? current
+          : { ...current, [parentId]: frontier },
+      );
+    }
   }, []);
 
   const loadIds = [rootId, ...view.expanded].filter(
@@ -305,6 +432,7 @@ export function WorkflowFocusedMap(props: {
     openFolds: view.openFolds,
     positions: currentPositions,
   });
+  const rootFrontier = frontierByParent[rootId];
   const nodeById = new Map(map.nodes.map((node) => [node.id, node]));
   const breadcrumbNodes = (() => {
     if (!view.selectedId) return [];
@@ -539,6 +667,17 @@ export function WorkflowFocusedMap(props: {
         ) : null,
       )}
       <div className="col-span-full grid min-w-0 gap-2 border-b border-border p-2 @md/workflow:grid-cols-[minmax(12rem,1fr)_auto]">
+        {rootFrontier ? (
+          <div
+            className="col-span-full flex flex-wrap items-center gap-x-2 rounded-md bg-muted px-2 py-1 text-xs"
+            aria-label="Workflow frontier"
+          >
+            <span className="font-medium">
+              {rootFrontier.status === "available" ? "Frontier available" : "Frontier empty"}
+            </span>
+            <span className="text-muted-foreground">{rootFrontier.message}</span>
+          </div>
+        ) : null}
         <form className="relative flex min-w-0 gap-1" role="search" onSubmit={submitSearch}>
           <Input
             aria-label="Search this workflow"

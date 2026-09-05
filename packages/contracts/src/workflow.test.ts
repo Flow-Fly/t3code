@@ -2,6 +2,8 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  WorkflowChildrenResult,
+  WorkflowIssueDetail,
   WorkflowIssueSummary,
   WorkflowRepositoriesResult,
   WorkflowRootsInput,
@@ -53,5 +55,96 @@ describe("workflow contracts", () => {
 
     expect(issue.state).toBe("closed");
     expect(issue).not.toHaveProperty("resolved");
+  });
+
+  it("decodes additive readiness while remaining compatible with older summaries", () => {
+    const summary = {
+      id: "issue-13",
+      repository: "Flow-Fly/t3code",
+      number: 13,
+      title: "Explain evidence",
+      url: "https://github.com/Flow-Fly/t3code/issues/13",
+      kind: "ticket",
+      state: "open",
+      stateReason: null,
+      updatedAt: "2026-09-05T19:30:00Z",
+      childCount: 0,
+      parentNumber: 10,
+      labels: ["workflow:ticket"],
+    };
+    const decodeChildren = Schema.decodeUnknownSync(WorkflowChildrenResult);
+
+    expect(
+      decodeChildren({ parentNumber: 10, children: [summary] }).children[0],
+    ).not.toHaveProperty("readiness");
+    const current = decodeChildren({
+      parentNumber: 10,
+      children: [
+        {
+          ...summary,
+          readiness: {
+            status: "ready",
+            reasons: [
+              {
+                kind: "approved-scope",
+                message: "Ticket-breakdown approval covers current scope.",
+              },
+            ],
+          },
+        },
+      ],
+      frontier: {
+        status: "available",
+        message: "1 item can proceed.",
+        readyIssueIds: ["issue-13"],
+      },
+    });
+    expect(current.children[0]?.readiness?.status).toBe("ready");
+    expect(current.frontier?.readyIssueIds).toEqual(["issue-13"]);
+  });
+
+  it("keeps approval authority separate from reported source access", () => {
+    const decode = Schema.decodeUnknownSync(WorkflowIssueDetail);
+    const detail = decode({
+      id: "issue-13",
+      repository: "Flow-Fly/t3code",
+      number: 13,
+      title: "Explain evidence",
+      url: "https://github.com/Flow-Fly/t3code/issues/13",
+      kind: "ticket",
+      state: "open",
+      stateReason: null,
+      updatedAt: "2026-09-05T19:30:00Z",
+      childCount: 0,
+      parentNumber: 10,
+      labels: ["workflow:ticket"],
+      body: "Scope",
+      blockedBy: [],
+      evidence: {
+        records: [
+          {
+            id: "approval-1",
+            url: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-1",
+            createdAt: "2026-09-05T19:32:15Z",
+            kind: "approval",
+            state: "current",
+            sourceAccess: "reported",
+            scope: "current",
+            summary: "Approval: ticket-breakdown",
+            approvalKind: "ticket-breakdown",
+            authority: "verified",
+            approvedBy: "Flow-Fly",
+            source: "T3 thread thread-1",
+            approvedContent: "Approved scope",
+          },
+        ],
+        manualConditions: [],
+      },
+    });
+
+    expect(detail.evidence?.records[0]).toMatchObject({
+      authority: "verified",
+      sourceAccess: "reported",
+    });
   });
 });

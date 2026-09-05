@@ -6,6 +6,7 @@ import {
   type WorkflowIssueDetailInput,
   type WorkflowIssueKind,
   type WorkflowIssueStateReason,
+  type WorkflowReadiness,
   type WorkflowLocateInput,
   type WorkflowLocateResult,
   WorkflowQueryError,
@@ -28,6 +29,13 @@ import * as Schema from "effect/Schema";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import {
+  interpretWorkflowEvidence,
+  type WorkflowEvidenceComment,
+  type WorkflowEvidenceIssue,
+  workflowFrontier,
+  workflowHasRemainingFog,
+} from "./WorkflowEvidence.ts";
 
 const WORKFLOW_LABEL_TO_KIND = {
   "wayfinder:map": "map",
@@ -44,6 +52,16 @@ const WORKFLOW_LABEL_TO_KIND = {
 } as const satisfies Record<string, WorkflowIssueKind>;
 
 const RawLabel = Schema.Struct({ name: Schema.String });
+const RawComment = Schema.Struct({
+  id: Schema.String,
+  url: Schema.String,
+  body: Schema.String,
+  createdAt: Schema.String,
+  author: Schema.NullOr(Schema.Struct({ login: Schema.String })),
+  authorAssociation: Schema.String,
+});
+const RawAssignee = Schema.Struct({ login: Schema.String });
+const RawReopenedEvent = Schema.Struct({ createdAt: Schema.String });
 const RawPageInfo = Schema.Struct({
   hasNextPage: Schema.Boolean,
   endCursor: Schema.NullOr(Schema.String),
@@ -65,6 +83,15 @@ type RawIssueReference = typeof RawIssueReference.Type;
 const RawIssue = Schema.Struct({
   ...RawIssueReference.fields,
   body: Schema.optional(Schema.String),
+  assignees: Schema.optional(
+    Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawAssignee) }),
+  ),
+  comments: Schema.optional(
+    Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawComment) }),
+  ),
+  timelineItems: Schema.optional(
+    Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawReopenedEvent) }),
+  ),
   parent: Schema.optional(Schema.NullOr(RawIssueReference)),
   blockedBy: Schema.optional(
     Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawIssueReference) }),
@@ -88,6 +115,11 @@ const RawChildrenPage = Schema.Struct({
       Schema.Struct({
         issue: Schema.NullOr(
           Schema.Struct({
+            id: Schema.optional(Schema.String),
+            body: Schema.optional(Schema.String),
+            comments: Schema.optional(
+              Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawComment) }),
+            ),
             subIssues: Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawIssue) }),
           }),
         ),
@@ -122,6 +154,45 @@ const RawBlockedByPage = Schema.Struct({
   }),
 });
 
+const RawCommentsPage = Schema.Struct({
+  data: Schema.Struct({
+    node: Schema.NullOr(
+      Schema.Struct({
+        comments: Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawComment) }),
+      }),
+    ),
+  }),
+});
+
+const RawAssigneesPage = Schema.Struct({
+  data: Schema.Struct({
+    node: Schema.NullOr(
+      Schema.Struct({
+        assignees: Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawAssignee) }),
+      }),
+    ),
+  }),
+});
+
+const RawReopenedPage = Schema.Struct({
+  data: Schema.Struct({
+    node: Schema.NullOr(
+      Schema.Struct({
+        timelineItems: Schema.Struct({
+          pageInfo: RawPageInfo,
+          nodes: Schema.Array(RawReopenedEvent),
+        }),
+      }),
+    ),
+  }),
+});
+
+const RawEvidenceLookup = Schema.Struct({
+  data: Schema.Struct({
+    node: Schema.NullOr(RawIssue),
+  }),
+});
+
 const RawSearchPage = Schema.Struct({
   data: Schema.Struct({
     search: Schema.Struct({
@@ -142,17 +213,30 @@ const decodeChildrenPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawChi
 const decodeDetail = Schema.decodeUnknownSync(Schema.fromJsonString(RawDetail));
 const decodeLabelsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawLabelsPage));
 const decodeBlockedByPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawBlockedByPage));
+const decodeCommentsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawCommentsPage));
+const decodeAssigneesPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawAssigneesPage));
+const decodeReopenedPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawReopenedPage));
+const decodeEvidenceLookup = Schema.decodeUnknownSync(Schema.fromJsonString(RawEvidenceLookup));
 const decodeSearchPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawSearchPage));
 const decodeIssueLookup = Schema.decodeUnknownSync(Schema.fromJsonString(RawIssueLookup));
 const isWorkflowRepositoryNameWithOwner = Schema.is(WorkflowRepositoryNameWithOwner);
 
 const ISSUE_BASE_FIELDS = `id number title url state stateReason updatedAt repository{nameWithOwner} labels(first:100){pageInfo{hasNextPage endCursor}nodes{name}} subIssuesSummary{total}`;
 const ISSUE_FIELDS = `${ISSUE_BASE_FIELDS} parent{${ISSUE_BASE_FIELDS}}`;
+const COMMENTS_FIELDS = `comments(first:100){pageInfo{hasNextPage endCursor}nodes{id url body createdAt author{login} authorAssociation}}`;
+const ASSIGNEES_FIELDS = `assignees(first:100){pageInfo{hasNextPage endCursor}nodes{login}}`;
+const REOPENED_FIELDS = `timelineItems(first:100,itemTypes:[REOPENED_EVENT]){pageInfo{hasNextPage endCursor}nodes{... on ReopenedEvent{createdAt}}}`;
+const BLOCKED_BY_FIELDS = `blockedBy(first:100){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}`;
+const ISSUE_EVIDENCE_FIELDS = `${ISSUE_FIELDS} body ${COMMENTS_FIELDS} ${ASSIGNEES_FIELDS} ${REOPENED_FIELDS} ${BLOCKED_BY_FIELDS}`;
 const ROOTS_QUERY = `query WorkflowRoots($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){issues(first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}`;
-const CHILDREN_QUERY = `query WorkflowChildren($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){subIssues(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}}`;
-const DETAIL_QUERY = `query WorkflowDetail($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){${ISSUE_FIELDS} body blockedBy(first:100){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}}`;
+const CHILDREN_QUERY = `query WorkflowChildren($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){id body ${COMMENTS_FIELDS} subIssues(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${ISSUE_EVIDENCE_FIELDS}}}}}}`;
+const DETAIL_QUERY = `query WorkflowDetail($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){${ISSUE_EVIDENCE_FIELDS}}}}`;
 const LABELS_QUERY = `query WorkflowLabels($id:ID!,$after:String){node(id:$id){... on Issue{labels(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{name}}}}}`;
 const BLOCKED_BY_QUERY = `query WorkflowBlockedBy($id:ID!,$after:String){node(id:$id){... on Issue{blockedBy(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}}`;
+const COMMENTS_QUERY = `query WorkflowComments($id:ID!,$after:String){node(id:$id){... on Issue{comments(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{id url body createdAt author{login} authorAssociation}}}}}`;
+const ASSIGNEES_QUERY = `query WorkflowAssignees($id:ID!,$after:String){node(id:$id){... on Issue{assignees(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{login}}}}}`;
+const REOPENED_QUERY = `query WorkflowReopened($id:ID!,$after:String){node(id:$id){... on Issue{timelineItems(first:100,after:$after,itemTypes:[REOPENED_EVENT]){pageInfo{hasNextPage endCursor}nodes{... on ReopenedEvent{createdAt}}}}}}`;
+const EVIDENCE_LOOKUP_QUERY = `query WorkflowEvidenceLookup($id:ID!){node(id:$id){... on Issue{${ISSUE_EVIDENCE_FIELDS}}}}`;
 const SEARCH_QUERY = `query WorkflowSearch($searchQuery:String!,$after:String){search(query:$searchQuery,type:ISSUE,first:20,after:$after){pageInfo{hasNextPage endCursor}nodes{... on Issue{${ISSUE_FIELDS}}}}}`;
 const ISSUE_LOOKUP_QUERY = `query WorkflowIssueLookup($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){${ISSUE_FIELDS}}}}`;
 
@@ -354,42 +438,49 @@ export const make = Effect.gen(function* () {
     return { ...issue, labels: { ...issue.labels, nodes: labels } };
   });
 
+  const completeBlockerReferences = Effect.fn("WorkflowService.completeBlockerReferences")(
+    function* (cwd: string, repository: string, issue: RawIssue) {
+      const blockers = [...(issue.blockedBy?.nodes ?? [])];
+      let pageInfo = issue.blockedBy?.pageInfo;
+      while (pageInfo?.hasNextPage) {
+        if (!pageInfo.endCursor) {
+          return yield* queryError(
+            "invalid-response",
+            "GitHub returned incomplete workflow blocker pagination.",
+          );
+        }
+        const raw = yield* executeGraphQl({
+          cwd,
+          repository,
+          query: BLOCKED_BY_QUERY,
+          id: issue.id,
+          cursor: pageInfo.endCursor,
+        });
+        const decoded = yield* Effect.try({
+          try: () => decodeBlockedByPage(raw),
+          catch: (error) =>
+            queryError(
+              "invalid-response",
+              "GitHub returned invalid workflow blockers.",
+              String(error),
+            ),
+        });
+        if (!decoded.data.node) {
+          return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+        }
+        blockers.push(...decoded.data.node.blockedBy.nodes);
+        pageInfo = decoded.data.node.blockedBy.pageInfo;
+      }
+      return blockers;
+    },
+  );
+
   const completeBlockedBy = Effect.fn("WorkflowService.completeBlockedBy")(function* (
     cwd: string,
     repository: string,
     issue: RawIssue,
   ) {
-    const blockers = [...(issue.blockedBy?.nodes ?? [])];
-    let pageInfo = issue.blockedBy?.pageInfo;
-    while (pageInfo?.hasNextPage) {
-      if (!pageInfo.endCursor) {
-        return yield* queryError(
-          "invalid-response",
-          "GitHub returned incomplete workflow blocker pagination.",
-        );
-      }
-      const raw = yield* executeGraphQl({
-        cwd,
-        repository,
-        query: BLOCKED_BY_QUERY,
-        id: issue.id,
-        cursor: pageInfo.endCursor,
-      });
-      const decoded = yield* Effect.try({
-        try: () => decodeBlockedByPage(raw),
-        catch: (error) =>
-          queryError(
-            "invalid-response",
-            "GitHub returned invalid workflow blockers.",
-            String(error),
-          ),
-      });
-      if (!decoded.data.node) {
-        return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
-      }
-      blockers.push(...decoded.data.node.blockedBy.nodes);
-      pageInfo = decoded.data.node.blockedBy.pageInfo;
-    }
+    const blockers = yield* completeBlockerReferences(cwd, repository, issue);
     const summaries = [];
     const seen = new Set<string>();
     for (const blocker of blockers) {
@@ -399,6 +490,250 @@ export const make = Effect.gen(function* () {
       summaries.push(issueSummary(complete));
     }
     return summaries;
+  });
+
+  const completeComments = Effect.fn("WorkflowService.completeComments")(function* (
+    cwd: string,
+    repository: string,
+    id: string,
+    initial:
+      | {
+          readonly pageInfo: typeof RawPageInfo.Type;
+          readonly nodes: ReadonlyArray<typeof RawComment.Type>;
+        }
+      | undefined,
+  ) {
+    const comments = [...(initial?.nodes ?? [])];
+    let pageInfo = initial?.pageInfo;
+    while (pageInfo?.hasNextPage) {
+      if (!pageInfo.endCursor) {
+        return yield* queryError(
+          "invalid-response",
+          "GitHub returned incomplete workflow comment pagination.",
+        );
+      }
+      const raw = yield* executeGraphQl({
+        cwd,
+        repository,
+        query: COMMENTS_QUERY,
+        id,
+        cursor: pageInfo.endCursor,
+      });
+      const decoded = yield* Effect.try({
+        try: () => decodeCommentsPage(raw),
+        catch: (error) =>
+          queryError(
+            "invalid-response",
+            "GitHub returned invalid workflow comments.",
+            String(error),
+          ),
+      });
+      if (!decoded.data.node)
+        return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+      comments.push(...decoded.data.node.comments.nodes);
+      pageInfo = decoded.data.node.comments.pageInfo;
+    }
+    return comments;
+  });
+
+  const completeAssignees = Effect.fn("WorkflowService.completeAssignees")(function* (
+    cwd: string,
+    repository: string,
+    id: string,
+    initial: RawIssue["assignees"],
+  ) {
+    const assignees = [...(initial?.nodes ?? [])];
+    let pageInfo = initial?.pageInfo;
+    while (pageInfo?.hasNextPage) {
+      if (!pageInfo.endCursor) {
+        return yield* queryError(
+          "invalid-response",
+          "GitHub returned incomplete workflow assignee pagination.",
+        );
+      }
+      const raw = yield* executeGraphQl({
+        cwd,
+        repository,
+        query: ASSIGNEES_QUERY,
+        id,
+        cursor: pageInfo.endCursor,
+      });
+      const decoded = yield* Effect.try({
+        try: () => decodeAssigneesPage(raw),
+        catch: (error) =>
+          queryError(
+            "invalid-response",
+            "GitHub returned invalid workflow assignees.",
+            String(error),
+          ),
+      });
+      if (!decoded.data.node)
+        return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+      assignees.push(...decoded.data.node.assignees.nodes);
+      pageInfo = decoded.data.node.assignees.pageInfo;
+    }
+    return assignees;
+  });
+
+  const completeReopened = Effect.fn("WorkflowService.completeReopened")(function* (
+    cwd: string,
+    repository: string,
+    id: string,
+    initial: RawIssue["timelineItems"],
+  ) {
+    const events = [...(initial?.nodes ?? [])];
+    let pageInfo = initial?.pageInfo;
+    while (pageInfo?.hasNextPage) {
+      if (!pageInfo.endCursor) {
+        return yield* queryError(
+          "invalid-response",
+          "GitHub returned incomplete workflow timeline pagination.",
+        );
+      }
+      const raw = yield* executeGraphQl({
+        cwd,
+        repository,
+        query: REOPENED_QUERY,
+        id,
+        cursor: pageInfo.endCursor,
+      });
+      const decoded = yield* Effect.try({
+        try: () => decodeReopenedPage(raw),
+        catch: (error) =>
+          queryError(
+            "invalid-response",
+            "GitHub returned invalid workflow history.",
+            String(error),
+          ),
+      });
+      if (!decoded.data.node)
+        return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+      events.push(...decoded.data.node.timelineItems.nodes);
+      pageInfo = decoded.data.node.timelineItems.pageInfo;
+    }
+    return events;
+  });
+
+  const evidenceComment = (comment: typeof RawComment.Type): WorkflowEvidenceComment => ({
+    id: comment.id,
+    url: comment.url,
+    body: comment.body,
+    createdAt: comment.createdAt,
+    author: comment.author?.login ?? null,
+    authorAssociation: comment.authorAssociation,
+  });
+
+  const completeEvidenceIssue = Effect.fn("WorkflowService.completeEvidenceIssue")(function* (
+    cwd: string,
+    rawIssue: RawIssue,
+  ) {
+    const repository = rawIssue.repository.nameWithOwner;
+    const issue = yield* completeLabels(cwd, repository, rawIssue);
+    const comments = yield* completeComments(cwd, repository, issue.id, issue.comments);
+    const assignees = yield* completeAssignees(cwd, repository, issue.id, issue.assignees);
+    const reopened = yield* completeReopened(cwd, repository, issue.id, issue.timelineItems);
+    const blockers = yield* completeBlockerReferences(cwd, repository, issue);
+    const summary = issueSummary(issue);
+    return {
+      raw: {
+        ...issue,
+        blockedBy: issue.blockedBy
+          ? {
+              ...issue.blockedBy,
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: blockers,
+            }
+          : undefined,
+      },
+      issue: {
+        id: summary.id,
+        url: summary.url,
+        number: summary.number,
+        title: summary.title,
+        kind: summary.kind,
+        state: summary.state,
+        stateReason: summary.stateReason,
+        labels: summary.labels,
+        assignees: assignees.map((assignee) => assignee.login),
+        body: issue.body ?? "",
+        comments: comments.map(evidenceComment),
+        reopenedAt: reopened.map((event) => event.createdAt),
+      } satisfies WorkflowEvidenceIssue,
+    };
+  });
+
+  const loadEvidenceIssue = Effect.fn("WorkflowService.loadEvidenceIssue")(function* (
+    cwd: string,
+    reference: RawIssueReference,
+  ) {
+    const raw = yield* executeGraphQl({
+      cwd,
+      repository: reference.repository.nameWithOwner,
+      query: EVIDENCE_LOOKUP_QUERY,
+      id: reference.id,
+    });
+    const decoded = yield* Effect.try({
+      try: () => decodeEvidenceLookup(raw),
+      catch: (error) =>
+        queryError("invalid-response", "GitHub returned invalid workflow evidence.", String(error)),
+    });
+    if (!decoded.data.node)
+      return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+    return yield* completeEvidenceIssue(cwd, decoded.data.node);
+  });
+
+  const assessEvidenceIssue = Effect.fn("WorkflowService.assessEvidenceIssue")(function* (input: {
+    cwd: string;
+    issue: { readonly raw: RawIssue; readonly issue: WorkflowEvidenceIssue };
+    approvalComments: ReadonlyArray<WorkflowEvidenceComment>;
+    cache: Map<string, WorkflowReadiness>;
+  }) {
+    const blockers = [];
+    for (const blocker of input.issue.raw.blockedBy?.nodes ?? []) {
+      let readiness = input.cache.get(blocker.id);
+      if (!readiness) {
+        const completeBlocker = yield* completeLabels(
+          input.cwd,
+          blocker.repository.nameWithOwner,
+          blocker,
+        );
+        const blockerSummary = issueSummary(completeBlocker);
+        if (blockerSummary.state === "open" || blockerSummary.stateReason === "not_planned") {
+          readiness = interpretWorkflowEvidence({
+            issue: {
+              id: blockerSummary.id,
+              url: blockerSummary.url,
+              number: blockerSummary.number,
+              title: blockerSummary.title,
+              kind: blockerSummary.kind,
+              state: blockerSummary.state,
+              stateReason: blockerSummary.stateReason,
+              labels: blockerSummary.labels,
+              assignees: [],
+              body: "",
+              comments: [],
+              reopenedAt: [],
+            },
+          }).readiness;
+        } else {
+          const loaded = yield* loadEvidenceIssue(input.cwd, completeBlocker);
+          readiness = interpretWorkflowEvidence({ issue: loaded.issue }).readiness;
+        }
+        input.cache.set(blocker.id, readiness);
+      }
+      blockers.push({
+        id: blocker.id,
+        number: blocker.number,
+        title: blocker.title,
+        url: blocker.url,
+        readiness,
+      });
+    }
+    return interpretWorkflowEvidence({
+      issue: input.issue.issue,
+      approvalComments: input.approvalComments,
+      blockers,
+    });
   });
 
   const repositories: WorkflowService["Service"]["repositories"] = Effect.fn(
@@ -482,6 +817,9 @@ export const make = Effect.gen(function* () {
     function* (input) {
       const selectedProject = yield* project(input.projectId);
       const children = [];
+      let approvalComments: ReadonlyArray<WorkflowEvidenceComment> = [];
+      let approvalCommentsLoaded = false;
+      let parentBody = "";
       let cursor: string | undefined;
       do {
         const raw = yield* executeGraphQl({
@@ -504,13 +842,18 @@ export const make = Effect.gen(function* () {
           );
         if (!repository.issue)
           return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
-        for (const issue of repository.issue.subIssues.nodes) {
-          const completeIssue = yield* completeLabels(
+        parentBody = repository.issue.body ?? parentBody;
+        if (!approvalCommentsLoaded && repository.issue.id && repository.issue.comments) {
+          approvalComments = (yield* completeComments(
             selectedProject.workspaceRoot,
-            issue.repository.nameWithOwner,
-            issue,
-          );
-          children.push(issueSummary(completeIssue, input.parentNumber));
+            input.repository,
+            repository.issue.id,
+            repository.issue.comments,
+          )).map(evidenceComment);
+          approvalCommentsLoaded = true;
+        }
+        for (const issue of repository.issue.subIssues.nodes) {
+          children.push(yield* completeEvidenceIssue(selectedProject.workspaceRoot, issue));
         }
         if (
           repository.issue.subIssues.pageInfo.hasNextPage &&
@@ -525,7 +868,28 @@ export const make = Effect.gen(function* () {
           ? (repository.issue.subIssues.pageInfo.endCursor ?? undefined)
           : undefined;
       } while (cursor);
-      return { parentNumber: input.parentNumber, children };
+      const blockerCache = new Map<string, WorkflowReadiness>();
+      const assessed = [];
+      for (const child of children) {
+        const interpretation = yield* assessEvidenceIssue({
+          cwd: selectedProject.workspaceRoot,
+          issue: child,
+          approvalComments,
+          cache: blockerCache,
+        });
+        assessed.push({
+          ...issueSummary(child.raw, input.parentNumber),
+          readiness: interpretation.readiness,
+        });
+      }
+      return {
+        parentNumber: input.parentNumber,
+        children: assessed,
+        frontier: workflowFrontier(
+          assessed.map((child) => ({ id: child.id, readiness: child.readiness })),
+          { hasRemainingFog: workflowHasRemainingFog(parentBody) },
+        ),
+      };
     },
   );
 
@@ -552,21 +916,40 @@ export const make = Effect.gen(function* () {
       );
     if (!repository.issue)
       return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
-    const completeIssue = yield* completeLabels(
+    const completeIssue = yield* completeEvidenceIssue(
       selectedProject.workspaceRoot,
-      input.repository,
       repository.issue,
     );
-    const summary = issueSummary(completeIssue);
+    let approvalComments: ReadonlyArray<WorkflowEvidenceComment> = [];
+    if (
+      completeIssue.issue.kind === "ticket" &&
+      /Approved slice:\s*\*\*T\d+\*\*/iu.test(completeIssue.issue.body) &&
+      completeIssue.raw.parent
+    ) {
+      const approvalIssue = yield* loadEvidenceIssue(
+        selectedProject.workspaceRoot,
+        completeIssue.raw.parent,
+      );
+      approvalComments = approvalIssue.issue.comments;
+    }
+    const interpretation = yield* assessEvidenceIssue({
+      cwd: selectedProject.workspaceRoot,
+      issue: completeIssue,
+      approvalComments,
+      cache: new Map(),
+    });
+    const summary = issueSummary(completeIssue.raw);
     const blockedBy = yield* completeBlockedBy(
       selectedProject.workspaceRoot,
       input.repository,
-      repository.issue,
+      completeIssue.raw,
     );
     return {
       ...summary,
-      body: repository.issue.body ?? "",
+      readiness: interpretation.readiness,
+      body: completeIssue.issue.body,
       blockedBy,
+      evidence: interpretation.evidence,
     };
   });
 

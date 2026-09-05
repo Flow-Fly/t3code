@@ -80,6 +80,19 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
             remoteCalls.push(input);
             return { repository: "Flow-Fly/t3code", roots: [] };
           }),
+        [WS_METHODS.workflowChildren]: (input: unknown) =>
+          Effect.sync(() => {
+            remoteCalls.push(input);
+            return {
+              parentNumber: 10,
+              children: [],
+              frontier: {
+                status: "empty-claimed",
+                message: "All otherwise available work is already claimed.",
+                readyIssueIds: [],
+              },
+            };
+          }),
       } as unknown as WsRpcProtocolClient;
       const local = yield* supervisor(LOCAL_ID, localClient);
       const remote = yield* supervisor(REMOTE_ID, remoteClient);
@@ -124,10 +137,21 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
       yield* Effect.addFinalizer(() => Effect.sync(unmount));
 
       const result = yield* Effect.promise(() => executeAtomQuery(registry, roots));
+      const children = atoms.children({
+        environmentId: REMOTE_ID,
+        input: { ...input, parentNumber: 10 },
+      });
+      const unmountChildren = registry.mount(children);
+      yield* Effect.addFinalizer(() => Effect.sync(unmountChildren));
+      const childResult = yield* Effect.promise(() => executeAtomQuery(registry, children));
 
       expect(AsyncResult.isSuccess(result)).toBe(true);
-      expect(routedEnvironments).toEqual([REMOTE_ID]);
-      expect(remoteCalls).toEqual([input]);
+      expect(AsyncResult.isSuccess(childResult)).toBe(true);
+      if (AsyncResult.isSuccess(childResult)) {
+        expect(childResult.value.frontier?.status).toBe("empty-claimed");
+      }
+      expect(routedEnvironments).toEqual([REMOTE_ID, REMOTE_ID]);
+      expect(remoteCalls).toEqual([input, { ...input, parentNumber: 10 }]);
     }),
   ),
 );

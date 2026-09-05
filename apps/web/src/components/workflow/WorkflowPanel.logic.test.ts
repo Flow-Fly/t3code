@@ -53,6 +53,26 @@ describe("Workflow panel browsing", () => {
     expect(workflowIssueStateLabel({ state: "closed", stateReason: "not_planned" })).toBe(
       "Closed — not planned",
     );
+    expect(
+      workflowIssueStateLabel({
+        state: "closed",
+        stateReason: "completed",
+        readiness: {
+          status: "resolved",
+          reasons: [{ kind: "resolution", message: "Completed with current resolution evidence." }],
+        },
+      }),
+    ).toBe("Resolved");
+    expect(
+      workflowIssueStateLabel({
+        state: "open",
+        stateReason: null,
+        readiness: {
+          status: "needs-review",
+          reasons: [{ kind: "scope-changed", message: "Scope changed." }],
+        },
+      }),
+    ).toBe("Needs review");
   });
 
   it("derives the brief only after detail is loaded", () => {
