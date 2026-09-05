@@ -30,6 +30,8 @@ export const WorkflowRepository = Schema.Struct({
 export type WorkflowRepository = typeof WorkflowRepository.Type;
 
 export const WorkflowIssueSummary = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
   number: PositiveInt,
   title: TrimmedNonEmptyString,
   url: TrimmedNonEmptyString,
@@ -38,6 +40,8 @@ export const WorkflowIssueSummary = Schema.Struct({
   stateReason: Schema.NullOr(WorkflowIssueStateReason),
   updatedAt: TrimmedNonEmptyString,
   childCount: Schema.Number,
+  parentNumber: Schema.NullOr(PositiveInt),
+  labels: Schema.Array(TrimmedNonEmptyString),
 });
 export type WorkflowIssueSummary = typeof WorkflowIssueSummary.Type;
 
@@ -84,9 +88,28 @@ export type WorkflowIssueDetailInput = typeof WorkflowIssueDetailInput.Type;
 export const WorkflowIssueDetail = Schema.Struct({
   ...WorkflowIssueSummary.fields,
   body: Schema.String,
-  labels: Schema.Array(TrimmedNonEmptyString),
+  blockedBy: Schema.Array(WorkflowIssueSummary),
 });
 export type WorkflowIssueDetail = typeof WorkflowIssueDetail.Type;
+
+export const WorkflowSearchInput = Schema.Struct({
+  ...WorkflowRootsInput.fields,
+  query: TrimmedNonEmptyString,
+});
+export type WorkflowSearchInput = typeof WorkflowSearchInput.Type;
+
+export const WorkflowSearchMatch = Schema.Struct({
+  issue: WorkflowIssueSummary,
+  ancestry: Schema.Array(WorkflowIssueSummary),
+  ancestryComplete: Schema.Boolean,
+});
+export type WorkflowSearchMatch = typeof WorkflowSearchMatch.Type;
+
+export const WorkflowSearchResult = Schema.Struct({
+  matches: Schema.Array(WorkflowSearchMatch),
+  hasMore: Schema.Boolean,
+});
+export type WorkflowSearchResult = typeof WorkflowSearchResult.Type;
 
 export const WorkflowQueryFailure = Schema.Literals([
   "project-not-found",

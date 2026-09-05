@@ -15,6 +15,8 @@ const repositories: WorkflowRepository[] = [
 ];
 
 const issue = (number: number, title: string, kind: WorkflowIssueSummary["kind"]) => ({
+  id: `issue-${number}`,
+  repository: "Flow-Fly/t3code",
   number,
   title,
   kind,
@@ -23,6 +25,8 @@ const issue = (number: number, title: string, kind: WorkflowIssueSummary["kind"]
   stateReason: null,
   updatedAt: "2026-09-05T19:30:00Z",
   childCount: 0,
+  parentNumber: null,
+  labels: [],
 });
 
 describe("Workflow panel browsing", () => {
@@ -56,6 +60,7 @@ describe("Workflow panel browsing", () => {
         ...issue(11, "Browse GitHub work", "ticket"),
         body: "## Summary\n\nBrowse work beside chat.\n\n## Details\n\nLong evidence.",
         labels: ["workflow:ticket"],
+        blockedBy: [],
       }),
     ).toBe("Browse work beside chat.");
   });
@@ -66,11 +71,24 @@ describe("Workflow panel browsing", () => {
         "## Parent\n\n[Capability](https://github.com/Flow-Fly/t3code/issues/10)\n\n[Approval](https://github.com/Flow-Fly/t3code/issues/10#issuecomment-1)",
       ),
     ).toEqual([
-      { label: "Capability", url: "https://github.com/Flow-Fly/t3code/issues/10" },
+      {
+        label: "Capability",
+        url: "https://github.com/Flow-Fly/t3code/issues/10",
+        relationship: "reference",
+      },
       {
         label: "Approval",
         url: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-1",
+        relationship: "reference",
       },
     ]);
+  });
+
+  it("classifies only declared relationship sections", () => {
+    expect(
+      workflowSourceLinks(
+        "## Source map\n\n[Map](https://github.com/acme/repo/issues/1)\n\n## Specification\n\n[Spec](https://github.com/acme/repo/issues/2)\n\n## Notes\n\n[Mention](https://github.com/acme/repo/issues/3)",
+      ).map(({ relationship }) => relationship),
+    ).toEqual(["source", "specification", "reference"]);
   });
 });

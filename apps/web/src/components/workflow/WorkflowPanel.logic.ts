@@ -51,15 +51,28 @@ export function workflowIssueBrief(detail: WorkflowIssueDetail): string | null {
 export interface WorkflowSourceLink {
   readonly label: string;
   readonly url: string;
+  readonly relationship: "source" | "specification" | "supersession" | "reference";
 }
 
 export function workflowSourceLinks(body: string): ReadonlyArray<WorkflowSourceLink> {
   const links = new Map<string, WorkflowSourceLink>();
-  for (const match of body.matchAll(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g)) {
-    const label = match[1]?.trim();
-    const url = match[2];
-    if (!label || !url || links.has(url)) continue;
-    links.set(url, { label, url });
+  let section = "";
+  for (const line of body.split("\n")) {
+    const heading = /^#{1,6}\s+(.+)$/.exec(line);
+    if (heading) section = heading[1]?.trim().toLocaleLowerCase() ?? "";
+    for (const match of line.matchAll(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g)) {
+      const label = match[1]?.trim();
+      const url = match[2];
+      if (!label || !url || links.has(url)) continue;
+      const relationship = /superseded by|supersession/.test(section)
+        ? "supersession"
+        : /specification|approved spec/.test(section)
+          ? "specification"
+          : /source map|source/.test(section)
+            ? "source"
+            : "reference";
+      links.set(url, { label, url, relationship });
+    }
   }
   return [...links.values()];
 }

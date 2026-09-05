@@ -138,6 +138,8 @@ import {
   WorkflowRepositoriesResult,
   WorkflowRootsInput,
   WorkflowRootsResult,
+  WorkflowSearchInput,
+  WorkflowSearchResult,
 } from "./workflow.ts";
 import {
   RelayClientInstallFailedError,
@@ -376,6 +378,7 @@ export const WS_METHODS = {
   workflowRoots: "workflow.roots",
   workflowChildren: "workflow.children",
   workflowIssueDetail: "workflow.issueDetail",
+  workflowSearch: "workflow.search",
 
   // Source control methods
   sourceControlLookupRepository: "sourceControl.lookupRepository",
@@ -809,6 +812,12 @@ export const WsWorkflowChildrenRpc = Rpc.make(WS_METHODS.workflowChildren, {
 export const WsWorkflowIssueDetailRpc = Rpc.make(WS_METHODS.workflowIssueDetail, {
   payload: WorkflowIssueDetailInput,
   success: WorkflowIssueDetail,
+  error: WorkflowRpcError,
+});
+
+export const WsWorkflowSearchRpc = Rpc.make(WS_METHODS.workflowSearch, {
+  payload: WorkflowSearchInput,
+  success: WorkflowSearchResult,
   error: WorkflowRpcError,
 });
 
@@ -1306,6 +1315,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowRootsRpc,
   WsWorkflowChildrenRpc,
   WsWorkflowIssueDetailRpc,
+  WsWorkflowSearchRpc,
   WsSourceControlLookupRepositoryRpc,
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,

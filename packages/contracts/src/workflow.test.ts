@@ -37,6 +37,8 @@ describe("workflow contracts", () => {
   it("preserves raw closed state without claiming verified resolution", () => {
     const decode = Schema.decodeUnknownSync(WorkflowIssueSummary);
     const issue = decode({
+      id: "issue-11",
+      repository: "Flow-Fly/t3code",
       number: 11,
       title: "Browse GitHub work",
       url: "https://github.com/Flow-Fly/t3code/issues/11",
@@ -45,6 +47,8 @@ describe("workflow contracts", () => {
       stateReason: "completed",
       updatedAt: "2026-09-05T19:30:00Z",
       childCount: 0,
+      parentNumber: 10,
+      labels: ["workflow:ticket"],
     });
 
     expect(issue.state).toBe("closed");

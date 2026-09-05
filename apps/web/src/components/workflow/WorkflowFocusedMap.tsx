@@ -1,0 +1,747 @@
+import type {
+  EnvironmentId,
+  ProjectId,
+  WorkflowChildrenResult,
+  WorkflowIssueSummary,
+  WorkflowSearchMatch,
+} from "@t3tools/contracts";
+import {
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  Focus,
+  LocateFixed,
+  Minus,
+  Plus,
+} from "lucide-react";
+import {
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+
+import { useEnvironmentQuery } from "~/state/query";
+import { workflowEnvironment } from "~/state/workflow";
+import { Button } from "~/components/ui/button";
+import { Input } from "~/components/ui/input";
+import { cn } from "~/lib/utils";
+import {
+  selectWorkflowMapView,
+  useWorkflowMapStore,
+  workflowMapContextKey,
+  workflowMapScopeKey,
+} from "~/workflowMapStore";
+
+import {
+  buildVisibleWorkflowMap,
+  fitWorkflowViewport,
+  foldIdentity,
+  issueIdentity,
+  mergeWorkflowSearchMatch,
+  type WorkflowPoint,
+  type WorkflowViewport,
+} from "./WorkflowMap.logic";
+import {
+  workflowIssueBrief,
+  workflowIssueStateLabel,
+  workflowSourceLinks,
+} from "./WorkflowPanel.logic";
+
+function ChildrenLoader(props: {
+  environmentId: EnvironmentId;
+  projectId: ProjectId;
+  parent: WorkflowIssueSummary;
+  refreshRequest: number;
+  onLoad: (parent: WorkflowIssueSummary, result: WorkflowChildrenResult) => void;
+}) {
+  const query = useEnvironmentQuery(
+    workflowEnvironment.children({
+      environmentId: props.environmentId,
+      input: {
+        projectId: props.projectId,
+        repository: props.parent.repository,
+        parentNumber: props.parent.number,
+      },
+    }),
+  );
+  const lastRefreshRequest = useRef(props.refreshRequest);
+  const refreshQuery = query.refresh;
+  const refreshRequest = props.refreshRequest;
+  useEffect(() => {
+    if (lastRefreshRequest.current === refreshRequest) return;
+    lastRefreshRequest.current = refreshRequest;
+    refreshQuery();
+  }, [refreshQuery, refreshRequest]);
+  useEffect(() => {
+    if (query.data) props.onLoad(props.parent, query.data);
+  }, [props, query.data]);
+  if (query.error)
+    return (
+      <div className="col-span-full flex items-center gap-2 border-b border-border px-3 py-1 text-destructive text-xs">
+        <span>
+          Could not load children for #{props.parent.number}: {query.error}
+        </span>
+        <Button size="micro" variant="ghost" onClick={query.refresh}>
+          Retry
+        </Button>
+      </div>
+    );
+  if (query.isPending && !query.data)
+    return (
+      <p className="col-span-full border-b border-border px-3 py-1 text-muted-foreground text-xs">
+        Loading children for #{props.parent.number}…
+      </p>
+    );
+  return null;
+}
+
+function WorkflowDetails(props: {
+  environmentId: EnvironmentId;
+  projectId: ProjectId;
+  issue: WorkflowIssueSummary;
+  refreshRequest: number;
+}) {
+  const query = useEnvironmentQuery(
+    workflowEnvironment.issueDetail({
+      environmentId: props.environmentId,
+      input: {
+        projectId: props.projectId,
+        repository: props.issue.repository,
+        number: props.issue.number,
+      },
+    }),
+  );
+  const lastRefreshRequest = useRef(props.refreshRequest);
+  const refreshQuery = query.refresh;
+  const refreshRequest = props.refreshRequest;
+  useEffect(() => {
+    if (lastRefreshRequest.current === refreshRequest) return;
+    lastRefreshRequest.current = refreshRequest;
+    refreshQuery();
+  }, [refreshQuery, refreshRequest]);
+  if (query.isPending && !query.data)
+    return <p className="p-3 text-muted-foreground text-xs">Loading issue details…</p>;
+  if (query.error)
+    return (
+      <div className="flex items-center gap-2 p-3 text-destructive text-xs">
+        <span>{query.error}</span>
+        <Button size="micro" variant="ghost" onClick={query.refresh}>
+          Retry
+        </Button>
+      </div>
+    );
+  if (!query.data) return null;
+  const seen = new Set(query.data.blockedBy.map((issue) => `${issue.repository}#${issue.number}`));
+  const links = workflowSourceLinks(query.data.body).filter((link) => {
+    const match = /github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/.exec(link.url);
+    if (!match) return true;
+    const id = `${match[1]}#${Number(match[2])}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  return (
+    <article
+      className="grid gap-3 border-t border-border p-3"
+      aria-label="Selected workflow details"
+    >
+      <div>
+        <p className="text-muted-foreground text-[10px] uppercase tracking-wide">
+          {query.data.repository}
+        </p>
+        <h2 className="font-semibold text-sm">
+          #{query.data.number} {query.data.title}
+        </h2>
+        <p className="text-muted-foreground text-xs">
+          {query.data.kind} · {workflowIssueStateLabel(query.data)}
+        </p>
+        <a
+          className="mt-1 inline-flex items-center gap-1 text-info text-xs hover:underline"
+          href={query.data.url}
+          target="_blank"
+          rel="noreferrer noopener"
+        >
+          Open GitHub issue <ExternalLink className="size-3" />
+        </a>
+      </div>
+      <p className="whitespace-pre-wrap text-muted-foreground text-xs leading-relaxed">
+        {workflowIssueBrief(query.data) ?? "No description provided."}
+      </p>
+      {query.data.blockedBy.length > 0 || links.length > 0 ? (
+        <div>
+          <h3 className="font-medium text-xs">Relationships</h3>
+          <ul className="mt-1 grid gap-1 text-xs">
+            {query.data.blockedBy.map((blocker) => (
+              <li key={issueIdentity(blocker)}>
+                <a
+                  className="text-info hover:underline"
+                  href={blocker.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  Prerequisite · {blocker.repository}#{blocker.number} {blocker.title}
+                </a>
+              </li>
+            ))}
+            {links.map((link) => (
+              <li key={link.url}>
+                <a
+                  className="inline-flex items-center gap-1 text-info hover:underline"
+                  href={link.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  <span className="capitalize">{link.relationship}</span> · {link.label}{" "}
+                  <ExternalLink className="size-3" />
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {query.data.body.trim() ? (
+        <details className="rounded-md border border-border p-2">
+          <summary className="cursor-pointer font-medium text-xs">Full issue description</summary>
+          <pre className="mt-2 whitespace-pre-wrap font-sans text-muted-foreground text-xs leading-relaxed">
+            {query.data.body}
+          </pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+export function WorkflowFocusedMap(props: {
+  environmentId: EnvironmentId;
+  projectId: ProjectId;
+  root: WorkflowIssueSummary;
+  onRefreshRoot: () => void;
+}) {
+  const context = workflowMapContextKey({
+    environmentId: props.environmentId,
+    projectId: props.projectId,
+    repository: props.root.repository,
+  });
+  const rootId = issueIdentity(props.root);
+  const scope = workflowMapScopeKey(context, rootId);
+  const store = useWorkflowMapStore();
+  const view = selectWorkflowMapView(store.views, scope);
+  const [nodes, setNodes] = useState<Record<string, WorkflowIssueSummary>>({
+    [rootId]: props.root,
+  });
+  const [childrenByParent, setChildrenByParent] = useState<Record<string, readonly string[]>>({});
+  const [search, setSearch] = useState("");
+  const [refreshRequest, setRefreshRequest] = useState(0);
+  const [transientViewport, setTransientViewport] = useState<WorkflowViewport | null>(null);
+  const [transientPosition, setTransientPosition] = useState<{
+    id: string;
+    point: WorkflowPoint;
+  } | null>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const panRef = useRef<{ x: number; y: number; originX: number; originY: number } | null>(null);
+  const dragRef = useRef<{
+    id: string;
+    x: number;
+    y: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+
+  const onChildren = useCallback((parent: WorkflowIssueSummary, result: WorkflowChildrenResult) => {
+    const parentId = issueIdentity(parent);
+    setNodes((current) => {
+      const changed = result.children.some((child) => {
+        const existing = current[issueIdentity(child)];
+        return (
+          !existing ||
+          existing.updatedAt !== child.updatedAt ||
+          existing.state !== child.state ||
+          existing.stateReason !== child.stateReason ||
+          existing.title !== child.title ||
+          existing.childCount !== child.childCount
+        );
+      });
+      return changed
+        ? {
+            ...current,
+            ...Object.fromEntries(result.children.map((child) => [issueIdentity(child), child])),
+          }
+        : current;
+    });
+    setChildrenByParent((current) => {
+      const childIds = result.children.map(issueIdentity);
+      const existing = current[parentId] ?? [];
+      if (
+        existing.length === childIds.length &&
+        existing.every((childId, index) => childId === childIds[index])
+      ) {
+        return current;
+      }
+      return { ...current, [parentId]: childIds };
+    });
+  }, []);
+
+  const loadIds = [rootId, ...view.expanded].filter(
+    (id, index, values) => values.indexOf(id) === index,
+  );
+  const currentNodes = nodes[rootId] === props.root ? nodes : { ...nodes, [rootId]: props.root };
+  const currentPositions = transientPosition
+    ? { ...view.positions, [transientPosition.id]: transientPosition.point }
+    : view.positions;
+  const currentViewport = transientViewport ?? view.viewport;
+  const map = buildVisibleWorkflowMap({
+    root: props.root,
+    nodes: currentNodes,
+    childrenByParent,
+    expanded: view.expanded,
+    openFolds: view.openFolds,
+    positions: currentPositions,
+  });
+  const breadcrumbNodes = (() => {
+    if (!view.selectedId) return [];
+    const path = new Array<(typeof map.nodes)[number]>();
+    let current = map.nodes.find((node) => node.id === view.selectedId);
+    while (current) {
+      path.unshift(current);
+      current = current.parentId
+        ? map.nodes.find((node) => node.id === current!.parentId)
+        : undefined;
+    }
+    return path;
+  })();
+  useEffect(() => {
+    const missing = map.nodes.filter((node) => !(node.id in view.positions));
+    if (missing.length === 0) return;
+    store.patchView(scope, {
+      positions: {
+        ...view.positions,
+        ...Object.fromEntries(missing.map((node) => [node.id, node.position])),
+      },
+    });
+  }, [map.nodes, scope, store, view.positions]);
+
+  const selected = view.selectedId ? currentNodes[view.selectedId] : undefined;
+  const selectionHidden = Boolean(
+    view.selectedId && !map.nodes.some((node) => node.id === view.selectedId),
+  );
+  const searchQuery = useEnvironmentQuery(
+    search.trim()
+      ? workflowEnvironment.search({
+          environmentId: props.environmentId,
+          input: {
+            projectId: props.projectId,
+            repository: props.root.repository,
+            query: search.trim(),
+          },
+        })
+      : null,
+  );
+  const searchMatches =
+    searchQuery.data?.matches.filter(
+      (match) =>
+        issueIdentity(match.issue) === rootId ||
+        match.ancestry.some((ancestor) => issueIdentity(ancestor) === rootId),
+    ) ?? [];
+
+  const revealMatch = (match: WorkflowSearchMatch) => {
+    const merged = mergeWorkflowSearchMatch({ nodes: currentNodes, childrenByParent }, match);
+    setNodes(merged.nodes);
+    setChildrenByParent(merged.childrenByParent);
+    store.patchView(scope, {
+      selectedId: issueIdentity(match.issue),
+      expanded: [...new Set([...view.expanded, ...merged.expanded])],
+      openFolds: [
+        ...new Set([
+          ...view.openFolds,
+          ...match.ancestry.flatMap((parent) => [
+            foldIdentity(issueIdentity(parent), "completed"),
+            foldIdentity(issueIdentity(parent), "cancelled"),
+          ]),
+        ]),
+      ],
+    });
+  };
+
+  const zoomBy = (factor: number) =>
+    store.patchView(scope, {
+      viewport: {
+        ...view.viewport,
+        zoom: Math.min(2, Math.max(0.02, view.viewport.zoom * factor)),
+      },
+    });
+  const fit = () => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    store.patchView(scope, {
+      viewport: fitWorkflowViewport(map.nodes, {
+        width: rect?.width ?? 600,
+        height: rect?.height ?? 420,
+      }),
+    });
+  };
+  const reset = () => store.patchView(scope, { positions: {}, viewport: { x: 0, y: 0, zoom: 1 } });
+  const refresh = () => {
+    props.onRefreshRoot();
+    setRefreshRequest((current) => current + 1);
+  };
+
+  const panStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const target = event.target as { closest?: (selector: string) => unknown };
+    if (target.closest?.("[data-workflow-node], button, input, a")) return;
+    panRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      originX: view.viewport.x,
+      originY: view.viewport.y,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const panMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = panRef.current;
+    if (!pan) return;
+    setTransientViewport({
+      ...view.viewport,
+      x: pan.originX + event.clientX - pan.x,
+      y: pan.originY + event.clientY - pan.y,
+    });
+  };
+  const panEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = panRef.current;
+    if (!pan) return;
+    store.patchView(scope, {
+      viewport: {
+        ...view.viewport,
+        x: pan.originX + event.clientX - pan.x,
+        y: pan.originY + event.clientY - pan.y,
+      },
+    });
+    panRef.current = null;
+    setTransientViewport(null);
+  };
+  const dragStart = (id: string, event: ReactPointerEvent<HTMLDivElement>) => {
+    const position = view.positions[id] ?? { x: 0, y: 0 };
+    dragRef.current = {
+      id,
+      x: event.clientX,
+      y: event.clientY,
+      originX: position.x,
+      originY: position.y,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    event.stopPropagation();
+  };
+  const dragMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    setTransientPosition({
+      id: drag.id,
+      point: {
+        x: drag.originX + (event.clientX - drag.x) / view.viewport.zoom,
+        y: drag.originY + (event.clientY - drag.y) / view.viewport.zoom,
+      },
+    });
+  };
+  const dragEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    store.patchView(scope, {
+      positions: {
+        ...view.positions,
+        [drag.id]: {
+          x: drag.originX + (event.clientX - drag.x) / view.viewport.zoom,
+          y: drag.originY + (event.clientY - drag.y) / view.viewport.zoom,
+        },
+      },
+    });
+    dragRef.current = null;
+    setTransientPosition(null);
+  };
+  const wheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? 1.1 : 0.9);
+  };
+
+  return (
+    <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(16rem,1fr)_minmax(10rem,auto)] @lg/workflow:grid-cols-[minmax(0,1fr)_minmax(14rem,0.38fr)] @lg/workflow:grid-rows-[auto_minmax(0,1fr)]">
+      {loadIds.map((id) =>
+        currentNodes[id]?.childCount ? (
+          <ChildrenLoader
+            key={id}
+            environmentId={props.environmentId}
+            projectId={props.projectId}
+            parent={currentNodes[id]!}
+            refreshRequest={refreshRequest}
+            onLoad={onChildren}
+          />
+        ) : null,
+      )}
+      <div className="col-span-full grid gap-2 border-b border-border p-2 @md/workflow:grid-cols-[minmax(12rem,1fr)_auto]">
+        <div className="relative">
+          <Input
+            aria-label="Search this workflow"
+            placeholder="Search this workflow"
+            size="sm"
+            type="search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          {search.trim() ? (
+            <div
+              className="absolute z-30 mt-1 max-h-52 w-full overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-lg"
+              aria-label="Workflow search results"
+            >
+              {searchQuery.isPending && !searchQuery.data ? (
+                <p className="p-2 text-muted-foreground text-xs">Searching…</p>
+              ) : null}
+              {searchQuery.error ? (
+                <div className="flex items-center gap-2 p-2 text-destructive text-xs">
+                  <span>{searchQuery.error}</span>
+                  <Button size="micro" variant="ghost" onClick={searchQuery.refresh}>
+                    Retry
+                  </Button>
+                </div>
+              ) : null}
+              {searchMatches.map((match) => (
+                <button
+                  key={issueIdentity(match.issue)}
+                  type="button"
+                  className="block w-full rounded px-2 py-1.5 text-left text-xs hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => {
+                    revealMatch(match);
+                    setSearch("");
+                  }}
+                >
+                  <span className="block truncate">
+                    {match.issue.repository}#{match.issue.number} {match.issue.title}
+                  </span>
+                  <span className="block truncate text-muted-foreground">
+                    {match.ancestry.map((item) => `#${item.number}`).join(" / ")}
+                  </span>
+                  {!match.ancestryComplete ? (
+                    <span className="block text-amber-foreground">Earlier ancestry omitted</span>
+                  ) : null}
+                </button>
+              ))}
+              {searchQuery.data?.hasMore ? (
+                <p className="p-2 text-muted-foreground text-[10px]">
+                  More matches exist in {props.root.repository}; refine your search.
+                </p>
+              ) : null}
+              {searchQuery.data && searchMatches.length === 0 ? (
+                <p className="p-2 text-muted-foreground text-xs">
+                  No matches in this focused root.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-1" aria-label="Map controls">
+          <Button size="icon-xs" variant="ghost" aria-label="Zoom out" onClick={() => zoomBy(0.9)}>
+            <Minus />
+          </Button>
+          <Button size="icon-xs" variant="ghost" aria-label="Zoom in" onClick={() => zoomBy(1.1)}>
+            <Plus />
+          </Button>
+          <Button size="xs" variant="ghost" aria-label="Fit workflow map" onClick={fit}>
+            <Focus /> Fit
+          </Button>
+          <Button size="xs" variant="ghost" aria-label="Reset workflow layout" onClick={reset}>
+            <LocateFixed /> Reset
+          </Button>
+          <Button size="xs" variant="ghost" aria-label="Refresh workflow map" onClick={refresh}>
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div
+        ref={canvasRef}
+        className="relative min-h-64 overflow-hidden bg-[radial-gradient(circle_at_center,var(--border)_1px,transparent_1px)] bg-[size:18px_18px] touch-none"
+        aria-label="Workflow map canvas"
+        onPointerDown={panStart}
+        onPointerMove={panMove}
+        onPointerUp={panEnd}
+        onPointerCancel={panEnd}
+        onWheel={wheel}
+      >
+        <div
+          className="absolute inset-0 origin-top-left"
+          style={{
+            transform: `translate(${currentViewport.x}px, ${currentViewport.y}px) scale(${currentViewport.zoom})`,
+          }}
+        >
+          <svg className="pointer-events-none absolute inset-0 overflow-visible" aria-hidden="true">
+            {map.nodes
+              .filter((node) => node.parentId)
+              .map((node) => {
+                const parent = map.nodes.find((candidate) => candidate.id === node.parentId);
+                if (!parent) return null;
+                return (
+                  <path
+                    key={node.id}
+                    d={`M ${parent.position.x + 104} ${parent.position.y + 92} C ${parent.position.x + 104} ${parent.position.y + 120}, ${node.position.x + 104} ${node.position.y - 28}, ${node.position.x + 104} ${node.position.y}`}
+                    fill="none"
+                    stroke="currentColor"
+                    className="text-border"
+                  />
+                );
+              })}
+          </svg>
+          {map.nodes.map((node) => {
+            const isSelected = node.id === view.selectedId;
+            const isExpanded = view.expanded.includes(node.id);
+            return (
+              <div
+                key={node.id}
+                data-workflow-node
+                className={cn(
+                  "absolute w-52 rounded-lg border bg-background p-2 shadow-sm",
+                  isSelected ? "border-ring ring-2 ring-ring/30" : "border-border",
+                )}
+                style={{ transform: `translate(${node.position.x}px, ${node.position.y}px)` }}
+                onPointerDown={(event) => dragStart(node.id, event)}
+                onPointerMove={dragMove}
+                onPointerUp={dragEnd}
+                onPointerCancel={dragEnd}
+              >
+                <button
+                  type="button"
+                  className="block w-full text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-current={isSelected ? "true" : undefined}
+                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                >
+                  <span className="block truncate text-[10px] text-muted-foreground">
+                    {node.issue.repository} · {node.issue.kind}
+                  </span>
+                  <span className="mt-1 line-clamp-2 block font-medium text-xs">
+                    #{node.issue.number} {node.issue.title}
+                  </span>
+                  <span className="mt-1 block text-[10px] text-muted-foreground">
+                    {workflowIssueStateLabel(node.issue)}
+                  </span>
+                </button>
+                {node.issue.childCount > 0 && node.id !== rootId ? (
+                  <button
+                    type="button"
+                    className="mt-1 inline-flex items-center gap-1 rounded text-[10px] focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={`${isExpanded ? "Collapse" : "Expand"} ${node.issue.title}`}
+                    aria-expanded={isExpanded}
+                    onClick={() => store.toggleExpanded(scope, node.id)}
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="size-3" />
+                    ) : (
+                      <ChevronRight className="size-3" />
+                    )}{" "}
+                    {node.issue.childCount}
+                  </button>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <aside
+        className="min-h-0 overflow-y-auto border-t border-border @lg/workflow:border-t-0 @lg/workflow:border-s"
+        aria-label="Workflow outline and details"
+      >
+        {selectionHidden ? (
+          <div className="border-b border-border p-2 text-xs">
+            <p>The selected work moved or is outside this focus.</p>
+            <Button
+              className="mt-1"
+              size="xs"
+              variant="outline"
+              onClick={() => setSearch(selected?.title ?? view.selectedId ?? "")}
+            >
+              Find current context
+            </Button>
+          </div>
+        ) : null}
+        <nav className="border-b border-border p-2" aria-label="Workflow breadcrumbs">
+          <ol className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+            <li>{props.root.repository}</li>
+            {(breadcrumbNodes.length > 0 ? breadcrumbNodes : map.nodes.slice(0, 1)).map((node) => (
+              <li key={node.id} className="contents">
+                <span aria-hidden="true">/</span>
+                <button
+                  type="button"
+                  className="max-w-40 truncate rounded hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-current={node.id === view.selectedId ? "location" : undefined}
+                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                >
+                  #{node.issue.number} {node.issue.title}
+                </button>
+              </li>
+            ))}
+          </ol>
+        </nav>
+        <div className="p-2">
+          <ul aria-label="Synchronized workflow outline" className="grid gap-1">
+            {map.nodes.map((node) => (
+              <li
+                key={node.id}
+                style={{ paddingInlineStart: `${node.depth * 12}px` }}
+                className="flex items-center gap-1"
+              >
+                {node.issue.childCount > 0 && node.id !== rootId ? (
+                  <button
+                    type="button"
+                    className="rounded p-1 focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={`${view.expanded.includes(node.id) ? "Collapse" : "Expand"} ${node.issue.title} in outline`}
+                    onClick={() => store.toggleExpanded(scope, node.id)}
+                  >
+                    {view.expanded.includes(node.id) ? (
+                      <ChevronDown className="size-3" />
+                    ) : (
+                      <ChevronRight className="size-3" />
+                    )}
+                  </button>
+                ) : (
+                  <span className="size-5" />
+                )}
+                <button
+                  type="button"
+                  className="min-w-0 flex-1 truncate rounded py-1 text-left text-xs focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-current={node.id === view.selectedId ? "true" : undefined}
+                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                >
+                  #{node.issue.number} {node.issue.title}
+                </button>
+              </li>
+            ))}
+          </ul>
+          {map.folds.map((fold) => (
+            <Button
+              key={fold.id}
+              className="mt-1 w-full justify-start"
+              size="xs"
+              variant="ghost"
+              aria-expanded={fold.open}
+              onClick={() => store.toggleFold(scope, fold.id)}
+            >
+              {fold.open ? <ChevronDown /> : <ChevronRight />}{" "}
+              {fold.group === "completed" ? "Completed — unverified" : "Cancelled / superseded"} (
+              {fold.count})
+            </Button>
+          ))}
+        </div>
+        {selected ? (
+          <WorkflowDetails
+            environmentId={props.environmentId}
+            projectId={props.projectId}
+            issue={selected}
+            refreshRequest={refreshRequest}
+          />
+        ) : (
+          <p className="border-t border-border p-3 text-muted-foreground text-xs">
+            Select work to inspect it without starting an agent.
+          </p>
+        )}
+      </aside>
+    </div>
+  );
+}

@@ -27,20 +27,24 @@ const processOutput = (stdout: string) => ({
 });
 
 function issue(number: number, parent: number | null = null) {
-  return {
-    id: `issue-${number}`,
-    number,
-    title: `Issue ${number}`,
-    url: `https://github.com/Flow-Fly/t3code/issues/${number}`,
-    state: number === 2 ? "CLOSED" : "OPEN",
-    stateReason: number === 2 ? "COMPLETED" : null,
+  const summary = (issueNumber: number) => ({
+    id: `issue-${issueNumber}`,
+    number: issueNumber,
+    title: `Issue ${issueNumber}`,
+    url: `https://github.com/Flow-Fly/t3code/issues/${issueNumber}`,
+    state: issueNumber === 2 ? "CLOSED" : "OPEN",
+    stateReason: issueNumber === 2 ? "COMPLETED" : null,
     updatedAt: "2026-09-05T19:30:00Z",
+    repository: { nameWithOwner: "Flow-Fly/t3code" },
     labels: {
-      pageInfo: { hasNextPage: false, endCursor: `labels-${number}` },
-      nodes: [{ name: number === 1 ? "workflow:capability" : "workflow:ticket" }],
+      pageInfo: { hasNextPage: false, endCursor: `labels-${issueNumber}` },
+      nodes: [{ name: issueNumber === 1 ? "workflow:capability" : "workflow:ticket" }],
     },
-    parent: parent === null ? null : { number: parent },
-    subIssuesSummary: { total: number === 1 ? 1 : 0 },
+    subIssuesSummary: { total: issueNumber === 1 ? 1 : 0 },
+  });
+  return {
+    ...summary(number),
+    parent: parent === null ? null : summary(parent),
   };
 }
 
@@ -178,6 +182,9 @@ describe("WorkflowService", () => {
                       nodes: [
                         {
                           ...issue(13, 10),
+                          id: "another-repository-13",
+                          repository: { nameWithOwner: "another/repository" },
+                          url: "https://github.com/another/repository/issues/13",
                           labels: {
                             pageInfo: { hasNextPage: false, endCursor: "labels-13" },
                             nodes: [],
@@ -205,6 +212,11 @@ describe("WorkflowService", () => {
         { number: 12, kind: "container" },
         { number: 13, kind: "task" },
       ]);
+      expect(result.children[1]).toMatchObject({
+        id: "another-repository-13",
+        repository: "another/repository",
+        parentNumber: 10,
+      });
       expect(execute).toHaveBeenCalledTimes(2);
       expect(execute.mock.calls[1]?.[0].args).toContain("after=page-2");
     }).pipe(Effect.provide(layer(execute)));
@@ -268,4 +280,114 @@ describe("WorkflowService", () => {
       expect(execute.mock.calls[1]?.[0].args).toContain("after=labels-2");
     }).pipe(Effect.provide(layer(execute)));
   });
+
+  it.effect("keeps a native cross-repository blocker as one repository-qualified identity", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    execute.mockReturnValueOnce(
+      Effect.succeed(
+        processOutput(
+          JSON.stringify({
+            data: {
+              repository: {
+                issue: {
+                  ...issue(11, 10),
+                  body: "## Source map\n\n[Map](https://github.com/Flow-Fly/t3code/issues/1)",
+                  blockedBy: {
+                    pageInfo: { hasNextPage: true, endCursor: "blockers-2" },
+                    nodes: [
+                      {
+                        ...issue(7),
+                        id: "other-repo-issue-7",
+                        repository: { nameWithOwner: "another/repository" },
+                        url: "https://github.com/another/repository/issues/7",
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+        ) as never,
+      ),
+    );
+    execute.mockReturnValueOnce(
+      Effect.succeed(
+        processOutput(
+          JSON.stringify({
+            data: {
+              node: {
+                blockedBy: {
+                  pageInfo: { hasNextPage: false, endCursor: "blockers-terminal" },
+                  nodes: [
+                    {
+                      ...issue(7),
+                      id: "other-repo-issue-7",
+                      repository: { nameWithOwner: "another/repository" },
+                      url: "https://github.com/another/repository/issues/7",
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        ) as never,
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.issueDetail({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        number: 11,
+      });
+
+      expect(result.blockedBy).toHaveLength(1);
+      expect(result.blockedBy[0]).toMatchObject({
+        id: "other-repo-issue-7",
+        repository: "another/repository",
+        number: 7,
+      });
+      expect(execute.mock.calls[1]?.[0].args).toContain("after=blockers-2");
+    }).pipe(Effect.provide(layer(execute)));
+  });
+
+  it.effect(
+    "reports truncation when the fifty-result search limit lands inside a terminal page",
+    () => {
+      const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+      const page = (start: number, count: number, hasNextPage: boolean, endCursor: string) =>
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({
+              data: {
+                search: {
+                  pageInfo: { hasNextPage, endCursor },
+                  nodes: Array.from({ length: count }, (_, index) => issue(start + index)),
+                },
+              },
+            }),
+          ) as never,
+        );
+      execute
+        .mockReturnValueOnce(page(100, 20, true, "search-2"))
+        .mockReturnValueOnce(page(120, 20, true, "search-3"))
+        .mockReturnValueOnce(page(140, 15, false, "search-terminal"));
+
+      return Effect.gen(function* () {
+        const service = yield* WorkflowService.WorkflowService;
+        const result = yield* service.search({
+          projectId: "project-1" as never,
+          repository: "Flow-Fly/t3code",
+          query: "delivery",
+        });
+
+        expect(result.matches).toHaveLength(50);
+        expect(result.hasMore).toBe(true);
+        expect(execute).toHaveBeenCalledTimes(3);
+        expect(execute.mock.calls[1]?.[0].args).toContain("after=search-2");
+        expect(result.matches[0]?.ancestryComplete).toBe(true);
+      }).pipe(Effect.provide(layer(execute)));
+    },
+  );
 });

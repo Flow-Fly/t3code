@@ -2119,6 +2119,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowIssueDetail, workflow.issueDetail(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowSearch]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowSearch, workflow.search(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.pullRequestsListStats]: (input) =>
           observeRpcEffect(WS_METHODS.pullRequestsListStats, pullRequests.listStats(input), {
             "rpc.aggregate": "pull-requests",

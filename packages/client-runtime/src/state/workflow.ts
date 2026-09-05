@@ -29,5 +29,10 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       tag: WS_METHODS.workflowIssueDetail,
       staleTimeMs: 30_000,
     }),
+    search: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:workflow:search",
+      tag: WS_METHODS.workflowSearch,
+      staleTimeMs: 30_000,
+    }),
   };
 }
