@@ -20,8 +20,9 @@ page when listing children or dependencies. Verify relationships after writes.
 - Read blocking edges with `GET issues/{ticket}/dependencies/blocked_by`.
   Add edges with `POST` to that endpoint, passing the blocker's numeric database
   ID as `issue_id`. Issue numbers and database IDs are different.
-- The frontier contains open children with no open blockers and no assignee.
-  An empty frontier can mean claimed work, blocked work or remaining fog.
+- The frontier contains open children with no open blockers, no pending
+  dependency reassessment and no assignee. An empty frontier can mean claimed
+  work, blocked work, pending reassessment or remaining fog.
 - Claim before work with `gh issue edit NUMBER --repo Flow-Fly/t3code
 --add-assignee @me`. Re-read live state before choosing or claiming work;
   assignment alone is not an atomic lock between sessions.
@@ -38,8 +39,23 @@ steps in `$to-spec` and `$to-tickets`. An approved specification is not delivery
 permission. Apply `ready-for-agent` only to approved delivery work whose blockers
 are complete; planning tickets do not receive it.
 
-Capability classification, spec-to-map relationships and resolution markers are
-open design questions in this effort. Prototype examples do not establish those
-tracker conventions.
+A capability is the specification issue itself. Put its brief and specification
+in that issue, and make its delivery tickets native sub-issues. Link the
+capability to its source Wayfinder map; a map may produce several capabilities.
+Decision tickets remain children of their map.
+
+## Cancelled prerequisites
+
+Cancellation or out-of-scope closure is distinct from successful resolution.
+Mark affected dependent work as needing reassessment and exclude it from ready
+work until its dependency has been reassessed. This applies to decision and
+delivery tickets, even when GitHub reports the blocker as closed.
+
+## Existing repositories
+
+Offer a proposed classification and linking plan for owner confirmation before
+adopting existing issues into this workflow. Keep missing metadata visible for
+correction. After adoption, use the agreed conventions for new issues; titles
+remain display names rather than machine identity.
 
 **PRs as a request surface: no.**

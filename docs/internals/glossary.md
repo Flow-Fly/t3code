@@ -48,9 +48,10 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 
 ## Workflow planning
 
-| Term              | Meaning                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------- |
-| Wayfinder map     | An effort's destination, decision index, remaining unknowns and scope boundaries.      |
-| Decision ticket   | A question whose resolution records a decision rather than delivering code.           |
-| Decision frontier | A map's open decision tickets that have no open blockers and no assignee.              |
-| Delivery ticket   | A bounded piece of implementation work with acceptance criteria and explicit blockers. |
+| Term              | Meaning                                                                                             |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| Wayfinder map     | An effort's destination, decision index, remaining unknowns and scope boundaries.                   |
+| Decision ticket   | A question whose resolution records a decision rather than delivering code.                         |
+| Decision frontier | A map's unclaimed, open decision tickets with no open blockers or pending dependency reassessment.  |
+| Capability        | A coherent piece of functionality described by one specification and delivered through its tickets. |
+| Delivery ticket   | A bounded piece of implementation work with acceptance criteria and explicit blockers.              |
