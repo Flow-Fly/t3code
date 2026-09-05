@@ -45,3 +45,12 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Checkpoint          | A saved workspace state used for diffs and restore, stored as a hidden Git ref.                              |
 | Checkpoint baseline | The workspace state captured before the work being compared.                                                 |
 | Turn diff           | The workspace changes attributed to one turn.                                                                |
+
+## Workflow planning
+
+| Term              | Meaning                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------- |
+| Wayfinder map     | An effort's destination, decision index, remaining unknowns and scope boundaries.      |
+| Decision ticket   | A question whose resolution records a decision rather than delivering code.           |
+| Decision frontier | A map's open decision tickets that have no open blockers and no assignee.              |
+| Delivery ticket   | A bounded piece of implementation work with acceptance criteria and explicit blockers. |

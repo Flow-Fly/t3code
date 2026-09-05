@@ -1,0 +1,1157 @@
+<!-- Throwaway: compare Workspace, Board and Outline at ?variant=A/B/C. All mutations are simulated. -->
+<style>
+  #t3-wayfinder-prototype {
+    color-scheme: light dark;
+    --wf-bg: light-dark(#ffffff, #181819);
+    --wf-rail: light-dark(#f5f5f6, #141415);
+    --wf-soft: light-dark(#f7f7f8, #202022);
+    --wf-line: light-dark(#e4e4e7, #333336);
+    --wf-text: light-dark(#222225, #eeeeef);
+    --wf-muted: light-dark(#626269, #a3a3ad);
+    --wf-accent: light-dark(#6553c7, #b4a6fa);
+    --wf-tint: light-dark(#efebff, #302940);
+    --wf-green: light-dark(#23704b, #86cda6);
+    --wf-amber: light-dark(#926019, #ddbc7e);
+    --wf-primary: light-dark(#27272b, #eeeeef);
+    --wf-on-primary: light-dark(#ffffff, #242426);
+    background: var(--wf-bg);
+    color: var(--wf-text);
+    font:
+      13px/1.5 -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      sans-serif;
+    border: 1px solid var(--wf-line);
+    border-radius: 12px;
+    overflow: clip;
+  }
+  #t3-wayfinder-prototype * {
+    box-sizing: border-box;
+  }
+  #t3-wayfinder-prototype button,
+  #t3-wayfinder-prototype select {
+    font: inherit;
+    color: inherit;
+  }
+  #t3-wayfinder-prototype button {
+    cursor: pointer;
+  }
+  #t3-wayfinder-prototype button:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  #t3-wayfinder-prototype :focus-visible {
+    outline: 2px solid var(--wf-accent);
+    outline-offset: 3px;
+  }
+  #t3-wayfinder-prototype button,
+  #t3-wayfinder-prototype a {
+    -webkit-tap-highlight-color: transparent;
+  }
+  #t3-wayfinder-prototype a {
+    color: var(--wf-accent);
+    text-decoration: none;
+  }
+  #t3-wayfinder-prototype a:hover {
+    text-decoration: underline;
+  }
+  #t3-wayfinder-prototype h1,
+  #t3-wayfinder-prototype h2,
+  #t3-wayfinder-prototype h3,
+  #t3-wayfinder-prototype p {
+    margin: 0;
+  }
+  #t3-wayfinder-prototype h1 {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.6px;
+  }
+  #t3-wayfinder-prototype h2 {
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.35;
+    letter-spacing: -0.3px;
+  }
+  #t3-wayfinder-prototype h3 {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  #t3-wayfinder-prototype .wf-shell {
+    display: grid;
+    grid-template-columns: 164px minmax(0, 1fr);
+    min-height: 710px;
+  }
+  #t3-wayfinder-prototype .wf-rail {
+    background: var(--wf-rail);
+    border-right: 1px solid var(--wf-line);
+    padding: 20px 12px;
+  }
+  #t3-wayfinder-prototype .wf-brand {
+    padding: 0 9px 24px;
+    font-size: 16px;
+    letter-spacing: -0.6px;
+    font-weight: 600;
+  }
+  #t3-wayfinder-prototype .wf-brand span {
+    color: var(--wf-muted);
+    font-weight: 400;
+  }
+  #t3-wayfinder-prototype .wf-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  #t3-wayfinder-prototype .wf-nav button {
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    text-align: left;
+  }
+  #t3-wayfinder-prototype .wf-nav button[aria-pressed="true"] {
+    background: var(--wf-tint);
+    color: var(--wf-accent);
+  }
+  #t3-wayfinder-prototype .wf-project {
+    border-top: 1px solid var(--wf-line);
+    margin-top: 24px;
+    padding: 20px 9px 0;
+  }
+  #t3-wayfinder-prototype .wf-eyebrow {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-project p {
+    margin-top: 8px;
+  }
+  #t3-wayfinder-prototype .wf-main {
+    min-width: 0;
+  }
+  #t3-wayfinder-prototype .wf-topbar {
+    padding: 15px 24px;
+    border-bottom: 1px solid var(--wf-line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  #t3-wayfinder-prototype .wf-muted {
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-sample {
+    color: var(--wf-amber);
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-heading {
+    padding: 25px 24px 19px;
+  }
+  #t3-wayfinder-prototype .wf-heading p {
+    margin-top: 5px;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 17px;
+    margin: 0 24px;
+    border-bottom: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype .wf-tabs button {
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 10px 0;
+    background: transparent;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-tabs button[aria-pressed="true"] {
+    border-bottom-color: var(--wf-accent);
+    color: var(--wf-text);
+  }
+  #t3-wayfinder-prototype .wf-content {
+    padding: 20px 24px 24px;
+  }
+  #t3-wayfinder-prototype .wf-workspace {
+    display: grid;
+    grid-template-columns: minmax(200px, 0.85fr) minmax(0, 1.15fr);
+    gap: 22px;
+  }
+  #t3-wayfinder-prototype .wf-group + .wf-group {
+    margin-top: 20px;
+  }
+  #t3-wayfinder-prototype .wf-group-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    gap: 8px;
+  }
+  #t3-wayfinder-prototype .wf-count {
+    color: var(--wf-muted);
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-item {
+    display: block;
+    width: 100%;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: left;
+    margin: 2px 0;
+  }
+  #t3-wayfinder-prototype .wf-item:hover {
+    background: var(--wf-soft);
+  }
+  #t3-wayfinder-prototype .wf-item[aria-pressed="true"] {
+    border-color: var(--wf-line);
+    background: var(--wf-soft);
+  }
+  #t3-wayfinder-prototype .wf-item-title {
+    display: block;
+    margin: 5px 0;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  #t3-wayfinder-prototype .wf-item-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-status {
+    display: inline-flex;
+    gap: 5px;
+    align-items: center;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  #t3-wayfinder-prototype .wf-status::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
+  }
+  #t3-wayfinder-prototype .wf-status[data-state="ready"],
+  #t3-wayfinder-prototype .wf-status[data-state="running"] {
+    color: var(--wf-accent);
+  }
+  #t3-wayfinder-prototype .wf-status[data-state="resolved"] {
+    color: var(--wf-green);
+  }
+  #t3-wayfinder-prototype .wf-status[data-state="blocked"],
+  #t3-wayfinder-prototype .wf-status[data-state="approval"] {
+    color: var(--wf-amber);
+  }
+  #t3-wayfinder-prototype .wf-detail {
+    border: 1px solid var(--wf-line);
+    border-radius: 10px;
+    padding: 21px;
+    min-width: 0;
+    align-self: start;
+  }
+  #t3-wayfinder-prototype .wf-detail h2 {
+    margin: 12px 0;
+  }
+  #t3-wayfinder-prototype .wf-description {
+    color: var(--wf-muted);
+    margin-bottom: 18px;
+    line-height: 1.65;
+  }
+  #t3-wayfinder-prototype .wf-detail-section {
+    border-top: 1px solid var(--wf-line);
+    padding-top: 15px;
+    margin-top: 18px;
+  }
+  #t3-wayfinder-prototype .wf-detail-section h3 {
+    margin-bottom: 8px;
+  }
+  #t3-wayfinder-prototype .wf-detail-section ul {
+    margin: 8px 0;
+    padding-left: 18px;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-detail-section li {
+    margin-bottom: 7px;
+  }
+  #t3-wayfinder-prototype .wf-profile {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin: 12px 0;
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-profile span {
+    padding: 4px 8px;
+    background: var(--wf-soft);
+    border-radius: 5px;
+  }
+  #t3-wayfinder-prototype .wf-primary,
+  #t3-wayfinder-prototype .wf-secondary {
+    border-radius: 7px;
+    padding: 9px 13px;
+    font-weight: 500;
+  }
+  #t3-wayfinder-prototype .wf-primary {
+    background: var(--wf-primary);
+    color: var(--wf-on-primary);
+    border: 1px solid var(--wf-primary);
+  }
+  #t3-wayfinder-prototype .wf-secondary {
+    background: transparent;
+    border: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype .wf-actions {
+    display: flex;
+    gap: 9px;
+    flex-wrap: wrap;
+    margin-top: 17px;
+    align-items: center;
+  }
+  #t3-wayfinder-prototype .wf-hint {
+    font-size: 11px;
+    color: var(--wf-muted);
+    margin-top: 8px;
+  }
+  #t3-wayfinder-prototype .wf-ticket {
+    display: flex;
+    justify-content: space-between;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    padding: 11px 0;
+    border: 0;
+    border-bottom: 1px solid var(--wf-line);
+    background: transparent;
+  }
+  #t3-wayfinder-prototype .wf-ticket:last-child {
+    border-bottom: 0;
+  }
+  #t3-wayfinder-prototype .wf-ticket span:first-child {
+    min-width: 0;
+  }
+  #t3-wayfinder-prototype .wf-ticket small {
+    display: block;
+    color: var(--wf-muted);
+    margin-top: 3px;
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype progress {
+    width: 100%;
+    height: 5px;
+    border: 0;
+    border-radius: 4px;
+    accent-color: var(--wf-accent);
+    margin: 9px 0;
+    background: var(--wf-line);
+  }
+  #t3-wayfinder-prototype progress::-webkit-progress-bar {
+    background: var(--wf-line);
+    border-radius: 4px;
+  }
+  #t3-wayfinder-prototype progress::-webkit-progress-value {
+    background: var(--wf-accent);
+    border-radius: 4px;
+  }
+  #t3-wayfinder-prototype summary {
+    cursor: pointer;
+    font-weight: 500;
+  }
+  #t3-wayfinder-prototype pre {
+    font:
+      11px/1.7 ui-monospace,
+      SFMono-Regular,
+      monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--wf-soft);
+    padding: 13px;
+    border-radius: 6px;
+  }
+  #t3-wayfinder-prototype .wf-board {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  #t3-wayfinder-prototype .wf-lane {
+    padding: 12px;
+    background: var(--wf-soft);
+    border-radius: 9px;
+  }
+  #t3-wayfinder-prototype .wf-lane .wf-item {
+    background: var(--wf-bg);
+    border: 1px solid var(--wf-line);
+    margin: 9px 0;
+  }
+  #t3-wayfinder-prototype .wf-lane .wf-item[aria-pressed="true"] {
+    border-color: var(--wf-accent);
+  }
+  #t3-wayfinder-prototype .wf-outline {
+    margin-bottom: 22px;
+  }
+  #t3-wayfinder-prototype .wf-outline > details {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype .wf-branch {
+    margin: 12px 0 0 9px;
+    padding-left: 19px;
+    border-left: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype .wf-outline .wf-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 12px;
+  }
+  #t3-wayfinder-prototype .wf-outline .wf-item .wf-eyebrow {
+    display: none;
+  }
+  #t3-wayfinder-prototype .wf-outline .wf-item-meta {
+    justify-content: end;
+  }
+  #t3-wayfinder-prototype .wf-simulation {
+    padding: 17px;
+    background: var(--wf-soft);
+    border-radius: 8px;
+    margin: 17px 0;
+  }
+  #t3-wayfinder-prototype .wf-simulation p + p {
+    margin-top: 10px;
+  }
+  #t3-wayfinder-prototype .wf-thread {
+    max-width: 710px;
+    margin: 0 auto;
+  }
+  #t3-wayfinder-prototype .wf-thread h2 {
+    margin: 13px 0;
+  }
+  #t3-wayfinder-prototype .wf-thread-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  #t3-wayfinder-prototype .wf-footer {
+    border-top: 1px solid var(--wf-line);
+    padding: 12px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  #t3-wayfinder-prototype .wf-switcher {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px;
+    border: 1px solid var(--wf-line);
+    background: var(--wf-bg);
+    border-radius: 24px;
+    box-shadow: 0 3px 14px #00000012;
+  }
+  #t3-wayfinder-prototype .wf-switcher button {
+    background: transparent;
+    border: 0;
+    border-radius: 50%;
+    padding: 6px 10px;
+  }
+  #t3-wayfinder-prototype .wf-switcher span {
+    font-size: 12px;
+    min-width: 115px;
+    text-align: center;
+  }
+  #t3-wayfinder-prototype .wf-state {
+    border-top: 1px solid var(--wf-line);
+    padding: 10px 20px;
+    color: var(--wf-muted);
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-empty {
+    color: var(--wf-muted);
+    padding: 14px 0;
+  }
+  #t3-wayfinder-prototype [hidden] {
+    display: none !important;
+  }
+  @media (max-width: 850px) {
+    #t3-wayfinder-prototype .wf-shell {
+      grid-template-columns: 1fr;
+    }
+    #t3-wayfinder-prototype .wf-rail {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 18px;
+      border-right: 0;
+      border-bottom: 1px solid var(--wf-line);
+    }
+    #t3-wayfinder-prototype .wf-brand {
+      padding: 0;
+    }
+    #t3-wayfinder-prototype .wf-nav {
+      flex-direction: row;
+    }
+    #t3-wayfinder-prototype .wf-project {
+      display: none;
+    }
+  }
+  @media (max-width: 600px) {
+    #t3-wayfinder-prototype .wf-workspace,
+    #t3-wayfinder-prototype .wf-board {
+      grid-template-columns: 1fr;
+    }
+    #t3-wayfinder-prototype .wf-content,
+    #t3-wayfinder-prototype .wf-heading,
+    #t3-wayfinder-prototype .wf-topbar {
+      padding: 17px;
+    }
+    #t3-wayfinder-prototype .wf-tabs {
+      margin: 0 17px;
+      gap: 14px;
+    }
+    #t3-wayfinder-prototype .wf-detail {
+      padding: 17px;
+    }
+    #t3-wayfinder-prototype .wf-outline .wf-item {
+      display: block;
+    }
+    #t3-wayfinder-prototype .wf-outline .wf-item-meta {
+      justify-content: start;
+    }
+    #t3-wayfinder-prototype .wf-footer {
+      justify-content: center;
+    }
+  }
+  @media (pointer: coarse) {
+    #t3-wayfinder-prototype button,
+    #t3-wayfinder-prototype summary {
+      min-height: 44px;
+    }
+  }
+</style>
+
+<div id="t3-wayfinder-prototype" aria-label="T3 Code Workflow prototype">
+  <div class="wf-shell">
+    <aside class="wf-rail" aria-label="T3 Code navigation">
+      <div class="wf-brand">T3 <span>Code</span></div>
+      <nav class="wf-nav">
+        <button type="button" data-page="workflow" aria-pressed="true">
+          Workflow
+        </button>
+        <button type="button" data-page="threads" aria-pressed="false">
+          Threads <span id="wf-thread-count">0</span>
+        </button>
+      </nav>
+      <div class="wf-project">
+        <div class="wf-eyebrow">Project</div>
+        <p>t3code</p>
+        <p class="wf-muted">Local environment</p>
+      </div>
+      <div class="wf-project">
+        <div class="wf-eyebrow">Source</div>
+        <p>GitHub Issues</p>
+        <p class="wf-muted">Flow-Fly/t3code</p>
+      </div>
+    </aside>
+    <main class="wf-main">
+      <header class="wf-topbar">
+        <span
+          ><span class="wf-muted">t3code / </span
+          ><span id="wf-breadcrumb">Workflow</span></span
+        ><span class="wf-sample"
+          >Prototype · sample state · simulated agents</span
+        >
+      </header>
+      <div id="wf-view"></div>
+    </main>
+  </div>
+  <footer class="wf-footer">
+    <span id="wf-announcement" class="wf-muted" role="status" aria-live="polite"
+      >Select an item to inspect its work.</span
+    >
+    <div class="wf-switcher" aria-label="Prototype layout">
+      <button type="button" data-cycle="-1" aria-label="Previous layout">
+        ←
+      </button>
+      <span id="wf-variant-label">A · Workspace</span>
+      <button type="button" data-cycle="1" aria-label="Next layout">→</button>
+    </div>
+  </footer>
+  <details class="wf-state">
+    <summary>Prototype state</summary>
+    <pre id="wf-state-output"></pre>
+  </details>
+</div>
+
+<script>
+  (() => {
+    const root = document.getElementById("t3-wayfinder-prototype");
+    const view = root.querySelector("#wf-view");
+    const variants = { A: "Workspace", B: "Board", C: "Outline" };
+    const initialVariant = new URLSearchParams(location.search).get("variant");
+    const state = {
+      variant: variants[initialVariant] ? initialVariant : "A",
+      section: "frontier",
+      page: "workflow",
+      selected: "tracking",
+      thread: null,
+      threads: [],
+    };
+    const items = [
+      {
+        id: "tracking",
+        kind: "Decision",
+        title: "Define the tracker contract",
+        summary:
+          "Agree how maps, capabilities, specifications and tickets are connected, and what each status means.",
+        question:
+          "What should distinguish a resolved decision from completed delivery, and how should those relationships appear in GitHub?",
+        status: "ready",
+        blockers: [],
+        skill: "$wayfinder · $grill-with-docs",
+        url: "https://github.com/Flow-Fly/t3code/issues/3",
+      },
+      {
+        id: "layout",
+        kind: "Decision",
+        title: "Choose the Workflow view",
+        summary:
+          "Compare three layouts with the owner before committing to the navigation and detail view.",
+        status: "running",
+        blockers: [],
+        assignee: "Flow-Fly",
+        skill: "$wayfinder · $prototype",
+        url: "https://github.com/Flow-Fly/t3code/issues/2",
+      },
+      {
+        id: "models",
+        kind: "Research",
+        title: "Verify skill and model controls",
+        summary:
+          "Find which provider settings can enforce the director, implementation and independent review profile.",
+        resolution:
+          "Codex can configure child model settings; T3 can observe actual activity. Explicit skill injection and host-enforced role selection need separate implementation decisions.",
+        status: "resolved",
+        blockers: [],
+        skill: "$wayfinder · $research",
+        url: "https://github.com/Flow-Fly/t3code/issues/4",
+      },
+      {
+        id: "launch",
+        kind: "Decision",
+        title: "Define immediate thread launch",
+        summary:
+          "Settle claims, repeat clicks, environment selection, failed starts and how to return to existing work.",
+        status: "blocked",
+        blockers: ["layout", "models"],
+        skill: "$wayfinder · $grill-with-docs",
+        url: "https://github.com/Flow-Fly/t3code/issues/5",
+      },
+      {
+        id: "handoff",
+        kind: "Decision",
+        title: "Define specification and delivery handoffs",
+        summary:
+          "Make the next step clear as decisions become an approved specification and executable tickets.",
+        status: "blocked",
+        blockers: ["tracking"],
+        skill: "$wayfinder · $grill-with-docs",
+        url: "https://github.com/Flow-Fly/t3code/issues/6",
+      },
+      {
+        id: "scope",
+        kind: "Decision",
+        title: "Begin with web and desktop",
+        summary:
+          "The first version uses the shared web client, including its desktop shell. Mobile follows later.",
+        resolution:
+          "Start with web and desktop. Keep server and shared client contracts suitable for a later native mobile view.",
+        status: "resolved",
+        blockers: [],
+        skill: "$wayfinder",
+        sample: true,
+      },
+      {
+        id: "capability",
+        kind: "Capability",
+        title: "Start agent work from the workflow",
+        summary:
+          "Move from a decision or capability into an agent thread with the right context, skills and model profile. Keep that thread linked to its source work.",
+        status: "ready",
+        blockers: [],
+        skill: "$implement · $code-review",
+        children: ["identity", "prompt", "submit", "resume", "recover"],
+        sample: true,
+      },
+      {
+        id: "identity",
+        kind: "Delivery ticket",
+        title: "Keep the source issue attached to a thread",
+        summary:
+          "Return from an active thread to the capability or decision that started it.",
+        status: "resolved",
+        blockers: [],
+        skill: "$implement",
+        parent: "capability",
+        sample: true,
+      },
+      {
+        id: "prompt",
+        kind: "Delivery ticket",
+        title: "Prepare context and the required skills",
+        summary:
+          "Include source links, the selected question, standing notes and the director profile.",
+        status: "resolved",
+        blockers: [],
+        skill: "$implement",
+        parent: "capability",
+        sample: true,
+      },
+      {
+        id: "submit",
+        kind: "Delivery ticket",
+        title: "Start the thread immediately",
+        summary:
+          "One Start work action creates the thread and sends the prepared first turn.",
+        status: "ready",
+        blockers: ["identity", "prompt"],
+        skill: "$implement",
+        parent: "capability",
+        sample: true,
+      },
+      {
+        id: "resume",
+        kind: "Delivery ticket",
+        title: "Return to work already in progress",
+        summary:
+          "Open the linked thread when this item already has active work.",
+        status: "blocked",
+        blockers: ["submit"],
+        skill: "$implement",
+        parent: "capability",
+        sample: true,
+      },
+      {
+        id: "recover",
+        kind: "Delivery ticket",
+        title: "Recover from a failed launch",
+        summary:
+          "Show the failure and let the user safely retry without duplicating the thread.",
+        status: "blocked",
+        blockers: ["submit"],
+        skill: "$implement",
+        parent: "capability",
+        sample: true,
+      },
+      {
+        id: "specmap",
+        kind: "Map",
+        title: "Bring project context into new threads",
+        summary:
+          "A sample map whose decisions are resolved and remaining fog is cleared. Its next step is a specification.",
+        status: "ready",
+        blockers: [],
+        skill: "$to-spec",
+        sample: true,
+      },
+      {
+        id: "unsliced",
+        kind: "Capability",
+        title: "Keep project context with every thread",
+        summary:
+          "An approved sample specification ready to be split into independently verifiable delivery tickets.",
+        status: "ready",
+        blockers: [],
+        skill: "$to-tickets",
+        approved: true,
+        sample: true,
+      },
+    ];
+    const get = (id) => items.find((item) => item.id === id);
+    const escape = (value) =>
+      String(value).replace(
+        /[&<>"']/g,
+        (char) =>
+          ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          })[char],
+      );
+    const decisionItems = () =>
+      items.filter(
+        (item) => item.kind === "Decision" || item.kind === "Research",
+      );
+    const labels = {
+      ready: "Ready",
+      running: "In progress",
+      blocked: "Blocked",
+      resolved: "Resolved",
+      approval: "Needs approval",
+    };
+    const status = (item) =>
+      `<span class="wf-status" data-state="${item.status}">${labels[item.status]}</span>`;
+    const openBlockers = (item) =>
+      item.blockers.map(get).filter((blocker) => blocker.status !== "resolved");
+    const frontier = () =>
+      decisionItems().filter(
+        (item) =>
+          item.status === "ready" &&
+          !item.assignee &&
+          openBlockers(item).length === 0,
+      );
+
+    function row(item) {
+      return `<button type="button" class="wf-item" data-select="${item.id}" aria-pressed="${state.selected === item.id}"><span><span class="wf-eyebrow">${item.kind}${item.sample ? " · example" : ""}</span><span class="wf-item-title">${escape(item.title)}</span></span><span class="wf-item-meta">${status(item)}${item.assignee ? `<span>${item.assignee}</span>` : ""}</span></button>`;
+    }
+
+    function group(title, list) {
+      return `<section class="wf-group"><div class="wf-group-title"><h3>${title}</h3><span class="wf-count">${list.length}</span></div>${list.length ? list.map(row).join("") : '<p class="wf-empty">No items here.</p>'}</section>`;
+    }
+
+    function promptFor(item) {
+      const source =
+        item.url || `[sample ${item.kind.toLowerCase()}: ${item.title}]`;
+      if (item.skill === "$to-spec")
+        return `$to-spec\n\nRead the map ${source}, its resolution comments and standing notes. Its decision work and remaining fog are complete. Synthesize the capability specification from those decisions. Confirm the testing seams, publish the spec, and wait for owner approval before $to-tickets.`;
+      if (item.skill === "$to-tickets")
+        return `$to-tickets\n\nRead the approved capability specification ${source}. Propose tracer-bullet delivery tickets and genuine blocking edges. Get owner approval of the breakdown before publishing. Mark only the executable frontier ready-for-agent.`;
+      if (item.kind === "Capability")
+        return `Act as workflow-director for ${source}.\nDirector: Astra high. Implementation subagents: Sol high using $implement. Independent review: Astra medium using $code-review.\n\nRead the full approved specification, child tickets, dependencies and live readiness labels. Execute only approved, unblocked work. Give each worker explicit write ownership. Preserve spec source, fixed point, exact implementation head and verification evidence for fresh review. Re-read tracker state before selecting the next ticket. Pause for unresolved product decisions. Apply the repository's approval rules for merges.`;
+      if (item.kind === "Delivery ticket")
+        return `$implement\n\nWork on ${source}, under its approved capability. Re-read acceptance criteria, readiness and blockers before editing. Return spec source, fixed point, exact head and verification evidence to the director. Independent $code-review follows in a fresh Astra medium session.`;
+      return `$wayfinder https://github.com/Flow-Fly/t3code/issues/1\nWork on the decision “${item.title}”: ${source}\n\nUse ${item.kind === "Research" ? "$research" : item.id === "layout" ? "$prototype" : "$grill-with-docs ($grilling and $domain-modeling)"}. Read map notes and relevant resolution comments. Re-read live blockers and assignee, claim this ticket before work, and resolve at most this one decision. Record the answer in a resolution comment and update the map's index and newly visible frontier. Human-in-the-loop decisions require the owner's live answers.`;
+    }
+
+    function actionLabel(item) {
+      if (state.threads.some((thread) => thread.item === item.id))
+        return "Open thread";
+      if (item.status === "resolved") return "Resolved";
+      if (openBlockers(item).length) return "Waiting on blockers";
+      if (item.assignee) return "Already claimed";
+      if (item.kind === "Capability" && item.children) return "Start director";
+      if (item.skill === "$to-spec") return "Start $to-spec";
+      if (item.skill === "$to-tickets") return "Start $to-tickets";
+      return "Start work";
+    }
+
+    function ticketRows(ids) {
+      return ids
+        .map(get)
+        .map(
+          (item) =>
+            `<button type="button" class="wf-ticket" data-select="${item.id}"><span>${escape(item.title)}<small>${escape(item.summary)}</small></span>${status(item)}</button>`,
+        )
+        .join("");
+    }
+
+    function detail() {
+      const item = get(state.selected);
+      const blockers = openBlockers(item);
+      const hasThread = state.threads.some((thread) => thread.item === item.id);
+      const disabled =
+        !hasThread &&
+        (item.status === "resolved" ||
+          item.status === "blocked" ||
+          item.assignee ||
+          blockers.length);
+      const children = (item.children || []).map(get);
+      const done = children.filter(
+        (ticket) => ticket.status === "resolved",
+      ).length;
+      const director =
+        item.parent &&
+        state.threads.find((thread) => thread.item === item.parent);
+      return `<article class="wf-detail" aria-label="Selected work details"><div class="wf-item-meta"><span class="wf-eyebrow">${item.kind}${item.sample ? " · example" : ""}</span>${status(item)}</div><h2>${escape(item.title)}</h2><p class="wf-description">${escape(item.summary)}</p>
+      ${item.question ? `<section class="wf-detail-section"><h3>Question to settle</h3><p>${escape(item.question)}</p></section>` : ""}
+      ${item.resolution ? `<section class="wf-detail-section"><h3>Decision</h3><p>${escape(item.resolution)}</p></section>` : ""}
+      ${children.length ? `<section class="wf-detail-section"><div class="wf-group-title"><h3>Delivery tickets</h3><span class="wf-count">${done} of ${children.length} resolved</span></div><progress value="${done}" max="${children.length}" aria-label="Resolved delivery tickets"></progress>${ticketRows(item.children)}</section>` : ""}
+      ${blockers.length ? `<section class="wf-detail-section"><h3>Blocked by</h3>${blockers.map(row).join("")}</section>` : ""}
+      ${item.parent ? `<div class="wf-detail-section wf-actions"><button type="button" class="wf-secondary" data-select="${item.parent}">Back to capability</button>${director ? `<button type="button" class="wf-secondary" data-thread="${director.id}">Open director thread</button>` : ""}</div>` : ""}
+      ${item.approved ? '<p class="wf-hint">Sample spec: owner approval recorded. Ticket breakdown still needs approval.</p>' : ""}
+      <section class="wf-detail-section"><h3>${item.kind === "Capability" && item.children ? "Workflow director" : "Agent instructions"}</h3><div class="wf-profile"><span>${item.kind === "Delivery ticket" ? "Sol · high" : "Astra · high"}</span>${item.kind === "Capability" && item.children ? "<span>Build: Sol · high</span><span>Review: Astra · medium</span>" : ""}</div><p class="wf-hint">${escape(item.skill)}</p><details style="margin-top:12px"><summary>View prepared instructions</summary><pre>${escape(promptFor(item))}</pre></details><div class="wf-actions"><button type="button" class="wf-primary" data-start="${item.id}" ${disabled ? "disabled" : ""}>${actionLabel(item)}${disabled ? "" : " ↗"}</button>${item.url ? `<a href="${item.url}" target="_blank" rel="noopener noreferrer">GitHub ↗</a>` : ""}</div><p class="wf-hint">${hasThread ? "Return to the linked thread." : disabled ? "Browse details while this work is unavailable." : "Creates a thread and sends the instructions immediately."}</p></section></article>`;
+    }
+
+    function listContent() {
+      if (state.section === "capabilities")
+        return group(
+          "Capabilities",
+          items.filter((item) => item.kind === "Capability"),
+        );
+      if (state.section === "decisions")
+        return (
+          group(
+            "Decisions so far",
+            decisionItems().filter((item) => item.status === "resolved"),
+          ) +
+          group(
+            "Open decisions",
+            decisionItems().filter((item) => item.status !== "resolved"),
+          )
+        );
+      if (state.section === "maps")
+        return (
+          `<section class="wf-group"><div class="wf-eyebrow">Wayfinder map</div><h2 style="margin:9px 0">Bring workflow tracking into T3 Code</h2><p class="wf-muted">Find the route from a workflow view to correctly instructed agent work.</p><div class="wf-detail-section"><h3>Destination</h3><p class="wf-muted">A prototype-informed, owner-approved specification for web and desktop.</p></div><div class="wf-detail-section"><h3>Not yet specified</h3><ul><li>Many projects and simultaneous capabilities</li><li>Existing trackers with different conventions</li><li>Reopened and superseded work</li></ul></div><div class="wf-detail-section"><h3>Out of scope</h3><p class="wf-muted">Mobile for the first version; automatic approval or merge authority.</p></div><div class="wf-actions"><a href="https://github.com/Flow-Fly/t3code/issues/1" target="_blank" rel="noopener noreferrer">Open planning map ↗</a></div></section>` +
+          group("Ready for specification · example", [get("specmap")])
+        );
+      return (
+        group("Frontier", frontier()) +
+        group(
+          "In progress",
+          decisionItems().filter((item) => item.status === "running"),
+        ) +
+        `<details class="wf-group"><summary>Blocked decisions · ${decisionItems().filter((item) => item.status === "blocked").length}</summary>${decisionItems()
+          .filter((item) => item.status === "blocked")
+          .map(row)
+          .join("")}</details>`
+      );
+    }
+
+    function board() {
+      const list =
+        state.section === "capabilities"
+          ? items.filter((item) => item.kind === "Capability" || item.parent)
+          : decisionItems();
+      const lanes = [
+        ["Ready", ["ready"]],
+        ["In progress", ["running"]],
+        ["Blocked / resolved", ["blocked", "resolved"]],
+      ];
+      return `<div class="wf-board">${lanes
+        .map(
+          ([title, states]) =>
+            `<section class="wf-lane"><h3>${title}</h3>${
+              list
+                .filter((item) => states.includes(item.status))
+                .map(row)
+                .join("") || '<p class="wf-empty">No work here.</p>'
+            }</section>`,
+        )
+        .join("")}</div>${detail()}`;
+    }
+
+    function outline() {
+      return `<div class="wf-outline"><details open><summary>Wayfinder · Bring workflow tracking into T3 Code</summary><div class="wf-branch">${decisionItems().map(row).join("")}</div></details><details open><summary>Capability · Start agent work from the workflow</summary><div class="wf-branch">${row(get("capability"))}${get("capability").children.map(get).map(row).join("")}</div></details><details><summary>Next handoffs · examples</summary><div class="wf-branch">${row(get("specmap"))}${row(get("unsliced"))}</div></details></div>${detail()}`;
+    }
+
+    function threadView() {
+      if (!state.threads.length)
+        return '<div class="wf-heading"><h1>Threads</h1><p>Start work from a decision or capability to see its thread here.</p></div>';
+      const thread =
+        state.threads.find((entry) => entry.id === state.thread) ||
+        state.threads.at(-1);
+      const item = get(thread.item);
+      return `<div class="wf-heading"><h1>Threads</h1><p>Work stays linked to the decision or capability that started it.</p></div><div class="wf-content"><div class="wf-thread-list">${state.threads.map((entry) => `<button type="button" class="wf-secondary" data-thread="${entry.id}">${escape(get(entry.item).title)}</button>`).join("")}</div><article class="wf-thread"><div class="wf-item-meta"><span class="wf-eyebrow">${item.kind === "Capability" && item.children ? "Workflow director" : "Agent thread"}</span><span class="wf-status" data-state="${thread.phase === "running" ? "running" : "resolved"}">${thread.phase === "running" ? "Started" : "Turn finished"} · simulated</span></div><h2>${escape(item.title)}</h2><div class="wf-profile"><span>${item.kind === "Delivery ticket" ? "Sol · high" : "Astra · high"}</span>${item.kind === "Capability" && item.children ? "<span>Implementation: Sol · high</span><span>Review: Astra · medium</span>" : ""}</div><section class="wf-detail-section"><h3>First message · sent automatically</h3><pre>${escape(thread.prompt)}</pre></section><div class="wf-simulation"><h3>${thread.phase === "running" ? "Agent activity" : "Turn complete"}</h3><p>${thread.phase === "running" ? (item.kind === "Capability" && item.children ? "The director is checking ready tickets. Sol high is working on “Start the thread immediately”; a fresh Astra medium review follows implementation." : "The selected skills and source context are being loaded. Human-in-the-loop work continues with the owner in this thread.") : "The turn has finished. The source ticket remains open until its resolution is recorded."}</p><p class="wf-hint">Sample activity. No provider has been called.</p></div><div class="wf-actions"><button type="button" class="wf-secondary" data-source="${item.id}">Back to source</button>${thread.phase === "running" ? `<button type="button" class="wf-secondary" data-finish="${thread.id}">Simulate finished turn</button>` : ""}${thread.phase === "finished" && !item.children && item.kind !== "Map" && item.kind !== "Capability" && item.status !== "resolved" ? `<button type="button" class="wf-secondary" data-resolve="${item.id}">Simulate recorded resolution</button>` : ""}</div></article></div>`;
+    }
+
+    function render() {
+      root
+        .querySelectorAll("[data-page]")
+        .forEach((button) =>
+          button.setAttribute(
+            "aria-pressed",
+            String(button.dataset.page === state.page),
+          ),
+        );
+      root.querySelector("#wf-thread-count").textContent = state.threads.length;
+      root.querySelector("#wf-breadcrumb").textContent =
+        state.page === "workflow" ? "Workflow" : "Threads";
+      root.querySelector("#wf-variant-label").textContent =
+        `${state.variant} · ${variants[state.variant]}`;
+      if (state.page === "threads") view.innerHTML = threadView();
+      else {
+        const tabs = [
+          ["frontier", "Frontier"],
+          ["maps", "Maps"],
+          ["decisions", "Decisions"],
+          ["capabilities", "Capabilities"],
+        ];
+        view.innerHTML = `<div class="wf-heading"><h1>Workflow</h1><p>Find the next decision. Follow a capability through delivery.</p></div><nav class="wf-tabs" aria-label="Workflow views">${tabs.map(([key, name]) => `<button type="button" data-section="${key}" aria-pressed="${state.section === key}">${name}</button>`).join("")}</nav><div class="wf-content">${state.variant === "A" || state.section === "maps" ? `<div class="wf-workspace"><div>${listContent()}</div>${detail()}</div>` : state.variant === "B" ? board() : outline()}</div>`;
+      }
+      root.querySelector("#wf-state-output").textContent = JSON.stringify(
+        {
+          layout: variants[state.variant],
+          view: state.page,
+          selected: get(state.selected).title,
+          frontier: frontier().map((item) => item.title),
+          tickets: items.map((item) => ({
+            title: item.title,
+            state: item.status,
+            claimedBy: item.assignee || null,
+          })),
+          threads: state.threads.map((thread) => ({
+            id: thread.id,
+            source: get(thread.item).title,
+            phase: thread.phase,
+          })),
+          storage: "memory only",
+          trackerWrites: 0,
+          providerCalls: 0,
+        },
+        null,
+        2,
+      );
+    }
+
+    function announce(message) {
+      root.querySelector("#wf-announcement").textContent = message;
+    }
+
+    function start(id) {
+      const item = get(id);
+      const existing = state.threads.find((thread) => thread.item === id);
+      if (existing) {
+        state.thread = existing.id;
+        state.page = "threads";
+        render();
+        return;
+      }
+      if (item.status !== "ready" || item.assignee || openBlockers(item).length)
+        return;
+      const thread = {
+        id: `thread-${state.threads.length + 1}`,
+        item: id,
+        phase: "running",
+        prompt: promptFor(item),
+      };
+      state.threads.push(thread);
+      state.thread = thread.id;
+      state.page = "threads";
+      item.status = "running";
+      item.assignee = "Flow-Fly";
+      if (item.children) {
+        const ticket = item.children
+          .map(get)
+          .find(
+            (child) => child.status === "ready" && !openBlockers(child).length,
+          );
+        if (ticket) {
+          ticket.status = "running";
+          ticket.assignee = "Sol high";
+        }
+      }
+      render();
+      announce("Thread created and instructions sent · simulated.");
+    }
+
+    function setVariant(key) {
+      state.variant = variants[key] ? key : "A";
+      state.page = "workflow";
+      if (location.protocol === "http:" || location.protocol === "https:") {
+        const url = new URL(location.href);
+        url.searchParams.set("variant", state.variant);
+        history.replaceState(null, "", url);
+      }
+      render();
+      announce(`Layout ${state.variant}: ${variants[state.variant]}.`);
+    }
+
+    root.addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button || button.disabled) return;
+      const data = button.dataset;
+      if (data.cycle) {
+        const keys = Object.keys(variants);
+        setVariant(
+          keys[
+            (keys.indexOf(state.variant) + Number(data.cycle) + keys.length) %
+              keys.length
+          ],
+        );
+        return;
+      }
+      if (data.start) {
+        start(data.start);
+        return;
+      }
+      if (data.page) state.page = data.page;
+      if (data.section) {
+        state.section = data.section;
+        state.selected = {
+          frontier: frontier()[0]?.id || "layout",
+          maps: "specmap",
+          decisions: "scope",
+          capabilities: "capability",
+        }[data.section];
+      }
+      if (data.select) {
+        state.selected = data.select;
+        state.page = "workflow";
+      }
+      if (data.source) {
+        state.selected = data.source;
+        state.page = "workflow";
+      }
+      if (data.thread) {
+        state.thread = data.thread;
+        state.page = "threads";
+      }
+      if (data.finish)
+        state.threads.find((thread) => thread.id === data.finish).phase =
+          "finished";
+      if (data.resolve) {
+        const item = get(data.resolve);
+        item.status = "resolved";
+        item.assignee = null;
+        item.resolution = "Sample resolution recorded after owner discussion.";
+        for (const candidate of items)
+          if (candidate.status === "blocked" && !openBlockers(candidate).length)
+            candidate.status = "ready";
+        announce(
+          "Sample resolution recorded. The frontier has been recalculated.",
+        );
+      }
+      render();
+    });
+
+    root.addEventListener("keydown", (event) => {
+      if (
+        event.target.closest(
+          "input, textarea, select, button, summary, [contenteditable]",
+        )
+      )
+        return;
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const keys = Object.keys(variants);
+      setVariant(
+        keys[
+          (keys.indexOf(state.variant) +
+            (event.key === "ArrowRight" ? 1 : -1) +
+            keys.length) %
+            keys.length
+        ],
+      );
+    });
+
+    render();
+    if (globalThis.Tweak) {
+      const tweak = new Tweak({
+        container: root,
+        onChange: () => setVariant(state.variant),
+      });
+      tweak.addSelect(state, "variant", {
+        label: "Workflow layout",
+        options: [
+          { label: "A · Workspace", value: "A" },
+          { label: "B · Board", value: "B" },
+          { label: "C · Outline", value: "C" },
+        ],
+      });
+    }
+  })();
+</script>
