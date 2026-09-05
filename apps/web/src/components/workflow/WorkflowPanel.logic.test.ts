@@ -33,7 +33,8 @@ describe("Workflow panel browsing", () => {
   it("requires an explicit repository when fork and upstream are both present", () => {
     expect(resolveWorkflowRepository(null, repositories)).toBeNull();
     expect(resolveWorkflowRepository("Flow-Fly/t3code", repositories)).toBe("Flow-Fly/t3code");
-    expect(resolveWorkflowRepository("missing/repository", repositories)).toBeNull();
+    expect(resolveWorkflowRepository("flow-fly/T3CODE", repositories)).toBe("Flow-Fly/t3code");
+    expect(resolveWorkflowRepository("linked/repository", repositories)).toBe("linked/repository");
     expect(resolveWorkflowRepository(null, repositories.slice(0, 1))).toBe("Flow-Fly/t3code");
   });
 

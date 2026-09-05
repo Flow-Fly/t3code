@@ -8,8 +8,12 @@ export function resolveWorkflowRepository(
   selected: string | null,
   repositories: ReadonlyArray<WorkflowRepository>,
 ): string | null {
-  if (selected && repositories.some((repository) => repository.nameWithOwner === selected)) {
-    return selected;
+  if (selected) {
+    const selectedKey = selected.toLowerCase();
+    const discovered = repositories.find(
+      (repository) => repository.nameWithOwner.toLowerCase() === selectedKey,
+    );
+    return discovered?.nameWithOwner ?? selected;
   }
   return repositories.length === 1 ? (repositories[0]?.nameWithOwner ?? null) : null;
 }

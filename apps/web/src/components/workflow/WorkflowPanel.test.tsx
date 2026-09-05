@@ -10,7 +10,7 @@ const query = vi.hoisted(() => {
     calls.push({ kind, request });
     return { kind, request };
   };
-  return { calls, descriptor, moved: false };
+  return { calls, descriptor, moved: false, destinationRepository: "Flow-Fly/t3code" };
 });
 
 vi.mock("~/state/workflow", () => ({
@@ -34,38 +34,27 @@ vi.mock("~/state/query", () => ({
         data: {
           projectId: "project-draft",
           projectTitle: "Draft project",
-          repositories: [{ nameWithOwner: "Flow-Fly/t3code", remoteNames: ["origin"] }],
+          repositories: [{ nameWithOwner: "flow-fly/t3code", remoteNames: ["origin"] }],
         },
       };
     }
     if (descriptor.kind === "roots") {
+      const repository = (descriptor.request as { input?: { repository?: string } }).input
+        ?.repository;
+      const destinationIsCurrent = query.destinationRepository.toLowerCase() === "flow-fly/t3code";
       return {
         ...idle,
         data: {
-          repository: "Flow-Fly/t3code",
-          roots: [
-            {
-              id: "issue-10",
-              repository: "Flow-Fly/t3code",
-              number: 10,
-              title: "Capability",
-              url: "https://github.com/Flow-Fly/t3code/issues/10",
-              kind: "capability",
-              state: "open",
-              stateReason: null,
-              updatedAt: "2026-09-05T00:00:00Z",
-              childCount: 1,
-              parentNumber: null,
-              labels: ["workflow:capability"],
-            },
-            ...(query.moved
+          repository: repository ?? "flow-fly/t3code",
+          roots:
+            repository?.toLowerCase() !== "flow-fly/t3code"
               ? [
                   {
                     id: "issue-20",
-                    repository: "Flow-Fly/t3code",
+                    repository: query.destinationRepository,
                     number: 20,
                     title: "New capability",
-                    url: "https://github.com/Flow-Fly/t3code/issues/20",
+                    url: `https://github.com/${query.destinationRepository}/issues/20`,
                     kind: "capability",
                     state: "open",
                     stateReason: null,
@@ -75,8 +64,40 @@ vi.mock("~/state/query", () => ({
                     labels: ["workflow:capability"],
                   },
                 ]
-              : []),
-          ],
+              : [
+                  {
+                    id: "issue-10",
+                    repository: "Flow-Fly/t3code",
+                    number: 10,
+                    title: "Capability",
+                    url: "https://github.com/Flow-Fly/t3code/issues/10",
+                    kind: "capability",
+                    state: "open",
+                    stateReason: null,
+                    updatedAt: "2026-09-05T00:00:00Z",
+                    childCount: 1,
+                    parentNumber: null,
+                    labels: ["workflow:capability"],
+                  },
+                  ...(query.moved && destinationIsCurrent
+                    ? [
+                        {
+                          id: "issue-20",
+                          repository: query.destinationRepository,
+                          number: 20,
+                          title: "New capability",
+                          url: `https://github.com/${query.destinationRepository}/issues/20`,
+                          kind: "capability",
+                          state: "open",
+                          stateReason: null,
+                          updatedAt: "2026-09-05T00:00:00Z",
+                          childCount: 1,
+                          parentNumber: null,
+                          labels: ["workflow:capability"],
+                        },
+                      ]
+                    : []),
+                ],
         },
       };
     }
@@ -211,10 +232,10 @@ vi.mock("~/state/query", () => ({
           ancestry: [
             {
               id: "issue-20",
-              repository: "Flow-Fly/t3code",
+              repository: query.destinationRepository,
               number: 20,
               title: "New capability",
-              url: "https://github.com/Flow-Fly/t3code/issues/20",
+              url: `https://github.com/${query.destinationRepository}/issues/20`,
               kind: "capability",
               state: "open",
               stateReason: null,
@@ -252,6 +273,7 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} });
   query.moved = false;
+  query.destinationRepository = "Flow-Fly/t3code";
 });
 
 afterEach(() => {
@@ -439,7 +461,7 @@ describe("WorkflowPanel browsing", () => {
     await act(() => renderer?.unmount());
   });
 
-  it("recovers a moved selection by stable identity and preserves the previous root view", async () => {
+  it("recovers a moved selection after remount across repository casing", async () => {
     const props = {
       environmentId: EnvironmentId.make("remote-environment"),
       environmentLabel: "Remote environment",
@@ -475,9 +497,17 @@ describe("WorkflowPanel browsing", () => {
         viewport: { x: 45, y: 67, zoom: 0.75 },
       }),
     );
+    expect(useWorkflowMapStore.getState().views[oldScope]!.selectedIssue).toEqual({
+      id: "issue-12",
+      repository: "Flow-Fly/t3code",
+      number: 12,
+    });
 
     query.moved = true;
-    await act(() => renderer!.update(<WorkflowPanel {...props} />));
+    await act(() => renderer!.unmount());
+    await act(() => {
+      renderer = create(<WorkflowPanel {...props} />);
+    });
     const recovery = renderer!.root
       .findAllByType("button")
       .find((button) => button.children.join("") === "Find current context");
@@ -510,12 +540,91 @@ describe("WorkflowPanel browsing", () => {
       y: 67,
       zoom: 0.75,
     });
+    expect(renderer!.root.findByType("select").props.value).toBe("flow-fly/t3code");
     expect(
       Object.values(useWorkflowMapStore.getState().views).some(
         (view) =>
           view.selectedId === "issue-12" && view !== useWorkflowMapStore.getState().views[oldScope],
       ),
     ).toBe(true);
+    await act(() => renderer?.unmount());
+  });
+
+  it("opens a located root from a repository absent from git remotes", async () => {
+    const props = {
+      environmentId: EnvironmentId.make("remote-environment"),
+      environmentLabel: "Remote environment",
+      projectId: ProjectId.make("project-draft"),
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(<WorkflowPanel {...props} />);
+    });
+    await act(() =>
+      renderer!.root
+        .findByProps({ "aria-label": "Workflow roots" })
+        .findAllByType("button")[0]!
+        .props.onClick(),
+    );
+    const search = renderer!.root.findByProps({ "aria-label": "Search this workflow" });
+    await act(() => search.props.onChange({ target: { value: "Nested" } }));
+    await act(() =>
+      renderer!.root.findByProps({ role: "search" }).props.onSubmit({ preventDefault: vi.fn() }),
+    );
+    await act(() =>
+      renderer!.root
+        .findByProps({ "aria-label": "Workflow search results" })
+        .findAllByType("button")[0]!
+        .props.onClick(),
+    );
+    const oldScope = Object.keys(useWorkflowMapStore.getState().views)[0]!;
+    await act(() =>
+      useWorkflowMapStore.getState().patchView(oldScope, {
+        viewport: { x: 21, y: 34, zoom: 0.6 },
+      }),
+    );
+
+    query.destinationRepository = "outside/repository";
+    query.moved = true;
+    await act(() => renderer!.update(<WorkflowPanel {...props} />));
+    await act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.children.join("") === "Find current context")!
+        .props.onClick(),
+    );
+    await act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.children.join("").includes("Open current root #20"))!
+        .props.onClick(),
+    );
+
+    const picker = renderer!.root.findByType("select");
+    expect(picker.props.value).toBe("outside/repository");
+    expect(
+      picker.findAllByType("option").some((option) => option.children.join("").includes("linked")),
+    ).toBe(true);
+    expect(
+      query.calls.some(
+        (call) =>
+          call.kind === "roots" &&
+          (call.request as { input?: { repository?: string } }).input?.repository ===
+            "outside/repository",
+      ),
+    ).toBe(true);
+    expect(
+      renderer!.root
+        .findByProps({ "aria-label": "Choose another workflow root" })
+        .children.join(""),
+    ).toContain("#20 New capability");
+    expect(useWorkflowMapStore.getState().views[oldScope]!.viewport).toEqual({
+      x: 21,
+      y: 34,
+      zoom: 0.6,
+    });
     await act(() => renderer?.unmount());
   });
 });

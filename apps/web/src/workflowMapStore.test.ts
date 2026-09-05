@@ -47,4 +47,19 @@ describe("Workflow map view persistence", () => {
       selectWorkflowMapView(useWorkflowMapStore.getState().views, remoteScope).selectedId,
     ).toBeNull();
   });
+
+  it("uses one persisted view for GitHub repository casing variants", () => {
+    const lower = workflowMapContextKey({
+      environmentId: "remote",
+      projectId: "project",
+      repository: "flow-fly/t3code",
+    });
+    const canonical = workflowMapContextKey({
+      environmentId: "remote",
+      projectId: "project",
+      repository: "Flow-Fly/T3Code",
+    });
+
+    expect(canonical).toBe(lower);
+  });
 });

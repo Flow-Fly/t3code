@@ -342,14 +342,14 @@ export function WorkflowFocusedMap(props: {
       : null,
   );
   const locateQuery = useEnvironmentQuery(
-    selectionHidden && recoverSelection && selected
+    selectionHidden && recoverSelection && view.selectedIssue
       ? workflowEnvironment.locate({
           environmentId: props.environmentId,
           input: {
             projectId: props.projectId,
-            repository: selected.repository,
-            id: selected.id,
-            number: selected.number,
+            repository: view.selectedIssue.repository,
+            id: view.selectedIssue.id,
+            number: view.selectedIssue.number,
           },
         })
       : null,
@@ -388,6 +388,11 @@ export function WorkflowFocusedMap(props: {
     setChildrenByParent(merged.childrenByParent);
     store.patchView(scope, {
       selectedId: issueIdentity(match.issue),
+      selectedIssue: {
+        id: match.issue.id,
+        repository: match.issue.repository,
+        number: match.issue.number,
+      },
       expanded,
       openFolds,
       viewport: fitWorkflowViewport(pathNodes, {
@@ -414,6 +419,12 @@ export function WorkflowFocusedMap(props: {
       },
     });
   };
+
+  const selectIssue = (issue: WorkflowIssueSummary) =>
+    store.patchView(scope, {
+      selectedId: issueIdentity(issue),
+      selectedIssue: { id: issue.id, repository: issue.repository, number: issue.number },
+    });
 
   const zoomBy = (factor: number) =>
     store.patchView(scope, {
@@ -708,7 +719,7 @@ export function WorkflowFocusedMap(props: {
                   type="button"
                   className="block w-full text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   aria-current={isSelected ? "true" : undefined}
-                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                  onClick={() => selectIssue(node.issue)}
                 >
                   <span className="block truncate text-[10px] text-muted-foreground">
                     {node.issue.repository} · {node.issue.kind}
@@ -790,7 +801,7 @@ export function WorkflowFocusedMap(props: {
                   type="button"
                   className="max-w-40 truncate rounded hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                   aria-current={node.id === view.selectedId ? "location" : undefined}
-                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                  onClick={() => selectIssue(node.issue)}
                 >
                   #{node.issue.number} {node.issue.title}
                 </button>
@@ -826,7 +837,7 @@ export function WorkflowFocusedMap(props: {
                   type="button"
                   className="min-w-0 flex-1 truncate rounded py-1 text-left text-xs focus-visible:ring-2 focus-visible:ring-ring"
                   aria-current={node.id === view.selectedId ? "true" : undefined}
-                  onClick={() => store.patchView(scope, { selectedId: node.id })}
+                  onClick={() => selectIssue(node.issue)}
                 >
                   #{node.issue.number} {node.issue.title}
                 </button>

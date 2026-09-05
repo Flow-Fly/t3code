@@ -6,6 +6,7 @@ import type { WorkflowPoint, WorkflowViewport } from "./components/workflow/Work
 
 export interface WorkflowMapView {
   selectedId: string | null;
+  selectedIssue: { id: string; repository: string; number: number } | null;
   expanded: string[];
   openFolds: string[];
   positions: Record<string, WorkflowPoint>;
@@ -14,6 +15,7 @@ export interface WorkflowMapView {
 
 const EMPTY_VIEW: WorkflowMapView = {
   selectedId: null,
+  selectedIssue: null,
   expanded: [],
   openFolds: [],
   positions: {},
@@ -38,7 +40,7 @@ export const workflowMapContextKey = (input: {
   environmentId: string;
   projectId: string;
   repository: string;
-}) => `${input.environmentId}:${input.projectId}:${input.repository}`;
+}) => `${input.environmentId}:${input.projectId}:${input.repository.toLowerCase()}`;
 
 export const workflowMapScopeKey = (context: string, rootId: string) => `${context}:${rootId}`;
 

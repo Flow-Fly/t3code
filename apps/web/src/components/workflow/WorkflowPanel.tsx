@@ -54,6 +54,9 @@ function RepositoryPicker(props: {
   value: string | null;
   onChange: (repository: string | null) => void;
 }) {
+  const hasSelectedRepository = props.repositories.some(
+    (repository) => repository.nameWithOwner.toLowerCase() === props.value?.toLowerCase(),
+  );
   return (
     <label className="grid min-w-44 gap-1 text-xs">
       <span className="font-medium text-muted-foreground">Tracker repository</span>
@@ -63,6 +66,9 @@ function RepositoryPicker(props: {
         onChange={(event) => props.onChange(event.target.value || null)}
       >
         {props.repositories.length > 1 ? <option value="">Choose a repository</option> : null}
+        {props.value && !hasSelectedRepository ? (
+          <option value={props.value}>{props.value} (linked)</option>
+        ) : null}
         {props.repositories.map((repository) => (
           <option key={repository.nameWithOwner} value={repository.nameWithOwner}>
             {repository.nameWithOwner} ({repository.remoteNames.join(", ")})
@@ -121,6 +127,11 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
     mapStore.focusRoot(destinationContext, destinationRootId);
     mapStore.patchView(destinationScope, {
       selectedId: issueIdentity(match.issue),
+      selectedIssue: {
+        id: match.issue.id,
+        repository: match.issue.repository,
+        number: match.issue.number,
+      },
       expanded: [...new Set([...destinationView.expanded, ...match.ancestry.map(issueIdentity)])],
       openFolds: [
         ...new Set([
