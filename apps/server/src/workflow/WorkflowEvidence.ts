@@ -127,7 +127,7 @@ function prerequisiteConditions(body: string): ReadonlyArray<string> {
     const explicitlyNamed = /^(?:prerequisite|requires?):\s+/iu.test(line);
     if (!inBlockedBy && !inPrerequisiteSection && !explicitlyNamed) continue;
     const description = line.replace(/^(?:prerequisite|requires?):\s+/iu, "").trim();
-    if (!description || /^none\b/iu.test(description)) continue;
+    if (!description || /^(?:none|n\/a|not applicable)\.?$/iu.test(description)) continue;
     if (inBlockedBy) {
       const unsupported = description
         .replace(/\[[^\]]+\]\(https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+\)/giu, "")
@@ -138,6 +138,23 @@ function prerequisiteConditions(body: string): ReadonlyArray<string> {
     conditions.push(description);
   }
   return [...new Set(conditions)];
+}
+
+function recordDeclarationLines(body: string): ReadonlyArray<string> {
+  const lines: string[] = [];
+  let fence: { character: string; length: number } | null = null;
+  for (const line of body.split("\n")) {
+    const fenceMatch = /^\s*(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (fenceMatch) {
+      const character = fenceMatch[0]!;
+      if (!fence) fence = { character, length: fenceMatch.length };
+      else if (fence.character === character && fenceMatch.length >= fence.length) fence = null;
+      continue;
+    }
+    if (fence || /^(?:\s*>| {4}|\t|\s*["'])/u.test(line)) continue;
+    lines.push(line);
+  }
+  return lines;
 }
 
 function ticketScope(body: string): string | undefined {
@@ -227,6 +244,10 @@ function parseRecord(
     section(comment.body, kind === "reassessment" ? "Changes" : "Summary") ??
     (kind === "approval" ? `Approval: ${approvalKind ?? "unknown kind"}` : `${kind} record`);
   const evidence = kind === "approval" ? undefined : section(comment.body, "Evidence");
+  const evidenceAccess =
+    evidence && /\bunavailable\b|\binaccessible\b/iu.test(evidence)
+      ? ("unavailable" as const)
+      : sourceAccess(source ?? evidence, availableComments);
   const valid =
     kind === "approval"
       ? (approvalKind === "specification" || approvalKind === "ticket-breakdown") &&
@@ -242,7 +263,7 @@ function parseRecord(
     createdAt: comment.createdAt,
     kind,
     state: valid ? "current" : "invalid",
-    sourceAccess: sourceAccess(source ?? evidence, availableComments),
+    sourceAccess: evidenceAccess,
     scope:
       kind === "approval"
         ? approvalScope(approvalKind, approvedContent, issue)
@@ -277,7 +298,7 @@ function markSuperseded(
     const comment = commentsById.get(supersedingRecord.id);
     if (!comment) continue;
     const targets = new Set(
-      comment.body.split("\n").flatMap((line) => {
+      recordDeclarationLines(comment.body).flatMap((line) => {
         const value =
           /^\s*Supersedes:\s*(.+)$/iu.exec(line)?.[1] ??
           /^\s*This record supersedes\s+(.+)$/iu.exec(line)?.[1];
@@ -320,6 +341,7 @@ function manualConditions(
         record.kind === "reassessment" &&
         record.state === "current" &&
         record.scope === "current" &&
+        record.sourceAccess !== "unavailable" &&
         record.outcome === "cleared" &&
         record.source?.includes(condition.source) &&
         record.summary.toLocaleLowerCase().includes(condition.description.toLocaleLowerCase()),
@@ -388,7 +410,9 @@ function closedReadiness(
       ],
     };
   }
-  const resolution = current.findLast((record) => record.outcome === "resolved");
+  const resolution = current.findLast(
+    (record) => record.outcome === "resolved" && record.sourceAccess !== "unavailable",
+  );
   if (issue.stateReason === "completed" && resolution) {
     return {
       status: "resolved",
@@ -399,7 +423,9 @@ function closedReadiness(
   }
   const uncertainResolution = records.findLast(
     (record) =>
-      record.kind === "resolution" && record.state === "current" && record.scope === "unknown",
+      record.kind === "resolution" &&
+      record.state === "current" &&
+      (record.scope === "unknown" || record.sourceAccess === "unavailable"),
   );
   return {
     status: "closed-unverified",
@@ -407,7 +433,9 @@ function closedReadiness(
       reason(
         "missing-resolution",
         uncertainResolution
-          ? "Resolution predates the latest issue edit; current scope needs verification."
+          ? uncertainResolution.sourceAccess === "unavailable"
+            ? "Resolution evidence is unavailable; completion remains unverified."
+            : "Resolution predates the latest issue edit; current scope needs verification."
           : issue.reopenedAt.length > 0
             ? "Closed after reopening without new current resolution evidence."
             : "Closed as completed without current resolution evidence.",
