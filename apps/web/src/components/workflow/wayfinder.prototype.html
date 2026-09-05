@@ -1,4 +1,4 @@
-<!-- Throwaway: compare Workspace, Board and Outline at ?variant=A/B/C. All mutations are simulated. -->
+<!-- Throwaway: compare Workspace, Board, Outline and Mind map at ?variant=A/B/C/D. All mutations are simulated. -->
 <style>
   #t3-wayfinder-prototype {
     color-scheme: light dark;
@@ -484,6 +484,304 @@
   #t3-wayfinder-prototype [hidden] {
     display: none !important;
   }
+  #t3-wayfinder-prototype[data-variant="D"] {
+    --wf-canvas: light-dark(#f8f9fc, #14171b);
+    --wf-dot: light-dark(#dce0e9, #30343b);
+    --wf-map-tone: light-dark(#6650bc, #b9a5f5);
+    --wf-decision-tone: light-dark(#396cb3, #93b9ee);
+    --wf-capability-tone: light-dark(#267b68, #81cbb6);
+    --wf-shadow: light-dark(#28324b0d, #00000030);
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-shell {
+    grid-template-columns: 1fr;
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-rail {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 24px;
+    border-right: 0;
+    border-bottom: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-brand {
+    padding: 0;
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-project {
+    display: none;
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-nav {
+    flex-direction: row;
+  }
+  #t3-wayfinder-prototype[data-variant="D"] .wf-topbar {
+    padding-block: 11px;
+  }
+  #t3-wayfinder-prototype .wf-map-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: center;
+    padding: 23px 28px;
+    flex-wrap: wrap;
+  }
+  #t3-wayfinder-prototype .wf-map-header h1 {
+    font-size: 23px;
+    letter-spacing: -0.7px;
+  }
+  #t3-wayfinder-prototype .wf-map-header p {
+    margin-top: 5px;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-map-header button {
+    white-space: nowrap;
+  }
+  #t3-wayfinder-prototype .wf-map-canvas {
+    position: relative;
+    height: 690px;
+    overflow: clip;
+    touch-action: none;
+    background-color: var(--wf-canvas);
+    background-image: radial-gradient(
+      circle,
+      var(--wf-dot) 0.8px,
+      transparent 0.9px
+    );
+    background-size: 22px 22px;
+    cursor: grab;
+    border-top: 1px solid var(--wf-line);
+  }
+  #t3-wayfinder-prototype .wf-map-canvas[data-dragging="true"] {
+    cursor: grabbing;
+    user-select: none;
+  }
+  #t3-wayfinder-prototype .wf-map-scene {
+    position: absolute;
+    transform-origin: 0 0;
+    width: 1px;
+    height: 1px;
+  }
+  #t3-wayfinder-prototype .wf-map-edges {
+    position: absolute;
+    overflow: visible;
+    pointer-events: none;
+  }
+  #t3-wayfinder-prototype .wf-map-edges path {
+    fill: none;
+    stroke: var(--wf-dot);
+    stroke-width: 1.7;
+  }
+  #t3-wayfinder-prototype .wf-map-edges path[data-tone="decision"] {
+    stroke: color-mix(in srgb, var(--wf-decision-tone) 45%, var(--wf-dot));
+  }
+  #t3-wayfinder-prototype .wf-map-edges path[data-tone="capability"] {
+    stroke: color-mix(in srgb, var(--wf-capability-tone) 45%, var(--wf-dot));
+  }
+  #t3-wayfinder-prototype .wf-map-edges path[data-selected="true"] {
+    stroke: var(--wf-accent);
+    stroke-width: 2.2;
+  }
+  #t3-wayfinder-prototype .wf-map-edges path[data-handoff="true"] {
+    stroke-dasharray: 5 6;
+  }
+  #t3-wayfinder-prototype .wf-node {
+    position: absolute;
+    width: 224px;
+    background: var(--wf-bg);
+    border: 1px solid var(--wf-line);
+    border-radius: 13px;
+    box-shadow: 0 5px 18px var(--wf-shadow);
+    --node-tone: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-node[data-tone="map"] {
+    --node-tone: var(--wf-map-tone);
+    border-color: color-mix(in srgb, var(--node-tone) 45%, var(--wf-line));
+  }
+  #t3-wayfinder-prototype .wf-node[data-tone="decision"] {
+    --node-tone: var(--wf-decision-tone);
+  }
+  #t3-wayfinder-prototype .wf-node[data-tone="capability"] {
+    --node-tone: var(--wf-capability-tone);
+  }
+  #t3-wayfinder-prototype .wf-node[data-frontier="true"] {
+    border-color: color-mix(in srgb, var(--wf-accent) 55%, var(--wf-line));
+  }
+  #t3-wayfinder-prototype .wf-node[data-selected="true"] {
+    border-color: var(--wf-accent);
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--wf-accent) 12%, transparent),
+      0 8px 24px var(--wf-shadow);
+  }
+  #t3-wayfinder-prototype .wf-node-main {
+    display: block;
+    width: 100%;
+    padding: 15px 17px;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    border-radius: 13px;
+    cursor: grab;
+  }
+  #t3-wayfinder-prototype .wf-node-main:active {
+    cursor: grabbing;
+  }
+  #t3-wayfinder-prototype .wf-node-kind {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--node-tone);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  #t3-wayfinder-prototype .wf-node-kind::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border: 1.5px solid currentColor;
+    border-radius: 3px;
+  }
+  #t3-wayfinder-prototype .wf-node-name {
+    display: block;
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: -0.2px;
+    line-height: 1.35;
+    margin: 9px 0;
+  }
+  #t3-wayfinder-prototype .wf-node[data-tone="map"] .wf-node-name {
+    font-size: 19px;
+    letter-spacing: -0.5px;
+  }
+  #t3-wayfinder-prototype .wf-node-meta {
+    font-size: 12px;
+    color: var(--wf-muted);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  #t3-wayfinder-prototype .wf-node-meta .wf-status {
+    font-size: 12px;
+  }
+  #t3-wayfinder-prototype .wf-node-expand {
+    width: 100%;
+    border: 0;
+    border-top: 1px solid var(--wf-line);
+    background: var(--wf-soft);
+    padding: 8px 16px;
+    text-align: left;
+    border-radius: 0 0 13px 13px;
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-map-controls {
+    position: absolute;
+    inset: auto 18px 18px auto;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 5px;
+    border: 1px solid var(--wf-line);
+    background: var(--wf-bg);
+    border-radius: 10px;
+    box-shadow: 0 4px 16px var(--wf-shadow);
+    z-index: 2;
+  }
+  #t3-wayfinder-prototype .wf-map-controls button {
+    border: 0;
+    background: transparent;
+    padding: 6px 10px;
+    border-radius: 5px;
+  }
+  #t3-wayfinder-prototype .wf-map-controls output {
+    min-width: 40px;
+    text-align: center;
+    color: var(--wf-muted);
+    font-size: 11px;
+  }
+  #t3-wayfinder-prototype .wf-map-legend {
+    position: absolute;
+    left: 22px;
+    bottom: 23px;
+    display: flex;
+    gap: 15px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--wf-muted);
+    pointer-events: none;
+  }
+  #t3-wayfinder-prototype .wf-map-legend span::before {
+    content: "";
+    display: inline-block;
+    vertical-align: middle;
+    width: 20px;
+    border-top: 1px solid var(--wf-muted);
+    margin-right: 6px;
+  }
+  #t3-wayfinder-prototype .wf-map-legend span:last-child::before {
+    border-top-style: dashed;
+  }
+  #t3-wayfinder-prototype .wf-map-inspector {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: min(345px, calc(100% - 28px));
+    max-height: calc(100% - 80px);
+    overflow: auto;
+    background: var(--wf-bg);
+    border: 1px solid var(--wf-line);
+    border-radius: 13px;
+    box-shadow: 0 12px 45px light-dark(#29314620, #00000060);
+    cursor: auto;
+    touch-action: pan-y;
+    z-index: 3;
+  }
+  #t3-wayfinder-prototype .wf-map-inspector .wf-detail {
+    border: 0;
+  }
+  #t3-wayfinder-prototype .wf-map-inspector-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 18px;
+    border-bottom: 1px solid var(--wf-line);
+    font-size: 11px;
+    color: var(--wf-muted);
+  }
+  #t3-wayfinder-prototype .wf-map-inspector-header button {
+    border: 0;
+    background: transparent;
+    padding: 4px 6px;
+  }
+  #t3-wayfinder-prototype .wf-map-tools {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  #t3-wayfinder-prototype .wf-map-tools select {
+    border: 1px solid var(--wf-line);
+    border-radius: 7px;
+    background: var(--wf-bg);
+    padding: 8px;
+  }
+  @media (max-width: 700px) {
+    #t3-wayfinder-prototype .wf-map-header {
+      padding: 18px;
+    }
+    #t3-wayfinder-prototype .wf-map-canvas {
+      height: 660px;
+    }
+    #t3-wayfinder-prototype .wf-map-legend {
+      top: 14px;
+      bottom: auto;
+      left: 16px;
+    }
+    #t3-wayfinder-prototype .wf-map-inspector {
+      top: auto;
+      bottom: 64px;
+      max-height: 48%;
+    }
+  }
   @media (max-width: 850px) {
     #t3-wayfinder-prototype .wf-shell {
       grid-template-columns: 1fr;
@@ -599,17 +897,59 @@
   (() => {
     const root = document.getElementById("t3-wayfinder-prototype");
     const view = root.querySelector("#wf-view");
-    const variants = { A: "Workspace", B: "Board", C: "Outline" };
+    const variants = {
+      A: "Workspace",
+      B: "Board",
+      C: "Outline",
+      D: "Mind map",
+    };
     const initialVariant = new URLSearchParams(location.search).get("variant");
     const state = {
-      variant: variants[initialVariant] ? initialVariant : "A",
+      variant: variants[initialVariant] ? initialVariant : "D",
       section: "frontier",
       page: "workflow",
       selected: "tracking",
       thread: null,
       threads: [],
     };
+    const graph = {
+      layout: "mind",
+      zoom: 1,
+      x: 0,
+      y: 0,
+      fitted: false,
+      inspector: false,
+      positions: {},
+      decisions: true,
+      delivery: true,
+      resolved: false,
+      allDecisions: false,
+      allDelivery: false,
+    };
     const items = [
+      {
+        id: "maproot",
+        kind: "Map",
+        title: "Bring workflow tracking into T3 Code",
+        summary:
+          "Find the route to a workflow view that follows decisions and delivery, and starts correctly instructed agent work.",
+        question:
+          "Destination: a prototype-informed, owner-approved specification for web and desktop.",
+        status: "ready",
+        blockers: [],
+        skill: "$wayfinder",
+        url: "https://github.com/Flow-Fly/t3code/issues/1",
+      },
+      {
+        id: "fog",
+        kind: "Unspecified",
+        title: "Beyond the current frontier",
+        summary:
+          "Many projects and simultaneous capabilities; older trackers with different conventions; reopened and superseded work. These questions are still too broad to turn into decision tickets.",
+        status: "blocked",
+        blockers: [],
+        skill: "$wayfinder",
+      },
       {
         id: "tracking",
         kind: "Decision",
@@ -669,6 +1009,17 @@
         blockers: ["tracking"],
         skill: "$wayfinder · $grill-with-docs",
         url: "https://github.com/Flow-Fly/t3code/issues/6",
+      },
+      {
+        id: "verification",
+        kind: "Decision",
+        title: "Choose tracking freshness and verification",
+        summary:
+          "Agree how fresh tracker state must be and how to prove the launch works across local and remote environments.",
+        status: "blocked",
+        blockers: ["layout", "tracking", "launch", "handoff"],
+        skill: "$wayfinder · $grill-with-docs",
+        url: "https://github.com/Flow-Fly/t3code/issues/7",
       },
       {
         id: "scope",
@@ -824,6 +1175,8 @@
     }
 
     function promptFor(item) {
+      if (item.id === "maproot")
+        return "$wayfinder https://github.com/Flow-Fly/t3code/issues/1\nRead the destination and notes. Re-read the live frontier, choose one open, unblocked, unclaimed decision ticket, claim it, and use its required skills. Resolve at most that one decision with the owner where human input is required.";
       const source =
         item.url || `[sample ${item.kind.toLowerCase()}: ${item.title}]`;
       if (item.skill === "$to-spec")
@@ -841,9 +1194,11 @@
       if (state.threads.some((thread) => thread.item === item.id))
         return "Open thread";
       if (item.status === "resolved") return "Resolved";
+      if (item.id === "fog") return "Not yet a decision ticket";
       if (openBlockers(item).length) return "Waiting on blockers";
       if (item.assignee) return "Already claimed";
       if (item.kind === "Capability" && item.children) return "Start director";
+      if (item.id === "maproot") return "Continue wayfinding";
       if (item.skill === "$to-spec") return "Start $to-spec";
       if (item.skill === "$to-tickets") return "Start $to-tickets";
       return "Start work";
@@ -948,6 +1303,282 @@
       return `<div class="wf-outline"><details open><summary>Wayfinder · Bring workflow tracking into T3 Code</summary><div class="wf-branch">${decisionItems().map(row).join("")}</div></details><details open><summary>Capability · Start agent work from the workflow</summary><div class="wf-branch">${row(get("capability"))}${get("capability").children.map(get).map(row).join("")}</div></details><details><summary>Next handoffs · examples</summary><div class="wf-branch">${row(get("specmap"))}${row(get("unsliced"))}</div></details></div>${detail()}`;
     }
 
+    let mapModel = { nodes: [], edges: [] };
+
+    function graphModel() {
+      const open = decisionItems().filter((item) => item.status !== "resolved");
+      const closed = decisionItems().filter(
+        (item) => item.status === "resolved",
+      );
+      const nodes = [
+        {
+          id: "maproot",
+          x: 405,
+          y: 307,
+          w: 236,
+          h: 154,
+          tone: "map",
+          title: "Workflow tracking in T3 Code",
+          label: "Wayfinder map",
+          meta: `${open.length} open decisions · ${frontier().length} in frontier`,
+        },
+        {
+          id: "decisions",
+          x: 81,
+          y: 189,
+          w: 224,
+          h: 137,
+          tone: "decision",
+          title: "Find the way forward",
+          label: "Decision branches",
+          meta: `${frontier().length} ready · ${open.filter((item) => item.assignee).length} claimed`,
+          toggle: "decisions",
+        },
+        {
+          id: "capability",
+          x: 711,
+          y: 335,
+          w: 238,
+          h: 174,
+          tone: "capability",
+          title: "Start agent work",
+          label: "Capability · example",
+          meta: `${get("capability").children.filter((id) => get(id).status === "resolved").length} of 5 tickets resolved`,
+          toggle: "delivery",
+        },
+        {
+          id: "resolved",
+          x: 272,
+          y: 589,
+          w: 224,
+          h: 126,
+          tone: "muted",
+          title: "Decisions so far",
+          label: "The route already walked",
+          meta: `${closed.length} resolved · expand to read`,
+          toggle: "resolved",
+        },
+        {
+          id: "fog",
+          x: 569,
+          y: 632,
+          w: 234,
+          h: 119,
+          tone: "muted",
+          title: "Not yet specified",
+          label: "Beyond the frontier",
+          meta: "3 areas still taking shape",
+        },
+      ];
+      const edges = [
+        { from: "maproot", to: "decisions", tone: "decision" },
+        {
+          from: "maproot",
+          to: "capability",
+          tone: "capability",
+          handoff: true,
+        },
+        { from: "maproot", to: "resolved" },
+        { from: "maproot", to: "fog", handoff: true },
+      ];
+      function add(id, x, y, parent, tone) {
+        nodes.push({ id, x, y, w: 224, h: 132, tone });
+        edges.push({ from: parent, to: id, tone });
+      }
+      if (graph.decisions) {
+        const positions = [
+          [25, 18],
+          [304, 26],
+          [8, 373],
+          [11, 559],
+          [11, 739],
+        ];
+        const ids = (graph.allDecisions ? open : open.slice(0, 3)).map(
+          (item) => item.id,
+        );
+        ids.forEach((id, index) =>
+          add(id, ...positions[index], "decisions", "decision"),
+        );
+      }
+      if (graph.delivery) {
+        add("submit", 729, 91, "capability", "capability");
+        add("resume", 1007, 284, "capability", "capability");
+        add("recover", 1000, 516, "capability", "capability");
+        if (graph.allDelivery) {
+          add("identity", 732, -88, "capability", "muted");
+          add("prompt", 1012, 97, "capability", "muted");
+        }
+      }
+      if (graph.resolved) {
+        closed.forEach((item, index) =>
+          add(item.id, 283 + index * 267, 829, "resolved", "muted"),
+        );
+      }
+      if (graph.layout === "tree") {
+        const tree = {
+          maproot: [550, 20],
+          decisions: [222, 241],
+          capability: [876, 241],
+          resolved: [19, 742],
+          fog: [1235, 231],
+          tracking: [14, 465],
+          layout: [272, 465],
+          launch: [530, 465],
+          handoff: [273, 670],
+          verification: [529, 670],
+          submit: [811, 485],
+          resume: [1064, 485],
+          recover: [1317, 485],
+          identity: [938, 701],
+          prompt: [1203, 701],
+          models: [18, 946],
+          scope: [282, 946],
+        };
+        nodes.forEach((node) => {
+          [node.x, node.y] = tree[node.id];
+        });
+      }
+      nodes.forEach((node) => Object.assign(node, graph.positions[node.id]));
+      return { nodes, edges };
+    }
+
+    function curve(from, to) {
+      const a = { x: from.x + from.w / 2, y: from.y + from.h / 2 };
+      const b = { x: to.x + to.w / 2, y: to.y + to.h / 2 };
+      if (Math.abs(b.x - a.x) > Math.abs(b.y - a.y)) {
+        a.x += ((b.x > a.x ? 1 : -1) * from.w) / 2;
+        b.x += ((b.x > a.x ? -1 : 1) * to.w) / 2;
+        const middle = (a.x + b.x) / 2;
+        return `M ${a.x} ${a.y} C ${middle} ${a.y}, ${middle} ${b.y}, ${b.x} ${b.y}`;
+      }
+      a.y += ((b.y > a.y ? 1 : -1) * from.h) / 2;
+      b.y += ((b.y > a.y ? -1 : 1) * to.h) / 2;
+      const middle = (a.y + b.y) / 2;
+      return `M ${a.x} ${a.y} C ${a.x} ${middle}, ${b.x} ${middle}, ${b.x} ${b.y}`;
+    }
+
+    function graphEdges() {
+      return mapModel.edges
+        .map((edge) => {
+          const from = mapModel.nodes.find((node) => node.id === edge.from);
+          const to = mapModel.nodes.find((node) => node.id === edge.to);
+          return `<path d="${curve(from, to)}" data-tone="${edge.tone || "muted"}" data-selected="${graph.inspector && (edge.to === state.selected || edge.from === state.selected)}" data-handoff="${Boolean(edge.handoff)}" />`;
+        })
+        .join("");
+    }
+
+    function graphNode(node) {
+      const item = get(node.id);
+      const group = !item;
+      const title = node.title || item.title;
+      const ready = item && frontier().includes(item);
+      const action = group
+        ? `data-toggle="${node.toggle}"`
+        : `data-select="${node.id}"`;
+      return `<article class="wf-node" data-node="${node.id}" data-tone="${node.tone}" data-selected="${graph.inspector && state.selected === node.id}" data-frontier="${Boolean(ready)}" style="left:${node.x}px;top:${node.y}px;width:${node.w}px">
+        <button type="button" class="wf-node-main" ${action} aria-label="${escape(title)}${group ? ", expand or collapse branch" : ", view details"}">
+          <span class="wf-node-kind">${node.label || item.kind}</span>
+          <span class="wf-node-name">${escape(title)}</span>
+          <span class="wf-node-meta">${node.meta || `${status(item)}${ready ? "<span>Frontier</span>" : ""}`}</span>
+        </button>
+        ${node.toggle ? `<button type="button" class="wf-node-expand" data-toggle="${node.toggle}" aria-expanded="${graph[node.toggle]}">${graph[node.toggle] ? "− Collapse branch" : "+ Expand branch"}</button>` : ""}
+        ${node.id === "decisions" && graph.decisions ? `<button type="button" class="wf-node-expand" data-toggle="allDecisions">${graph.allDecisions ? "Show first branches" : "Show all open decisions"}</button>` : ""}
+        ${node.id === "capability" && graph.delivery ? `<button type="button" class="wf-node-expand" data-toggle="allDelivery">${graph.allDelivery ? "Hide resolved tickets" : "Show resolved tickets"}</button>` : ""}
+      </article>`;
+    }
+
+    function mindMap() {
+      mapModel = graphModel();
+      return `<header class="wf-map-header"><div><h1>Workflow map</h1><p>From open questions to working capabilities.</p></div><div class="wf-map-tools"><label><span class="wf-muted">Layout </span><select aria-label="Node layout" data-map-layout><option value="mind" ${graph.layout === "mind" ? "selected" : ""}>Mind map</option><option value="tree" ${graph.layout === "tree" ? "selected" : ""}>Top to bottom</option></select></label><button type="button" class="wf-secondary" data-select="${frontier()[0]?.id || "maproot"}">${frontier().length} in frontier ↗</button></div></header>
+        <section class="wf-map-canvas" aria-label="Workflow mind map. Drag the canvas to pan, drag nodes to arrange them, or use the zoom controls.">
+          <div class="wf-map-scene"><svg class="wf-map-edges" width="1" height="1" aria-hidden="true">${graphEdges()}</svg>${mapModel.nodes.map(graphNode).join("")}</div>
+          <div class="wf-map-legend"><span>Branch</span><span>Handoff / unexplored</span></div>
+          <div class="wf-map-controls" aria-label="Map navigation"><button type="button" data-map-zoom="-1" aria-label="Zoom out">−</button><output id="wf-zoom-label">100%</output><button type="button" data-map-zoom="1" aria-label="Zoom in">+</button><button type="button" data-map-fit>Fit map</button></div>
+          ${graph.inspector ? `<aside class="wf-map-inspector" aria-label="Node details"><div class="wf-map-inspector-header"><span>Selected node</span><button type="button" data-close-inspector aria-label="Close node details">Close ×</button></div>${detail()}</aside>` : ""}
+        </section>`;
+    }
+
+    function syncGraph() {
+      const canvas = root.querySelector(".wf-map-canvas");
+      if (!canvas) return;
+      const scene = canvas.querySelector(".wf-map-scene");
+      scene.style.transform = `translate(${graph.x}px, ${graph.y}px) scale(${graph.zoom})`;
+      canvas.querySelector("#wf-zoom-label").textContent =
+        `${Math.round(graph.zoom * 100)}%`;
+    }
+
+    function measureGraph() {
+      mapModel.nodes.forEach((node) => {
+        const element = root.querySelector(`[data-node="${node.id}"]`);
+        node.h = element.offsetHeight || node.h;
+      });
+      root.querySelector(".wf-map-edges").innerHTML = graphEdges();
+    }
+
+    function fitGraph(initial = false) {
+      const canvas = root.querySelector(".wf-map-canvas");
+      if (!canvas || !canvas.clientWidth) return;
+      const minX = Math.min(...mapModel.nodes.map((node) => node.x));
+      const minY = Math.min(...mapModel.nodes.map((node) => node.y));
+      const maxX = Math.max(...mapModel.nodes.map((node) => node.x + node.w));
+      const maxY = Math.max(...mapModel.nodes.map((node) => node.y + node.h));
+      graph.zoom = Math.min(
+        1,
+        (canvas.clientWidth - 80) / (maxX - minX),
+        (canvas.clientHeight - 80) / (maxY - minY),
+      );
+      graph.zoom = Math.max(0.4, graph.zoom);
+      if (initial && canvas.clientWidth < 800) {
+        graph.zoom = 0.85;
+        const center = mapModel.nodes.find((node) => node.id === "maproot");
+        graph.x =
+          canvas.clientWidth / 2 - (center.x + center.w / 2) * graph.zoom;
+        graph.y =
+          canvas.clientHeight / 2 - (center.y + center.h / 2) * graph.zoom;
+      } else {
+        graph.x =
+          (canvas.clientWidth - (maxX - minX) * graph.zoom) / 2 -
+          minX * graph.zoom;
+        graph.y =
+          (canvas.clientHeight - (maxY - minY) * graph.zoom) / 2 -
+          minY * graph.zoom;
+      }
+      graph.fitted = true;
+      syncGraph();
+      writePrototypeState();
+    }
+
+    function focusGraph(id) {
+      const node = mapModel.nodes.find((candidate) => candidate.id === id);
+      const canvas = root.querySelector(".wf-map-canvas");
+      if (!node || !canvas || !canvas.clientWidth) return;
+      const availableWidth =
+        canvas.clientWidth -
+        (graph.inspector && canvas.clientWidth > 700 ? 365 : 0);
+      const availableHeight =
+        canvas.clientHeight *
+        (graph.inspector && canvas.clientWidth <= 700 ? 0.5 : 1);
+      graph.x = availableWidth / 2 - (node.x + node.w / 2) * graph.zoom;
+      graph.y = availableHeight / 2 - (node.y + node.h / 2) * graph.zoom;
+      syncGraph();
+      writePrototypeState();
+    }
+
+    function zoomGraph(direction, point) {
+      const canvas = root.querySelector(".wf-map-canvas");
+      if (!canvas) return;
+      const center = point || {
+        x: canvas.clientWidth / 2,
+        y: canvas.clientHeight / 2,
+      };
+      const zoom = Math.min(1.6, Math.max(0.4, graph.zoom + direction * 0.1));
+      graph.x = center.x - ((center.x - graph.x) * zoom) / graph.zoom;
+      graph.y = center.y - ((center.y - graph.y) * zoom) / graph.zoom;
+      graph.zoom = zoom;
+      syncGraph();
+      writePrototypeState();
+    }
+
     function threadView() {
       if (!state.threads.length)
         return '<div class="wf-heading"><h1>Threads</h1><p>Start work from a decision or capability to see its thread here.</p></div>';
@@ -959,6 +1590,7 @@
     }
 
     function render() {
+      root.dataset.variant = state.variant;
       root
         .querySelectorAll("[data-page]")
         .forEach((button) =>
@@ -973,7 +1605,12 @@
       root.querySelector("#wf-variant-label").textContent =
         `${state.variant} · ${variants[state.variant]}`;
       if (state.page === "threads") view.innerHTML = threadView();
-      else {
+      else if (state.variant === "D") {
+        view.innerHTML = mindMap();
+        measureGraph();
+        if (!graph.fitted) fitGraph(true);
+        syncGraph();
+      } else {
         const tabs = [
           ["frontier", "Frontier"],
           ["maps", "Maps"],
@@ -982,9 +1619,20 @@
         ];
         view.innerHTML = `<div class="wf-heading"><h1>Workflow</h1><p>Find the next decision. Follow a capability through delivery.</p></div><nav class="wf-tabs" aria-label="Workflow views">${tabs.map(([key, name]) => `<button type="button" data-section="${key}" aria-pressed="${state.section === key}">${name}</button>`).join("")}</nav><div class="wf-content">${state.variant === "A" || state.section === "maps" ? `<div class="wf-workspace"><div>${listContent()}</div>${detail()}</div>` : state.variant === "B" ? board() : outline()}</div>`;
       }
+      writePrototypeState();
+    }
+
+    function writePrototypeState() {
       root.querySelector("#wf-state-output").textContent = JSON.stringify(
         {
           layout: variants[state.variant],
+          map: {
+            layout: graph.layout,
+            zoom: graph.zoom,
+            pan: { x: graph.x, y: graph.y },
+            movedNodes: graph.positions,
+            inspector: graph.inspector,
+          },
           view: state.page,
           selected: get(state.selected).title,
           frontier: frontier().map((item) => item.title),
@@ -1060,10 +1708,39 @@
       announce(`Layout ${state.variant}: ${variants[state.variant]}.`);
     }
 
+    let graphDrag = null;
+    let suppressGraphClick = false;
+
     root.addEventListener("click", (event) => {
+      if (suppressGraphClick) {
+        suppressGraphClick = false;
+        event.preventDefault();
+        return;
+      }
       const button = event.target.closest("button");
       if (!button || button.disabled) return;
       const data = button.dataset;
+      if ("mapZoom" in data) {
+        zoomGraph(Number(data.mapZoom));
+        return;
+      }
+      if ("mapFit" in data) {
+        fitGraph();
+        return;
+      }
+      if ("closeInspector" in data) {
+        graph.inspector = false;
+        render();
+        root
+          .querySelector(`[data-node="${state.selected}"] .wf-node-main`)
+          ?.focus({ preventScroll: true });
+        return;
+      }
+      if (data.toggle) {
+        graph[data.toggle] = !graph[data.toggle];
+        render();
+        return;
+      }
       if (data.cycle) {
         const keys = Object.keys(variants);
         setVariant(
@@ -1091,10 +1768,12 @@
       if (data.select) {
         state.selected = data.select;
         state.page = "workflow";
+        if (state.variant === "D") graph.inspector = true;
       }
       if (data.source) {
         state.selected = data.source;
         state.page = "workflow";
+        if (state.variant === "D") graph.inspector = true;
       }
       if (data.thread) {
         state.thread = data.thread;
@@ -1116,9 +1795,143 @@
         );
       }
       render();
+      if (state.variant === "D" && (data.select || data.source)) {
+        focusGraph(state.selected);
+        root
+          .querySelector("[data-close-inspector]")
+          ?.focus({ preventScroll: true });
+      }
+    });
+
+    root.addEventListener("change", (event) => {
+      if (!event.target.matches("[data-map-layout]")) return;
+      graph.layout = event.target.value;
+      graph.positions = {};
+      graph.fitted = false;
+      graph.inspector = false;
+      render();
+      fitGraph();
+    });
+
+    root.addEventListener("pointerdown", (event) => {
+      const canvas = event.target.closest(".wf-map-canvas");
+      if (
+        !canvas ||
+        event.button !== 0 ||
+        event.target.closest(
+          ".wf-map-inspector, .wf-map-controls, .wf-node-expand",
+        )
+      )
+        return;
+      const element = event.target.closest("[data-node]");
+      const node =
+        element &&
+        mapModel.nodes.find(
+          (candidate) => candidate.id === element.dataset.node,
+        );
+      const capture = event.target.closest(".wf-node-main") || canvas;
+      graphDrag = {
+        pointer: event.pointerId,
+        canvas,
+        capture,
+        node,
+        element,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        x: node?.x ?? graph.x,
+        y: node?.y ?? graph.y,
+        moved: false,
+      };
+      capture.setPointerCapture(event.pointerId);
+    });
+
+    root.addEventListener("pointermove", (event) => {
+      if (!graphDrag || graphDrag.pointer !== event.pointerId) return;
+      const dx = event.clientX - graphDrag.clientX;
+      const dy = event.clientY - graphDrag.clientY;
+      if (!graphDrag.moved && Math.hypot(dx, dy) < 5) return;
+      graphDrag.moved = true;
+      graphDrag.canvas.dataset.dragging = "true";
+      if (graphDrag.node) {
+        const position = {
+          x: graphDrag.x + dx / graph.zoom,
+          y: graphDrag.y + dy / graph.zoom,
+        };
+        graph.positions[graphDrag.node.id] = position;
+        Object.assign(graphDrag.node, position);
+        graphDrag.element.style.left = `${position.x}px`;
+        graphDrag.element.style.top = `${position.y}px`;
+        graphDrag.canvas.querySelector(".wf-map-edges").innerHTML =
+          graphEdges();
+      } else {
+        graph.x = graphDrag.x + dx;
+        graph.y = graphDrag.y + dy;
+        syncGraph();
+      }
+    });
+
+    function endGraphDrag(event) {
+      if (!graphDrag || graphDrag.pointer !== event.pointerId) return;
+      suppressGraphClick = graphDrag.moved && event.type !== "pointercancel";
+      graphDrag.canvas.dataset.dragging = "false";
+      if (graphDrag.capture.hasPointerCapture(event.pointerId))
+        graphDrag.capture.releasePointerCapture(event.pointerId);
+      graphDrag = null;
+      writePrototypeState();
+    }
+    root.addEventListener("pointerup", endGraphDrag);
+    root.addEventListener("pointercancel", endGraphDrag);
+    root.addEventListener(
+      "wheel",
+      (event) => {
+        const canvas = event.target.closest(".wf-map-canvas");
+        if (
+          !canvas ||
+          event.target.closest(".wf-map-inspector") ||
+          !(event.ctrlKey || event.metaKey)
+        )
+          return;
+        event.preventDefault();
+        const bounds = canvas.getBoundingClientRect();
+        zoomGraph(event.deltaY < 0 ? 1 : -1, {
+          x: event.clientX - bounds.left,
+          y: event.clientY - bounds.top,
+        });
+      },
+      { passive: false },
+    );
+
+    root.addEventListener("focusin", (event) => {
+      const element = event.target.closest("[data-node]");
+      const canvas = root.querySelector(".wf-map-canvas");
+      if (!element || !canvas) return;
+      const bounds = canvas.getBoundingClientRect();
+      const node = element.getBoundingClientRect();
+      if (
+        node.left < bounds.left ||
+        node.right > bounds.right ||
+        node.top < bounds.top ||
+        node.bottom > bounds.bottom
+      )
+        focusGraph(element.dataset.node);
+    });
+
+    window.addEventListener("resize", () => {
+      if (state.variant === "D" && state.page === "workflow") {
+        if (graph.inspector) focusGraph(state.selected);
+        else fitGraph(true);
+      }
     });
 
     root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && graph.inspector) {
+        graph.inspector = false;
+        render();
+        root
+          .querySelector(`[data-node="${state.selected}"] .wf-node-main`)
+          ?.focus({ preventScroll: true });
+        return;
+      }
       if (
         event.target.closest(
           "input, textarea, select, button, summary, [contenteditable]",
@@ -1150,6 +1963,7 @@
           { label: "A · Workspace", value: "A" },
           { label: "B · Board", value: "B" },
           { label: "C · Outline", value: "C" },
+          { label: "D · Mind map", value: "D" },
         ],
       });
     }

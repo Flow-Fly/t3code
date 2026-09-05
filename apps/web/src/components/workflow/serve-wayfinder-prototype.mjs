@@ -3,11 +3,7 @@
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 
-const fragment = await readFile(
-  new URL("./wayfinder.prototype.html", import.meta.url),
-  "utf8",
-);
-const page = `<!doctype html>
+const page = (fragment) => `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -23,22 +19,26 @@ const page = `<!doctype html>
 <body>${fragment}</body>
 </html>`;
 
-const server = createServer((request, response) => {
+const server = createServer(async (request, response) => {
   const path = new URL(request.url, "http://localhost").pathname;
   if (path !== "/" && path !== "/workflow-prototype") {
     response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-    response.end("Open /workflow-prototype?variant=A");
+    response.end("Open /workflow-prototype?variant=D");
     return;
   }
+  const fragment = await readFile(
+    new URL("./wayfinder.prototype.html", import.meta.url),
+    "utf8",
+  );
   response.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
   });
-  response.end(page);
+  response.end(page(fragment));
 });
 
 server.listen(Number(process.argv[2] ?? 4317), "127.0.0.1", () => {
   console.log(
-    `Workflow prototype: http://127.0.0.1:${server.address().port}/workflow-prototype?variant=A`,
+    `Workflow prototype: http://127.0.0.1:${server.address().port}/workflow-prototype?variant=D`,
   );
 });
