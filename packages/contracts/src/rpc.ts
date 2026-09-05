@@ -133,6 +133,8 @@ import {
   WorkflowChildrenResult,
   WorkflowIssueDetail,
   WorkflowIssueDetailInput,
+  WorkflowLocateInput,
+  WorkflowLocateResult,
   WorkflowQueryError,
   WorkflowRepositoriesInput,
   WorkflowRepositoriesResult,
@@ -379,6 +381,7 @@ export const WS_METHODS = {
   workflowChildren: "workflow.children",
   workflowIssueDetail: "workflow.issueDetail",
   workflowSearch: "workflow.search",
+  workflowLocate: "workflow.locate",
 
   // Source control methods
   sourceControlLookupRepository: "sourceControl.lookupRepository",
@@ -818,6 +821,12 @@ export const WsWorkflowIssueDetailRpc = Rpc.make(WS_METHODS.workflowIssueDetail,
 export const WsWorkflowSearchRpc = Rpc.make(WS_METHODS.workflowSearch, {
   payload: WorkflowSearchInput,
   success: WorkflowSearchResult,
+  error: WorkflowRpcError,
+});
+
+export const WsWorkflowLocateRpc = Rpc.make(WS_METHODS.workflowLocate, {
+  payload: WorkflowLocateInput,
+  success: WorkflowLocateResult,
   error: WorkflowRpcError,
 });
 
@@ -1316,6 +1325,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowChildrenRpc,
   WsWorkflowIssueDetailRpc,
   WsWorkflowSearchRpc,
+  WsWorkflowLocateRpc,
   WsSourceControlLookupRepositoryRpc,
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,

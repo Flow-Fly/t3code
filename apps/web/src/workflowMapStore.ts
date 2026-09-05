@@ -29,7 +29,6 @@ interface WorkflowMapStoreState {
   patchView: (scope: string, patch: Partial<WorkflowMapView>) => void;
   toggleExpanded: (scope: string, id: string) => void;
   toggleFold: (scope: string, id: string) => void;
-  resetView: (scope: string) => void;
 }
 
 const toggle = (values: readonly string[], value: string) =>
@@ -87,7 +86,6 @@ export const useWorkflowMapStore = create<WorkflowMapStoreState>()(
             views: { ...state.views, [scope]: { ...view, openFolds: toggle(view.openFolds, id) } },
           };
         }),
-      resetView: (scope) => set((state) => ({ views: { ...state.views, [scope]: EMPTY_VIEW } })),
     }),
     {
       name: "t3code:workflow-map:v1",

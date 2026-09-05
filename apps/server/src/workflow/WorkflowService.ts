@@ -6,6 +6,8 @@ import {
   type WorkflowIssueDetailInput,
   type WorkflowIssueKind,
   type WorkflowIssueStateReason,
+  type WorkflowLocateInput,
+  type WorkflowLocateResult,
   WorkflowQueryError,
   type WorkflowRepositoriesInput,
   type WorkflowRepositoriesResult,
@@ -256,6 +258,9 @@ export class WorkflowService extends Context.Service<
     readonly search: (
       input: WorkflowSearchInput,
     ) => Effect.Effect<WorkflowSearchResult, WorkflowQueryError>;
+    readonly locate: (
+      input: WorkflowLocateInput,
+    ) => Effect.Effect<WorkflowLocateResult, WorkflowQueryError>;
   }
 >()("t3/workflow/WorkflowService") {}
 
@@ -569,6 +574,57 @@ export const make = Effect.gen(function* () {
     function* (input) {
       const selectedProject = yield* project(input.projectId);
       const matches: Array<WorkflowSearchResult["matches"][number]> = [];
+      const lookupCache = new Map<string, RawIssue | null>();
+      const summaryCache = new Map<string, ReturnType<typeof issueSummary>>();
+
+      const lookupIssue = Effect.fn("WorkflowService.search.lookupIssue")(function* (
+        reference: RawIssueReference,
+      ) {
+        const key = reference.id;
+        if (lookupCache.has(key)) return lookupCache.get(key) ?? null;
+        const parentRaw = yield* executeGraphQl({
+          cwd: selectedProject.workspaceRoot,
+          repository: reference.repository.nameWithOwner,
+          query: ISSUE_LOOKUP_QUERY,
+          number: reference.number,
+        });
+        const parentDecoded = yield* Effect.try({
+          try: () => decodeIssueLookup(parentRaw),
+          catch: (error) =>
+            queryError(
+              "invalid-response",
+              "GitHub returned invalid workflow ancestry.",
+              String(error),
+            ),
+        });
+        const issue = parentDecoded.data.repository?.issue ?? null;
+        lookupCache.set(key, issue);
+        return issue;
+      });
+
+      const ancestryFor = Effect.fn("WorkflowService.search.ancestryFor")(function* (
+        firstParent: RawIssueReference | null | undefined,
+      ) {
+        const ancestry = [];
+        let parent = firstParent;
+        for (let depth = 0; parent && depth < 8; depth += 1) {
+          let summary = summaryCache.get(parent.id);
+          if (!summary) {
+            const completeParent = yield* completeLabels(
+              selectedProject.workspaceRoot,
+              parent.repository.nameWithOwner,
+              parent,
+            );
+            summary = issueSummary(completeParent);
+            summaryCache.set(parent.id, summary);
+          }
+          ancestry.unshift(summary);
+          const parentIssue = yield* lookupIssue(parent);
+          parent = parentIssue?.parent ?? null;
+        }
+        return { ancestry, ancestryComplete: parent === null };
+      });
+
       let cursor: string | undefined;
       let hasMore = false;
       do {
@@ -595,36 +651,10 @@ export const make = Effect.gen(function* () {
             rawIssue.repository.nameWithOwner,
             rawIssue,
           );
-          const ancestry = [];
-          let parent = complete.parent;
-          for (let depth = 0; parent && depth < 8; depth += 1) {
-            const completeParent = yield* completeLabels(
-              selectedProject.workspaceRoot,
-              parent.repository.nameWithOwner,
-              parent,
-            );
-            ancestry.unshift(issueSummary(completeParent));
-            const parentRaw = yield* executeGraphQl({
-              cwd: selectedProject.workspaceRoot,
-              repository: parent.repository.nameWithOwner,
-              query: ISSUE_LOOKUP_QUERY,
-              number: parent.number,
-            });
-            const parentDecoded = yield* Effect.try({
-              try: () => decodeIssueLookup(parentRaw),
-              catch: (error) =>
-                queryError(
-                  "invalid-response",
-                  "GitHub returned invalid workflow ancestry.",
-                  String(error),
-                ),
-            });
-            parent = parentDecoded.data.repository?.issue?.parent ?? null;
-          }
+          const ancestryResult = yield* ancestryFor(complete.parent);
           matches.push({
             issue: issueSummary(complete),
-            ancestry,
-            ancestryComplete: parent === null,
+            ...ancestryResult,
           });
           consumed += 1;
           if (matches.length === 50) break;
@@ -643,7 +673,71 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkflowService.of({ repositories, roots, children, issueDetail, search });
+  const locate: WorkflowService["Service"]["locate"] = Effect.fn("WorkflowService.locate")(
+    function* (input) {
+      const selectedProject = yield* project(input.projectId);
+      const raw = yield* executeGraphQl({
+        cwd: selectedProject.workspaceRoot,
+        repository: input.repository,
+        query: ISSUE_LOOKUP_QUERY,
+        number: input.number,
+      });
+      const decoded = yield* Effect.try({
+        try: () => decodeIssueLookup(raw),
+        catch: (error) =>
+          queryError(
+            "invalid-response",
+            "GitHub returned invalid workflow ancestry.",
+            String(error),
+          ),
+      });
+      const issue = decoded.data.repository?.issue;
+      if (!issue || issue.id !== input.id) {
+        return yield* queryError(
+          "issue-not-found",
+          "The selected workflow issue is no longer available at this location.",
+        );
+      }
+      const complete = yield* completeLabels(
+        selectedProject.workspaceRoot,
+        issue.repository.nameWithOwner,
+        issue,
+      );
+      const ancestry = [];
+      let parent = complete.parent;
+      for (let depth = 0; parent && depth < 8; depth += 1) {
+        const completeParent = yield* completeLabels(
+          selectedProject.workspaceRoot,
+          parent.repository.nameWithOwner,
+          parent,
+        );
+        ancestry.unshift(issueSummary(completeParent));
+        const parentRaw = yield* executeGraphQl({
+          cwd: selectedProject.workspaceRoot,
+          repository: parent.repository.nameWithOwner,
+          query: ISSUE_LOOKUP_QUERY,
+          number: parent.number,
+        });
+        const parentDecoded = yield* Effect.try({
+          try: () => decodeIssueLookup(parentRaw),
+          catch: (error) =>
+            queryError(
+              "invalid-response",
+              "GitHub returned invalid workflow ancestry.",
+              String(error),
+            ),
+        });
+        parent = parentDecoded.data.repository?.issue?.parent ?? null;
+      }
+      return {
+        issue: issueSummary(complete),
+        ancestry,
+        ancestryComplete: parent === null,
+      };
+    },
+  );
+
+  return WorkflowService.of({ repositories, roots, children, issueDetail, search, locate });
 });
 
 export const layer = Layer.effect(WorkflowService, make).pipe(Layer.provide(GitHubCli.layer));

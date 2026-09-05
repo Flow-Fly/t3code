@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   type PointerEvent as ReactPointerEvent,
+  type FormEvent as ReactFormEvent,
   type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
@@ -219,6 +220,7 @@ export function WorkflowFocusedMap(props: {
   projectId: ProjectId;
   root: WorkflowIssueSummary;
   onRefreshRoot: () => void;
+  onNavigateMatch: (match: WorkflowSearchMatch) => void;
 }) {
   const context = workflowMapContextKey({
     environmentId: props.environmentId,
@@ -233,7 +235,9 @@ export function WorkflowFocusedMap(props: {
     [rootId]: props.root,
   });
   const [childrenByParent, setChildrenByParent] = useState<Record<string, readonly string[]>>({});
-  const [search, setSearch] = useState("");
+  const [searchDraft, setSearchDraft] = useState("");
+  const [submittedSearch, setSubmittedSearch] = useState("");
+  const [recoverSelection, setRecoverSelection] = useState(false);
   const [refreshRequest, setRefreshRequest] = useState(0);
   const [transientViewport, setTransientViewport] = useState<WorkflowViewport | null>(null);
   const [transientPosition, setTransientPosition] = useState<{
@@ -249,6 +253,7 @@ export function WorkflowFocusedMap(props: {
     originX: number;
     originY: number;
   } | null>(null);
+  const searchCompositionRef = useRef(false);
 
   const onChildren = useCallback((parent: WorkflowIssueSummary, result: WorkflowChildrenResult) => {
     const parentId = issueIdentity(parent);
@@ -300,15 +305,14 @@ export function WorkflowFocusedMap(props: {
     openFolds: view.openFolds,
     positions: currentPositions,
   });
+  const nodeById = new Map(map.nodes.map((node) => [node.id, node]));
   const breadcrumbNodes = (() => {
     if (!view.selectedId) return [];
     const path = new Array<(typeof map.nodes)[number]>();
-    let current = map.nodes.find((node) => node.id === view.selectedId);
+    let current = nodeById.get(view.selectedId);
     while (current) {
       path.unshift(current);
-      current = current.parentId
-        ? map.nodes.find((node) => node.id === current!.parentId)
-        : undefined;
+      current = current.parentId ? nodeById.get(current.parentId) : undefined;
     }
     return path;
   })();
@@ -324,17 +328,28 @@ export function WorkflowFocusedMap(props: {
   }, [map.nodes, scope, store, view.positions]);
 
   const selected = view.selectedId ? currentNodes[view.selectedId] : undefined;
-  const selectionHidden = Boolean(
-    view.selectedId && !map.nodes.some((node) => node.id === view.selectedId),
-  );
+  const selectionHidden = Boolean(view.selectedId && !nodeById.has(view.selectedId));
   const searchQuery = useEnvironmentQuery(
-    search.trim()
+    submittedSearch
       ? workflowEnvironment.search({
           environmentId: props.environmentId,
           input: {
             projectId: props.projectId,
             repository: props.root.repository,
-            query: search.trim(),
+            query: submittedSearch,
+          },
+        })
+      : null,
+  );
+  const locateQuery = useEnvironmentQuery(
+    selectionHidden && recoverSelection && selected
+      ? workflowEnvironment.locate({
+          environmentId: props.environmentId,
+          input: {
+            projectId: props.projectId,
+            repository: selected.repository,
+            id: selected.id,
+            number: selected.number,
           },
         })
       : null,
@@ -348,20 +363,55 @@ export function WorkflowFocusedMap(props: {
 
   const revealMatch = (match: WorkflowSearchMatch) => {
     const merged = mergeWorkflowSearchMatch({ nodes: currentNodes, childrenByParent }, match);
+    const expanded = [...new Set([...view.expanded, ...merged.expanded])];
+    const openFolds = [
+      ...new Set([
+        ...view.openFolds,
+        ...match.ancestry.flatMap((parent) => [
+          foldIdentity(issueIdentity(parent), "completed"),
+          foldIdentity(issueIdentity(parent), "cancelled"),
+        ]),
+      ]),
+    ];
+    const revealedMap = buildVisibleWorkflowMap({
+      root: props.root,
+      nodes: merged.nodes,
+      childrenByParent: merged.childrenByParent,
+      expanded,
+      openFolds,
+      positions: currentPositions,
+    });
+    const pathIds = new Set([...match.ancestry, match.issue].map(issueIdentity));
+    const pathNodes = revealedMap.nodes.filter((node) => pathIds.has(node.id));
+    const rect = canvasRef.current?.getBoundingClientRect();
     setNodes(merged.nodes);
     setChildrenByParent(merged.childrenByParent);
     store.patchView(scope, {
       selectedId: issueIdentity(match.issue),
-      expanded: [...new Set([...view.expanded, ...merged.expanded])],
-      openFolds: [
-        ...new Set([
-          ...view.openFolds,
-          ...match.ancestry.flatMap((parent) => [
-            foldIdentity(issueIdentity(parent), "completed"),
-            foldIdentity(issueIdentity(parent), "cancelled"),
-          ]),
-        ]),
-      ],
+      expanded,
+      openFolds,
+      viewport: fitWorkflowViewport(pathNodes, {
+        width: rect?.width ?? 600,
+        height: rect?.height ?? 420,
+      }),
+    });
+  };
+
+  const submitSearch = (event: ReactFormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (searchCompositionRef.current) return;
+    setSubmittedSearch(searchDraft.trim());
+  };
+
+  const moveSelected = (offset: WorkflowPoint) => {
+    const node = view.selectedId ? nodeById.get(view.selectedId) : undefined;
+    if (!node) return;
+    const position = view.positions[node.id] ?? node.position;
+    store.patchView(scope, {
+      positions: {
+        ...view.positions,
+        [node.id]: { x: position.x + offset.x, y: position.y + offset.y },
+      },
     });
   };
 
@@ -464,7 +514,7 @@ export function WorkflowFocusedMap(props: {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(16rem,1fr)_minmax(10rem,auto)] @lg/workflow:grid-cols-[minmax(0,1fr)_minmax(14rem,0.38fr)] @lg/workflow:grid-rows-[auto_minmax(0,1fr)]">
+    <div className="grid min-h-0 min-w-0 flex-1 grid-rows-[auto_minmax(16rem,1fr)_minmax(10rem,auto)] @lg/workflow:grid-cols-[minmax(0,1fr)_minmax(14rem,0.38fr)] @lg/workflow:grid-rows-[auto_minmax(0,1fr)]">
       {loadIds.map((id) =>
         currentNodes[id]?.childCount ? (
           <ChildrenLoader
@@ -477,19 +527,28 @@ export function WorkflowFocusedMap(props: {
           />
         ) : null,
       )}
-      <div className="col-span-full grid gap-2 border-b border-border p-2 @md/workflow:grid-cols-[minmax(12rem,1fr)_auto]">
-        <div className="relative">
+      <div className="col-span-full grid min-w-0 gap-2 border-b border-border p-2 @md/workflow:grid-cols-[minmax(12rem,1fr)_auto]">
+        <form className="relative flex min-w-0 gap-1" role="search" onSubmit={submitSearch}>
           <Input
             aria-label="Search this workflow"
             placeholder="Search this workflow"
             size="sm"
             type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            value={searchDraft}
+            onChange={(event) => setSearchDraft(event.target.value)}
+            onCompositionStart={() => {
+              searchCompositionRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              searchCompositionRef.current = false;
+            }}
           />
-          {search.trim() ? (
+          <Button type="submit" size="xs" variant="outline">
+            Search
+          </Button>
+          {submittedSearch ? (
             <div
-              className="absolute z-30 mt-1 max-h-52 w-full overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-lg"
+              className="absolute inset-x-0 top-full z-30 mt-1 max-h-52 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-lg"
               aria-label="Workflow search results"
             >
               {searchQuery.isPending && !searchQuery.data ? (
@@ -510,7 +569,8 @@ export function WorkflowFocusedMap(props: {
                   className="block w-full rounded px-2 py-1.5 text-left text-xs hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={() => {
                     revealMatch(match);
-                    setSearch("");
+                    setSearchDraft("");
+                    setSubmittedSearch("");
                   }}
                 >
                   <span className="block truncate">
@@ -536,8 +596,8 @@ export function WorkflowFocusedMap(props: {
               ) : null}
             </div>
           ) : null}
-        </div>
-        <div className="flex items-center gap-1" aria-label="Map controls">
+        </form>
+        <div className="flex min-w-0 flex-wrap items-center gap-1" aria-label="Map controls">
           <Button size="icon-xs" variant="ghost" aria-label="Zoom out" onClick={() => zoomBy(0.9)}>
             <Minus />
           </Button>
@@ -553,6 +613,44 @@ export function WorkflowFocusedMap(props: {
           <Button size="xs" variant="ghost" aria-label="Refresh workflow map" onClick={refresh}>
             Refresh
           </Button>
+          <div className="flex items-center" role="group" aria-label="Selected node position">
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              aria-label="Move selected node left"
+              disabled={!view.selectedId || !nodeById.has(view.selectedId)}
+              onClick={() => moveSelected({ x: -16, y: 0 })}
+            >
+              ←
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              aria-label="Move selected node up"
+              disabled={!view.selectedId || !nodeById.has(view.selectedId)}
+              onClick={() => moveSelected({ x: 0, y: -16 })}
+            >
+              ↑
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              aria-label="Move selected node down"
+              disabled={!view.selectedId || !nodeById.has(view.selectedId)}
+              onClick={() => moveSelected({ x: 0, y: 16 })}
+            >
+              ↓
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              aria-label="Move selected node right"
+              disabled={!view.selectedId || !nodeById.has(view.selectedId)}
+              onClick={() => moveSelected({ x: 16, y: 0 })}
+            >
+              →
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -576,7 +674,7 @@ export function WorkflowFocusedMap(props: {
             {map.nodes
               .filter((node) => node.parentId)
               .map((node) => {
-                const parent = map.nodes.find((candidate) => candidate.id === node.parentId);
+                const parent = node.parentId ? nodeById.get(node.parentId) : undefined;
                 if (!parent) return null;
                 return (
                   <path
@@ -655,10 +753,31 @@ export function WorkflowFocusedMap(props: {
               className="mt-1"
               size="xs"
               variant="outline"
-              onClick={() => setSearch(selected?.title ?? view.selectedId ?? "")}
+              onClick={() => setRecoverSelection(true)}
             >
               Find current context
             </Button>
+            {locateQuery.isPending ? (
+              <p className="mt-1 text-muted-foreground">Finding current context…</p>
+            ) : null}
+            {locateQuery.error ? (
+              <div className="mt-1 flex items-center gap-2 text-destructive">
+                <span>{locateQuery.error}</span>
+                <Button size="micro" variant="ghost" onClick={locateQuery.refresh}>
+                  Retry
+                </Button>
+              </div>
+            ) : null}
+            {locateQuery.data ? (
+              <Button
+                className="mt-1"
+                size="xs"
+                variant="outline"
+                onClick={() => props.onNavigateMatch(locateQuery.data!)}
+              >
+                Open current root #{(locateQuery.data.ancestry[0] ?? locateQuery.data.issue).number}
+              </Button>
+            ) : null}
           </div>
         ) : null}
         <nav className="border-b border-border p-2" aria-label="Workflow breadcrumbs">

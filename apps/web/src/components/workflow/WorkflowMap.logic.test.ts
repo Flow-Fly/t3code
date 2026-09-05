@@ -152,4 +152,86 @@ describe("focused Workflow map", () => {
       result.nodes.find((node) => node.issue.number === 5)?.position,
     );
   });
+
+  it("reserves a saved branch when an earlier sibling expands later", () => {
+    const root = { ...issue(1, null), childCount: 2 };
+    const left = { ...issue(2, 1), childCount: 1 };
+    const right = { ...issue(3, 1), childCount: 1 };
+    const leftChild = issue(4, 2);
+    const rightChild = issue(5, 3);
+    const all = [root, left, right, leftChild, rightChild];
+    const input = {
+      root,
+      nodes: Object.fromEntries(all.map((node) => [issueIdentity(node), node])),
+      childrenByParent: {
+        [issueIdentity(root)]: [issueIdentity(left), issueIdentity(right)],
+        [issueIdentity(left)]: [issueIdentity(leftChild)],
+        [issueIdentity(right)]: [issueIdentity(rightChild)],
+      },
+      openFolds: [],
+    };
+    const rightFirst = buildVisibleWorkflowMap({
+      ...input,
+      expanded: [issueIdentity(right)],
+      positions: {},
+    });
+    const positions = Object.fromEntries(rightFirst.nodes.map((node) => [node.id, node.position]));
+    const both = buildVisibleWorkflowMap({
+      ...input,
+      expanded: [issueIdentity(left), issueIdentity(right)],
+      positions,
+    });
+
+    expect(both.nodes.find((node) => node.issue.number === 5)?.position).toEqual(
+      positions[issueIdentity(rightChild)],
+    );
+    expect(both.nodes.find((node) => node.issue.number === 4)?.position).not.toEqual(
+      positions[issueIdentity(rightChild)],
+    );
+  });
+
+  it("places an inserted sibling without moving or covering saved siblings", () => {
+    const root = { ...issue(1, null), childCount: 3 };
+    const first = issue(2, 1);
+    const second = issue(3, 1);
+    const inserted = issue(4, 1);
+    const nodes = Object.fromEntries(
+      [root, first, second, inserted].map((node) => [issueIdentity(node), node]),
+    );
+    const original = buildVisibleWorkflowMap({
+      root,
+      nodes,
+      childrenByParent: { [issueIdentity(root)]: [issueIdentity(first), issueIdentity(second)] },
+      expanded: [],
+      openFolds: [],
+      positions: {},
+    });
+    const positions = Object.fromEntries(original.nodes.map((node) => [node.id, node.position]));
+    const updated = buildVisibleWorkflowMap({
+      root,
+      nodes,
+      childrenByParent: {
+        [issueIdentity(root)]: [
+          issueIdentity(inserted),
+          issueIdentity(first),
+          issueIdentity(second),
+        ],
+      },
+      expanded: [],
+      openFolds: [],
+      positions,
+    });
+
+    expect(updated.nodes.find((node) => node.id === issueIdentity(first))?.position).toEqual(
+      positions[issueIdentity(first)],
+    );
+    expect(updated.nodes.find((node) => node.id === issueIdentity(second))?.position).toEqual(
+      positions[issueIdentity(second)],
+    );
+    const insertedPosition = updated.nodes.find(
+      (node) => node.id === issueIdentity(inserted),
+    )?.position;
+    expect(insertedPosition).not.toEqual(positions[issueIdentity(first)]);
+    expect(insertedPosition).not.toEqual(positions[issueIdentity(second)]);
+  });
 });

@@ -1,14 +1,24 @@
-import type { EnvironmentId, ProjectId, WorkflowRepository } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ProjectId,
+  WorkflowRepository,
+  WorkflowSearchMatch,
+} from "@t3tools/contracts";
 import { useMemo, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { useEnvironmentQuery } from "~/state/query";
 import { workflowEnvironment } from "~/state/workflow";
-import { useWorkflowMapStore, workflowMapContextKey } from "~/workflowMapStore";
+import {
+  selectWorkflowMapView,
+  useWorkflowMapStore,
+  workflowMapContextKey,
+  workflowMapScopeKey,
+} from "~/workflowMapStore";
 
 import { WorkflowFocusedMap } from "./WorkflowFocusedMap";
-import { issueIdentity } from "./WorkflowMap.logic";
+import { foldIdentity, issueIdentity } from "./WorkflowMap.logic";
 import { filterWorkflowRoots, resolveWorkflowRepository } from "./WorkflowPanel.logic";
 
 interface WorkflowPanelProps {
@@ -97,6 +107,32 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
     : null;
   const focusedId = context ? mapStore.focusedRootByContext[context] : null;
   const focusedRoot = roots.find((root) => issueIdentity(root) === focusedId) ?? null;
+  const navigateToMatch = (match: WorkflowSearchMatch) => {
+    const root = match.ancestry[0] ?? match.issue;
+    const destinationContext = workflowMapContextKey({
+      environmentId: props.environmentId,
+      projectId: props.projectId,
+      repository: root.repository,
+    });
+    const destinationRootId = issueIdentity(root);
+    const destinationScope = workflowMapScopeKey(destinationContext, destinationRootId);
+    const destinationView = selectWorkflowMapView(mapStore.views, destinationScope);
+    mapStore.selectRepository(projectScope, root.repository);
+    mapStore.focusRoot(destinationContext, destinationRootId);
+    mapStore.patchView(destinationScope, {
+      selectedId: issueIdentity(match.issue),
+      expanded: [...new Set([...destinationView.expanded, ...match.ancestry.map(issueIdentity)])],
+      openFolds: [
+        ...new Set([
+          ...destinationView.openFolds,
+          ...match.ancestry.flatMap((parent) => [
+            foldIdentity(issueIdentity(parent), "completed"),
+            foldIdentity(issueIdentity(parent), "cancelled"),
+          ]),
+        ]),
+      ],
+    });
+  };
 
   const header = (
     <header className="grid gap-2 border-b border-border px-3 py-2 @md/workflow:grid-cols-[1fr_auto] @md/workflow:items-end">
@@ -241,6 +277,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           projectId={props.projectId}
           root={focusedRoot}
           onRefreshRoot={rootsQuery.refresh}
+          onNavigateMatch={navigateToMatch}
         />
       </>
     );

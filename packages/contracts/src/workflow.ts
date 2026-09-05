@@ -111,6 +111,17 @@ export const WorkflowSearchResult = Schema.Struct({
 });
 export type WorkflowSearchResult = typeof WorkflowSearchResult.Type;
 
+export const WorkflowLocateInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  id: TrimmedNonEmptyString,
+  number: PositiveInt,
+});
+export type WorkflowLocateInput = typeof WorkflowLocateInput.Type;
+
+export const WorkflowLocateResult = WorkflowSearchMatch;
+export type WorkflowLocateResult = typeof WorkflowLocateResult.Type;
+
 export const WorkflowQueryFailure = Schema.Literals([
   "project-not-found",
   "missing-git-repository",

@@ -10,7 +10,7 @@ const query = vi.hoisted(() => {
     calls.push({ kind, request });
     return { kind, request };
   };
-  return { calls, descriptor };
+  return { calls, descriptor, moved: false };
 });
 
 vi.mock("~/state/workflow", () => ({
@@ -20,6 +20,7 @@ vi.mock("~/state/workflow", () => ({
     children: (request: unknown) => query.descriptor("children", request),
     issueDetail: (request: unknown) => query.descriptor("detail", request),
     search: (request: unknown) => query.descriptor("search", request),
+    locate: (request: unknown) => query.descriptor("locate", request),
   },
 }));
 
@@ -57,6 +58,24 @@ vi.mock("~/state/query", () => ({
               parentNumber: null,
               labels: ["workflow:capability"],
             },
+            ...(query.moved
+              ? [
+                  {
+                    id: "issue-20",
+                    repository: "Flow-Fly/t3code",
+                    number: 20,
+                    title: "New capability",
+                    url: "https://github.com/Flow-Fly/t3code/issues/20",
+                    kind: "capability",
+                    state: "open",
+                    stateReason: null,
+                    updatedAt: "2026-09-05T00:00:00Z",
+                    childCount: 1,
+                    parentNumber: null,
+                    labels: ["workflow:capability"],
+                  },
+                ]
+              : []),
           ],
         },
       };
@@ -68,22 +87,26 @@ vi.mock("~/state/query", () => ({
         ...idle,
         data: {
           parentNumber: parentNumber ?? 10,
-          children: [
-            {
-              id: parentNumber === 11 ? "issue-12" : "issue-11",
-              repository: "Flow-Fly/t3code",
-              number: parentNumber === 11 ? 12 : 11,
-              title: parentNumber === 11 ? "Nested task" : "Browse work",
-              url: `https://github.com/Flow-Fly/t3code/issues/${parentNumber === 11 ? 12 : 11}`,
-              kind: "ticket",
-              state: parentNumber === 11 ? "closed" : "open",
-              stateReason: parentNumber === 11 ? "completed" : null,
-              updatedAt: "2026-09-05T00:00:00Z",
-              childCount: parentNumber === 11 ? 0 : 1,
-              parentNumber: parentNumber ?? 10,
-              labels: ["workflow:ticket"],
-            },
-          ],
+          children:
+            query.moved && parentNumber === 11
+              ? []
+              : [
+                  {
+                    id: parentNumber === 11 || parentNumber === 20 ? "issue-12" : "issue-11",
+                    repository: "Flow-Fly/t3code",
+                    number: parentNumber === 11 || parentNumber === 20 ? 12 : 11,
+                    title:
+                      parentNumber === 11 || parentNumber === 20 ? "Nested task" : "Browse work",
+                    url: `https://github.com/Flow-Fly/t3code/issues/${parentNumber === 11 || parentNumber === 20 ? 12 : 11}`,
+                    kind: "ticket",
+                    state: parentNumber === 11 || parentNumber === 20 ? "closed" : "open",
+                    stateReason: parentNumber === 11 || parentNumber === 20 ? "completed" : null,
+                    updatedAt: "2026-09-05T00:00:00Z",
+                    childCount: parentNumber === 11 || parentNumber === 20 ? 0 : 1,
+                    parentNumber: parentNumber ?? 10,
+                    labels: ["workflow:ticket"],
+                  },
+                ],
         },
       };
     }
@@ -180,6 +203,44 @@ vi.mock("~/state/query", () => ({
         },
       };
     }
+    if (descriptor.kind === "locate") {
+      return {
+        ...idle,
+        data: {
+          ancestryComplete: true,
+          ancestry: [
+            {
+              id: "issue-20",
+              repository: "Flow-Fly/t3code",
+              number: 20,
+              title: "New capability",
+              url: "https://github.com/Flow-Fly/t3code/issues/20",
+              kind: "capability",
+              state: "open",
+              stateReason: null,
+              updatedAt: "2026-09-05T00:00:00Z",
+              childCount: 1,
+              parentNumber: null,
+              labels: ["workflow:capability"],
+            },
+          ],
+          issue: {
+            id: "issue-12",
+            repository: "Flow-Fly/t3code",
+            number: 12,
+            title: "Nested task",
+            url: "https://github.com/Flow-Fly/t3code/issues/12",
+            kind: "ticket",
+            state: "closed",
+            stateReason: "completed",
+            updatedAt: "2026-09-05T00:00:00Z",
+            childCount: 0,
+            parentNumber: 20,
+            labels: ["workflow:ticket"],
+          },
+        },
+      };
+    }
     throw new Error(`Unexpected Workflow operation: ${descriptor.kind}`);
   },
 }));
@@ -190,6 +251,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} });
+  query.moved = false;
 });
 
 afterEach(() => {
@@ -223,7 +285,7 @@ describe("WorkflowPanel browsing", () => {
     try {
       const root = renderer!.root
         .findByProps({ "aria-label": "Workflow roots" })
-        .findByType("button");
+        .findAllByType("button")[0]!;
       await act(() => root.props.onClick());
 
       const issueButton = renderer!.root
@@ -266,16 +328,43 @@ describe("WorkflowPanel browsing", () => {
     await act(() =>
       renderer!.root
         .findByProps({ "aria-label": "Workflow roots" })
-        .findByType("button")
+        .findAllByType("button")[0]!
         .props.onClick(),
     );
 
     const search = renderer!.root.findByProps({ "aria-label": "Search this workflow" });
     await act(() => search.props.onChange({ target: { value: "Nested" } }));
+    expect(query.calls.filter((call) => call.kind === "search")).toHaveLength(0);
+    await act(() => search.props.onCompositionStart());
+    await act(() =>
+      renderer!.root.findByProps({ role: "search" }).props.onSubmit({ preventDefault: vi.fn() }),
+    );
+    expect(query.calls.filter((call) => call.kind === "search")).toHaveLength(0);
+    await act(() => search.props.onCompositionEnd());
+    const scope = Object.keys(useWorkflowMapStore.getState().views)[0]!;
+    await act(() =>
+      useWorkflowMapStore.getState().patchView(scope, {
+        viewport: { x: 999, y: 999, zoom: 1 },
+      }),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ role: "search" }).props.onSubmit({ preventDefault: vi.fn() }),
+    );
+    expect(query.calls.some((call) => call.kind === "search")).toBe(true);
     const result = renderer!.root
       .findByProps({ "aria-label": "Workflow search results" })
       .findAllByType("button")[0]!;
     await act(() => result.props.onClick());
+    expect(useWorkflowMapStore.getState().views[scope]!.viewport).not.toEqual({
+      x: 999,
+      y: 999,
+      zoom: 1,
+    });
+    const revealedViewport = useWorkflowMapStore.getState().views[scope]!.viewport;
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Refresh workflow map" }).props.onClick(),
+    );
+    expect(useWorkflowMapStore.getState().views[scope]!.viewport).toEqual(revealedViewport);
     const outline = renderer!.root.findByProps({ "aria-label": "Synchronized workflow outline" });
     expect(
       outline.findAllByType("button").some((button) => button.children.join("").includes("#12")),
@@ -287,9 +376,18 @@ describe("WorkflowPanel browsing", () => {
       "#12 Nested task",
     ]);
 
+    const selectedPosition = useWorkflowMapStore.getState().views[scope]!.positions["issue-12"]!;
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Move selected node right" }).props.onClick(),
+    );
+    expect(useWorkflowMapStore.getState().views[scope]!.positions["issue-12"]).toEqual({
+      x: selectedPosition.x + 16,
+      y: selectedPosition.y,
+    });
+
     await act(() => renderer!.root.findByProps({ "aria-label": "Zoom in" }).props.onClick());
-    const scope = Object.keys(useWorkflowMapStore.getState().views)[0]!;
     const canvas = renderer!.root.findByProps({ "aria-label": "Workflow map canvas" });
+    const viewportBeforePan = useWorkflowMapStore.getState().views[scope]!.viewport;
     await act(() => {
       canvas.props.onPointerDown({
         target: { closest: () => null },
@@ -301,7 +399,10 @@ describe("WorkflowPanel browsing", () => {
       canvas.props.onPointerMove({ clientX: 35, clientY: 28 });
       canvas.props.onPointerUp({ clientX: 35, clientY: 28 });
     });
-    expect(useWorkflowMapStore.getState().views[scope]?.viewport).toMatchObject({ x: 25, y: 18 });
+    expect(useWorkflowMapStore.getState().views[scope]?.viewport).toMatchObject({
+      x: viewportBeforePan.x + 25,
+      y: viewportBeforePan.y + 18,
+    });
 
     const node = renderer!.root.findAllByProps({ "data-workflow-node": true })[0]!;
     const rootPosition = useWorkflowMapStore.getState().views[scope]!.positions["issue-10"]!;
@@ -335,6 +436,86 @@ describe("WorkflowPanel browsing", () => {
     expect(renderer!.root.findAllByProps({ "aria-label": "Workflow roots" })).toHaveLength(0);
     expect(renderer!.root.findByProps({ "aria-label": "Workflow map canvas" })).toBeDefined();
     expect(useWorkflowMapStore.getState().views[scope]?.selectedId).toBe("issue-12");
+    await act(() => renderer?.unmount());
+  });
+
+  it("recovers a moved selection by stable identity and preserves the previous root view", async () => {
+    const props = {
+      environmentId: EnvironmentId.make("remote-environment"),
+      environmentLabel: "Remote environment",
+      projectId: ProjectId.make("project-draft"),
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(<WorkflowPanel {...props} />);
+    });
+    await act(() =>
+      renderer!.root
+        .findByProps({ "aria-label": "Workflow roots" })
+        .findAllByType("button")[0]!
+        .props.onClick(),
+    );
+
+    const search = renderer!.root.findByProps({ "aria-label": "Search this workflow" });
+    await act(() => search.props.onChange({ target: { value: "Nested" } }));
+    await act(() =>
+      renderer!.root.findByProps({ role: "search" }).props.onSubmit({ preventDefault: vi.fn() }),
+    );
+    await act(() =>
+      renderer!.root
+        .findByProps({ "aria-label": "Workflow search results" })
+        .findAllByType("button")[0]!
+        .props.onClick(),
+    );
+    const oldScope = Object.keys(useWorkflowMapStore.getState().views)[0]!;
+    await act(() =>
+      useWorkflowMapStore.getState().patchView(oldScope, {
+        viewport: { x: 45, y: 67, zoom: 0.75 },
+      }),
+    );
+
+    query.moved = true;
+    await act(() => renderer!.update(<WorkflowPanel {...props} />));
+    const recovery = renderer!.root
+      .findAllByType("button")
+      .find((button) => button.children.join("") === "Find current context");
+    expect(recovery).toBeDefined();
+    await act(() => recovery!.props.onClick());
+    const locateCall = query.calls.find((call) => call.kind === "locate");
+    expect(locateCall?.request).toMatchObject({
+      input: { repository: "Flow-Fly/t3code", id: "issue-12", number: 12 },
+    });
+    await act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.children.join("").includes("Open current root #20"))!
+        .props.onClick(),
+    );
+
+    expect(
+      renderer!.root
+        .findByProps({ "aria-label": "Choose another workflow root" })
+        .children.join(""),
+    ).toContain("#20 New capability");
+    expect(
+      renderer!.root
+        .findByProps({ "aria-label": "Synchronized workflow outline" })
+        .findAllByType("button")
+        .some((button) => button.children.join("").includes("#12 Nested task")),
+    ).toBe(true);
+    expect(useWorkflowMapStore.getState().views[oldScope]!.viewport).toEqual({
+      x: 45,
+      y: 67,
+      zoom: 0.75,
+    });
+    expect(
+      Object.values(useWorkflowMapStore.getState().views).some(
+        (view) =>
+          view.selectedId === "issue-12" && view !== useWorkflowMapStore.getState().views[oldScope],
+      ),
+    ).toBe(true);
     await act(() => renderer?.unmount());
   });
 });

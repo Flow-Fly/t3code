@@ -390,4 +390,73 @@ describe("WorkflowService", () => {
       }).pipe(Effect.provide(layer(execute)));
     },
   );
+
+  it.effect("reuses a shared ancestor lookup across a bounded search request", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    execute
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({
+              data: {
+                search: {
+                  pageInfo: { hasNextPage: false, endCursor: "search-terminal" },
+                  nodes: Array.from({ length: 50 }, (_, index) => issue(100 + index, 1)),
+                },
+              },
+            }),
+          ) as never,
+        ),
+      )
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(JSON.stringify({ data: { repository: { issue: issue(1) } } })) as never,
+        ),
+      );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.search({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        query: "shared parent",
+      });
+
+      expect(result.matches).toHaveLength(50);
+      expect(result.matches.every((match) => match.ancestry[0]?.number === 1)).toBe(true);
+      expect(execute).toHaveBeenCalledTimes(2);
+    }).pipe(Effect.provide(layer(execute)));
+  });
+
+  it.effect("locates a stable issue identity in its current ancestry", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    execute
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({ data: { repository: { issue: issue(12, 20) } } }),
+          ) as never,
+        ),
+      )
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(JSON.stringify({ data: { repository: { issue: issue(20) } } })) as never,
+        ),
+      );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.locate({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        id: "issue-12",
+        number: 12,
+      });
+
+      expect(result.issue.id).toBe("issue-12");
+      expect(result.ancestry.map((ancestor) => ancestor.number)).toEqual([20]);
+      expect(result.ancestryComplete).toBe(true);
+      expect(execute).toHaveBeenCalledTimes(2);
+    }).pipe(Effect.provide(layer(execute)));
+  });
 });

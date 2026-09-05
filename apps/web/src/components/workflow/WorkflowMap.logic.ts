@@ -59,13 +59,25 @@ export function buildVisibleWorkflowMap(input: {
   const openFolds = new Set(input.openFolds);
   const rootId = issueIdentity(input.root);
   const nextColumnByDepth = new Map<number, number>();
+  const occupied = Object.values(input.positions);
+  const overlapsExistingNode = (position: WorkflowPoint) =>
+    occupied.some(
+      (existing) =>
+        Math.abs(existing.x - position.x) < 224 && Math.abs(existing.y - position.y) < 108,
+    );
   const visit = (id: string, parentId: string | null, depth: number) => {
     const issue = input.nodes[id];
     if (!issue) return;
-    const column = nextColumnByDepth.get(depth) ?? 0;
+    let column = nextColumnByDepth.get(depth) ?? 0;
+    let fallback = { x: column * 240 + 32, y: depth * 150 + 28 };
+    while (!input.positions[id] && overlapsExistingNode(fallback)) {
+      column += 1;
+      fallback = { x: column * 240 + 32, y: depth * 150 + 28 };
+    }
     nextColumnByDepth.set(depth, column + 1);
-    const fallback = { x: column * 240 + 32, y: depth * 150 + 28 };
-    visible.push({ id, issue, parentId, depth, position: input.positions[id] ?? fallback });
+    const position = input.positions[id] ?? fallback;
+    if (!input.positions[id]) occupied.push(position);
+    visible.push({ id, issue, parentId, depth, position });
     if (issue.childCount === 0) return;
     if (id !== rootId && !expanded.has(id)) return;
     const groups: Record<WorkflowHistoryGroup, string[]> = { completed: [], cancelled: [] };
