@@ -10,3 +10,7 @@
 
 Labels express readiness within the owning workflow. A label on a map or
 specification does not authorize implementing its children.
+
+Workflow artifact and reassessment labels are defined in
+[the tracker guidance](issue-tracker.md). Approval and resolution come from their
+records; `ready-for-agent` must also agree with the current blockers and scope.
