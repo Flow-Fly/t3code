@@ -32,6 +32,7 @@ export interface WorkflowEvidenceIssue {
   readonly body: string;
   readonly comments: ReadonlyArray<WorkflowEvidenceComment>;
   readonly reopenedAt: ReadonlyArray<string>;
+  readonly lastEditedAt?: string | null;
 }
 
 export interface WorkflowBlockerEvidence {
@@ -107,8 +108,8 @@ function declaredPrerequisites(body: string) {
   ].map((match) => ({ url: match[1]!, number: Number(match[2]) }));
 }
 
-function manualScope(body: string): ReadonlyArray<string> {
-  const lines: string[] = [];
+function prerequisiteConditions(body: string): ReadonlyArray<string> {
+  const conditions: string[] = [];
   let heading = "";
   for (const rawLine of body.split("\n")) {
     const headingMatch = /^#{1,6}\s+(.+)$/u.exec(rawLine);
@@ -118,14 +119,25 @@ function manualScope(body: string): ReadonlyArray<string> {
     }
     const line = rawLine.replace(/^\s*[-*]\s+/u, "").trim();
     if (!line) continue;
+    const inBlockedBy = /^blocked by$/iu.test(heading);
     const inPrerequisiteSection =
       /\b(?:manual|outside|additional|human|resource)?\s*(?:prerequisites?|conditions?)\b/iu.test(
         heading,
-      ) && !/^blocked by$/iu.test(heading);
+      );
     const explicitlyNamed = /^(?:prerequisite|requires?):\s+/iu.test(line);
-    if (inPrerequisiteSection || explicitlyNamed) lines.push(line);
+    if (!inBlockedBy && !inPrerequisiteSection && !explicitlyNamed) continue;
+    const description = line.replace(/^(?:prerequisite|requires?):\s+/iu, "").trim();
+    if (!description || /^none\b/iu.test(description)) continue;
+    if (inBlockedBy) {
+      const unsupported = description
+        .replace(/\[[^\]]+\]\(https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+\)/giu, "")
+        .replace(/\bT\d+\b/giu, "")
+        .replace(/[^\p{L}\p{N}]+/gu, "");
+      if (!unsupported) continue;
+    }
+    conditions.push(description);
   }
-  return lines;
+  return [...new Set(conditions)];
 }
 
 function ticketScope(body: string): string | undefined {
@@ -137,7 +149,7 @@ function ticketScope(body: string): string | undefined {
       what,
       acceptance,
       `Blocked by: ${prerequisiteIds(body).join(",") || "none"}`,
-      `Manual conditions: ${manualScope(body).join(" | ") || "none"}`,
+      `Manual conditions: ${prerequisiteConditions(body).join(" | ") || "none"}`,
     ].join("\n\n"),
   );
 }
@@ -168,6 +180,24 @@ function sourceAccess(
   if (/\bunavailable\b|\binaccessible\b/iu.test(source)) return "unavailable";
   if (availableComments.some((comment) => source.includes(comment.url))) return "verified";
   return "reported";
+}
+
+function hasIdentifiableEvidence(evidence: string | undefined): boolean {
+  if (!evidence) return false;
+  return (
+    /\[[^\]]+\]\(https?:\/\/[^\s)]+\)/u.test(evidence) ||
+    /https?:\/\/[^\s)]+/u.test(evidence) ||
+    /\b(?:thread|message|commit|artifact|file|path)\s*:?\s*`[^`]+`/iu.test(evidence)
+  );
+}
+
+function recordScope(
+  comment: WorkflowEvidenceComment,
+  issue: WorkflowEvidenceIssue,
+): WorkflowEvidenceRecord["scope"] {
+  if (issue.reopenedAt.some((createdAt) => createdAt > comment.createdAt)) return "changed";
+  if (issue.lastEditedAt && issue.lastEditedAt > comment.createdAt) return "unknown";
+  return "current";
 }
 
 function parseRecord(
@@ -203,9 +233,9 @@ function parseRecord(
         Boolean(approvedBy && source && approvedContent)
       : kind === "resolution"
         ? (outcome === "resolved" || outcome === "cancelled" || outcome === "out-of-scope") &&
-          Boolean(section(comment.body, "Summary") && evidence)
+          Boolean(section(comment.body, "Summary") && hasIdentifiableEvidence(evidence))
         : (outcome === "cleared" || outcome === "scope-change") &&
-          Boolean(source && section(comment.body, "Changes") && evidence);
+          Boolean(source && section(comment.body, "Changes") && hasIdentifiableEvidence(evidence));
   return {
     id: comment.id,
     url: comment.url,
@@ -216,9 +246,7 @@ function parseRecord(
     scope:
       kind === "approval"
         ? approvalScope(approvalKind, approvedContent, issue)
-        : issue.reopenedAt.some((createdAt) => createdAt > comment.createdAt)
-          ? "changed"
-          : "current",
+        : recordScope(comment, issue),
     summary,
     ...(approvalKind === "specification" || approvalKind === "ticket-breakdown"
       ? { approvalKind }
@@ -243,11 +271,32 @@ function markSuperseded(
   comments: ReadonlyArray<WorkflowEvidenceComment>,
 ) {
   const superseded = new Set<string>();
-  for (const comment of comments) {
-    if (!/\bsupersed(?:e|es|ed|ing)\b/iu.test(comment.body)) continue;
-    for (const record of records) {
-      if (record.url !== comment.url && comment.body.includes(record.url))
-        superseded.add(record.id);
+  const commentsById = new Map(comments.map((comment) => [comment.id, comment]));
+  for (const supersedingRecord of records) {
+    if (supersedingRecord.state !== "current") continue;
+    const comment = commentsById.get(supersedingRecord.id);
+    if (!comment) continue;
+    const targets = new Set(
+      comment.body.split("\n").flatMap((line) => {
+        const value =
+          /^\s*Supersedes:\s*(.+)$/iu.exec(line)?.[1] ??
+          /^\s*This record supersedes\s+(.+)$/iu.exec(line)?.[1];
+        return value
+          ? [...value.matchAll(/https?:\/\/[^\s)]+/gu)].map((match) =>
+              match[0].replace(/[.,;:]+$/u, ""),
+            )
+          : [];
+      }),
+    );
+    for (const target of records) {
+      if (
+        targets.has(target.url) &&
+        target.createdAt < supersedingRecord.createdAt &&
+        target.kind === supersedingRecord.kind &&
+        (target.kind !== "approval" || target.approvalKind === supersedingRecord.approvalKind)
+      ) {
+        superseded.add(target.id);
+      }
     }
   }
   return records.map((record) =>
@@ -261,32 +310,16 @@ function manualConditions(
   issue: WorkflowEvidenceIssue,
   records: ReadonlyArray<WorkflowEvidenceRecord>,
 ): ReadonlyArray<WorkflowManualCondition> {
-  const conditions: Array<{ description: string; source: string }> = [];
-  let heading = "";
-  for (const rawLine of issue.body.split("\n")) {
-    const headingMatch = /^#{1,6}\s+(.+)$/u.exec(rawLine);
-    if (headingMatch) {
-      heading = headingMatch[1]?.trim().toLowerCase() ?? "";
-      continue;
-    }
-    const line = rawLine.replace(/^\s*[-*]\s+/u, "").trim();
-    if (!line) continue;
-    const inPrerequisiteSection =
-      /\b(?:manual|outside|additional|human|resource)?\s*(?:prerequisites?|conditions?)\b/iu.test(
-        heading,
-      ) && !/^blocked by$/iu.test(heading);
-    const explicitlyNamed = /^(?:prerequisite|requires?):\s+/iu.test(line);
-    if (!inPrerequisiteSection && !explicitlyNamed) continue;
-    const description = line.replace(/^(?:prerequisite|requires?):\s+/iu, "").trim();
-    if (!description) continue;
+  const conditions = prerequisiteConditions(issue.body).map((description) => {
     const source = /\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/u.exec(description)?.[1] ?? issue.url;
-    conditions.push({ description, source });
-  }
+    return { description, source };
+  });
   return conditions.map((condition) => {
     const satisfiedBy = records.find(
       (record) =>
         record.kind === "reassessment" &&
         record.state === "current" &&
+        record.scope === "current" &&
         record.outcome === "cleared" &&
         record.source?.includes(condition.source) &&
         record.summary.toLocaleLowerCase().includes(condition.description.toLocaleLowerCase()),
@@ -310,6 +343,7 @@ function reason(
 function closedReadiness(
   issue: WorkflowEvidenceIssue,
   records: ReadonlyArray<WorkflowEvidenceRecord>,
+  historyComplete: boolean,
 ): WorkflowReadiness {
   const current = records.filter(
     (record) =>
@@ -342,6 +376,18 @@ function closedReadiness(
       ],
     };
   }
+  if (!historyComplete) {
+    return {
+      status: "closed-unverified",
+      reasons: [
+        reason(
+          "missing-resolution",
+          "Closed evidence history is truncated; open details to verify the current resolution.",
+          issue.url,
+        ),
+      ],
+    };
+  }
   const resolution = current.findLast((record) => record.outcome === "resolved");
   if (issue.stateReason === "completed" && resolution) {
     return {
@@ -351,15 +397,21 @@ function closedReadiness(
       ],
     };
   }
+  const uncertainResolution = records.findLast(
+    (record) =>
+      record.kind === "resolution" && record.state === "current" && record.scope === "unknown",
+  );
   return {
     status: "closed-unverified",
     reasons: [
       reason(
         "missing-resolution",
-        issue.reopenedAt.length > 0
-          ? "Closed after reopening without new current resolution evidence."
-          : "Closed as completed without current resolution evidence.",
-        issue.url,
+        uncertainResolution
+          ? "Resolution predates the latest issue edit; current scope needs verification."
+          : issue.reopenedAt.length > 0
+            ? "Closed after reopening without new current resolution evidence."
+            : "Closed as completed without current resolution evidence.",
+        uncertainResolution?.url ?? issue.url,
       ),
     ],
   };
@@ -369,19 +421,28 @@ export function interpretWorkflowEvidence(input: {
   readonly issue: WorkflowEvidenceIssue;
   readonly approvalComments?: ReadonlyArray<WorkflowEvidenceComment>;
   readonly blockers?: ReadonlyArray<WorkflowBlockerEvidence>;
+  readonly historyComplete?: boolean;
 }): { readonly evidence: WorkflowEvidence; readonly readiness: WorkflowReadiness } {
   const allComments = [...(input.approvalComments ?? []), ...input.issue.comments];
+  const inheritedApprovals = (input.approvalComments ?? []).filter(
+    (comment) => recordKind(comment.body) === "approval",
+  );
+  const ownedComments = input.issue.comments.filter(
+    (comment) => input.issue.kind === "capability" || recordKind(comment.body) !== "approval",
+  );
+  const recordComments = [...inheritedApprovals, ...ownedComments];
   const records = markSuperseded(
-    allComments
+    recordComments
       .map((comment) => parseRecord(comment, input.issue, allComments))
       .filter((record): record is WorkflowEvidenceRecord => record !== null)
       .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt)),
-    allComments,
+    recordComments,
   );
   const conditions = manualConditions(input.issue, records);
-  const evidence = { records, manualConditions: conditions };
+  const historyComplete = input.historyComplete ?? true;
+  const evidence = { records, manualConditions: conditions, historyComplete };
   if (input.issue.state === "closed") {
-    return { evidence, readiness: closedReadiness(input.issue, records) };
+    return { evidence, readiness: closedReadiness(input.issue, records, historyComplete) };
   }
 
   const reasons: WorkflowReadinessReason[] = [];

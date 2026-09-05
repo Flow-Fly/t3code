@@ -129,7 +129,7 @@ describe("workflow contracts", () => {
             kind: "approval",
             state: "current",
             sourceAccess: "reported",
-            scope: "current",
+            scope: "unknown",
             summary: "Approval: ticket-breakdown",
             approvalKind: "ticket-breakdown",
             authority: "verified",
@@ -139,12 +139,15 @@ describe("workflow contracts", () => {
           },
         ],
         manualConditions: [],
+        historyComplete: false,
       },
     });
 
     expect(detail.evidence?.records[0]).toMatchObject({
       authority: "verified",
       sourceAccess: "reported",
+      scope: "unknown",
     });
+    expect(detail.evidence?.historyComplete).toBe(false);
   });
 });

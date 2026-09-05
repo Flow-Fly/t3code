@@ -228,9 +228,17 @@ function WorkflowDetails(props: {
           </ul>
         </div>
       ) : null}
-      {evidence && (evidence.records.length > 0 || evidence.manualConditions.length > 0) ? (
+      {evidence &&
+      (evidence.records.length > 0 ||
+        evidence.manualConditions.length > 0 ||
+        evidence.historyComplete === false) ? (
         <section aria-label="Workflow evidence ledger">
           <h3 className="font-medium text-xs">Evidence</h3>
+          {evidence.historyComplete === false ? (
+            <p className="mt-1 text-muted-foreground text-xs">
+              Evidence history is incomplete. Open or refresh details before relying on this status.
+            </p>
+          ) : null}
           {evidence.records.length > 0 ? (
             <ol className="mt-1 grid gap-2">
               {evidence.records.map((record) => (

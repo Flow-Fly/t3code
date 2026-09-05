@@ -48,7 +48,12 @@ function issue(number: number, parent: number | null = null) {
   };
 }
 
-const terminalPage = { hasNextPage: false, endCursor: "terminal" };
+const terminalPage: {
+  hasNextPage: boolean;
+  endCursor: string;
+  hasPreviousPage?: boolean;
+  startCursor?: string | null;
+} = { hasNextPage: false, endCursor: "terminal" };
 
 function workflowComment(input: {
   id: string;
@@ -79,6 +84,7 @@ function evidenceIssue(input: {
   comments?: ReturnType<typeof workflowComment>[];
   reopenedAt?: string[];
   blockedBy?: ReturnType<typeof issue>[];
+  lastEditedAt?: string | null;
 }) {
   const base = issue(input.number, input.parent ?? null);
   return {
@@ -87,6 +93,7 @@ function evidenceIssue(input: {
     body: input.body ?? "",
     state: input.state ?? base.state,
     stateReason: input.stateReason === undefined ? base.stateReason : input.stateReason,
+    lastEditedAt: input.lastEditedAt ?? null,
     labels: {
       pageInfo: terminalPage,
       nodes: (input.labels ?? base.labels.nodes.map(({ name }) => name)).map((name) => ({ name })),
@@ -979,6 +986,58 @@ describe("WorkflowService", () => {
     }).pipe(Effect.provide(layer(execute)));
   });
 
+  it.effect("holds completed work when its issue scope was edited after resolution", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    const oldResolution = workflowComment({
+      id: "before-scope-edit",
+      createdAt: "2026-09-05T20:00:00Z",
+      body: [
+        "## Resolution",
+        "<!-- t3-workflow:v1 resolution -->",
+        "Outcome: resolved",
+        "### Summary",
+        "The approved work was completed.",
+        "### Evidence",
+        "[Reviewed commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      ].join("\n"),
+    });
+    execute.mockReturnValueOnce(
+      Effect.succeed(
+        processOutput(
+          JSON.stringify({
+            data: {
+              repository: {
+                issue: evidenceIssue({
+                  number: 18,
+                  title: "Edited after completion",
+                  body: "## Acceptance criteria\n\n- [ ] Newly added work",
+                  state: "CLOSED",
+                  stateReason: "COMPLETED",
+                  labels: ["wayfinder:task"],
+                  comments: [oldResolution],
+                  lastEditedAt: "2026-09-05T21:00:00Z",
+                }),
+              },
+            },
+          }),
+        ) as never,
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.issueDetail({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        number: 18,
+      });
+
+      expect(result.readiness).toMatchObject({ status: "closed-unverified" });
+      expect(result.readiness?.reasons[0]?.message).toContain("latest issue edit");
+      expect(result.evidence?.records[0]).toMatchObject({ scope: "unknown", state: "current" });
+    }).pipe(Effect.provide(layer(execute)));
+  });
+
   it.effect(
     "paginates evidence and lets a rejected prototype resolve after its latest reopening",
     () => {
@@ -1306,4 +1365,160 @@ describe("WorkflowService", () => {
       }).pipe(Effect.provide(layer(execute)));
     },
   );
+
+  it.effect("does not use a parent resolution as child completion evidence", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    const parentResolution = workflowComment({
+      id: "parent-resolution",
+      createdAt: "2026-09-05T20:00:00Z",
+      body: [
+        "## Resolution",
+        "<!-- t3-workflow:v1 resolution -->",
+        "Outcome: resolved",
+        "### Summary",
+        "The parent completed.",
+        "### Evidence",
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      ].join("\n"),
+    });
+    execute.mockReturnValueOnce(
+      Effect.succeed(
+        processOutput(
+          JSON.stringify({
+            data: {
+              repository: {
+                issue: {
+                  id: "issue-10",
+                  body: "Capability",
+                  comments: { pageInfo: terminalPage, nodes: [parentResolution] },
+                  subIssues: {
+                    pageInfo: terminalPage,
+                    nodes: [
+                      evidenceIssue({
+                        number: 13,
+                        parent: 10,
+                        state: "CLOSED",
+                        stateReason: "COMPLETED",
+                        labels: ["workflow:ticket"],
+                      }),
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+        ) as never,
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.children({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        parentNumber: 10,
+      });
+
+      expect(result.children[0]?.readiness).toMatchObject({ status: "closed-unverified" });
+      expect(execute).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.provide(layer(execute)));
+  });
+
+  it.effect("paginates open evidence without expanding folded closed history", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    const closedResolution = workflowComment({
+      id: "closed-resolution",
+      createdAt: "2026-09-05T20:00:00Z",
+      body: [
+        "## Resolution",
+        "<!-- t3-workflow:v1 resolution -->",
+        "Outcome: resolved",
+        "### Summary",
+        "The folded work completed.",
+        "### Evidence",
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      ].join("\n"),
+    });
+    const closed = evidenceIssue({
+      number: 14,
+      parent: 10,
+      state: "CLOSED",
+      stateReason: "COMPLETED",
+      labels: ["wayfinder:task"],
+      comments: [closedResolution],
+    });
+    closed.comments.pageInfo = {
+      ...terminalPage,
+      hasPreviousPage: true,
+      startCursor: "closed-older",
+    };
+    const open = evidenceIssue({
+      number: 15,
+      parent: 10,
+      state: "OPEN",
+      labels: ["wayfinder:task"],
+    });
+    open.comments.pageInfo = {
+      ...terminalPage,
+      hasPreviousPage: true,
+      startCursor: "open-older",
+    };
+    execute
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({
+              data: {
+                repository: {
+                  issue: {
+                    id: "issue-10",
+                    body: "Capability",
+                    comments: { pageInfo: terminalPage, nodes: [] },
+                    subIssues: { pageInfo: terminalPage, nodes: [closed, open] },
+                  },
+                },
+              },
+            }),
+          ) as never,
+        ),
+      )
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({
+              data: {
+                node: {
+                  comments: {
+                    pageInfo: {
+                      ...terminalPage,
+                      hasPreviousPage: false,
+                      startCursor: "open-first",
+                    },
+                    nodes: [],
+                  },
+                },
+              },
+            }),
+          ) as never,
+        ),
+      );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const result = yield* service.children({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        parentNumber: 10,
+      });
+
+      expect(result.children[0]?.readiness).toMatchObject({ status: "closed-unverified" });
+      expect(result.children[0]?.readiness?.reasons[0]?.message).toContain("truncated");
+      expect(result.children[1]?.readiness).toMatchObject({ status: "ready" });
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute.mock.calls[0]?.[0].args.join(" ")).toContain("comments(last:20)");
+      expect(execute.mock.calls[0]?.[0].args.join(" ")).toContain("blockedBy(first:20)");
+      expect(execute.mock.calls[1]?.[0].args).toContain("before=open-older");
+      expect(execute.mock.calls[1]?.[0].args).not.toContain("before=closed-older");
+    }).pipe(Effect.provide(layer(execute)));
+  });
 });

@@ -65,6 +65,8 @@ const RawReopenedEvent = Schema.Struct({ createdAt: Schema.String });
 const RawPageInfo = Schema.Struct({
   hasNextPage: Schema.Boolean,
   endCursor: Schema.NullOr(Schema.String),
+  hasPreviousPage: Schema.optional(Schema.Boolean),
+  startCursor: Schema.optional(Schema.NullOr(Schema.String)),
 });
 const RawIssueReference = Schema.Struct({
   id: Schema.String,
@@ -74,6 +76,7 @@ const RawIssueReference = Schema.Struct({
   state: Schema.String,
   stateReason: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
+  lastEditedAt: Schema.optional(Schema.NullOr(Schema.String)),
   labels: Schema.Struct({ pageInfo: RawPageInfo, nodes: Schema.Array(RawLabel) }),
   repository: Schema.Struct({ nameWithOwner: Schema.String }),
   subIssuesSummary: Schema.Struct({ total: Schema.Number }),
@@ -164,6 +167,8 @@ const RawCommentsPage = Schema.Struct({
   }),
 });
 
+const RawCommentsBackwardPage = RawCommentsPage;
+
 const RawAssigneesPage = Schema.Struct({
   data: Schema.Struct({
     node: Schema.NullOr(
@@ -214,6 +219,9 @@ const decodeDetail = Schema.decodeUnknownSync(Schema.fromJsonString(RawDetail));
 const decodeLabelsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawLabelsPage));
 const decodeBlockedByPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawBlockedByPage));
 const decodeCommentsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawCommentsPage));
+const decodeCommentsBackwardPage = Schema.decodeUnknownSync(
+  Schema.fromJsonString(RawCommentsBackwardPage),
+);
 const decodeAssigneesPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawAssigneesPage));
 const decodeReopenedPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawReopenedPage));
 const decodeEvidenceLookup = Schema.decodeUnknownSync(Schema.fromJsonString(RawEvidenceLookup));
@@ -221,19 +229,24 @@ const decodeSearchPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawSearc
 const decodeIssueLookup = Schema.decodeUnknownSync(Schema.fromJsonString(RawIssueLookup));
 const isWorkflowRepositoryNameWithOwner = Schema.is(WorkflowRepositoryNameWithOwner);
 
-const ISSUE_BASE_FIELDS = `id number title url state stateReason updatedAt repository{nameWithOwner} labels(first:100){pageInfo{hasNextPage endCursor}nodes{name}} subIssuesSummary{total}`;
+const ISSUE_BASE_FIELDS = `id number title url state stateReason updatedAt lastEditedAt repository{nameWithOwner} labels(first:100){pageInfo{hasNextPage endCursor}nodes{name}} subIssuesSummary{total}`;
 const ISSUE_FIELDS = `${ISSUE_BASE_FIELDS} parent{${ISSUE_BASE_FIELDS}}`;
 const COMMENTS_FIELDS = `comments(first:100){pageInfo{hasNextPage endCursor}nodes{id url body createdAt author{login} authorAssociation}}`;
+const RECENT_COMMENTS_FIELDS = `comments(last:20){pageInfo{hasNextPage endCursor hasPreviousPage startCursor}nodes{id url body createdAt author{login} authorAssociation}}`;
 const ASSIGNEES_FIELDS = `assignees(first:100){pageInfo{hasNextPage endCursor}nodes{login}}`;
 const REOPENED_FIELDS = `timelineItems(first:100,itemTypes:[REOPENED_EVENT]){pageInfo{hasNextPage endCursor}nodes{... on ReopenedEvent{createdAt}}}`;
 const BLOCKED_BY_FIELDS = `blockedBy(first:100){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}`;
+const CHILD_BLOCKER_FIELDS = `id number title url state stateReason updatedAt lastEditedAt repository{nameWithOwner} labels(first:20){pageInfo{hasNextPage endCursor}nodes{name}} subIssuesSummary{total}`;
+const CHILD_BLOCKED_BY_FIELDS = `blockedBy(first:20){pageInfo{hasNextPage endCursor}nodes{${CHILD_BLOCKER_FIELDS}}}`;
 const ISSUE_EVIDENCE_FIELDS = `${ISSUE_FIELDS} body ${COMMENTS_FIELDS} ${ASSIGNEES_FIELDS} ${REOPENED_FIELDS} ${BLOCKED_BY_FIELDS}`;
+const CHILD_EVIDENCE_FIELDS = `${ISSUE_FIELDS} body ${RECENT_COMMENTS_FIELDS} ${ASSIGNEES_FIELDS} ${REOPENED_FIELDS} ${CHILD_BLOCKED_BY_FIELDS}`;
 const ROOTS_QUERY = `query WorkflowRoots($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){issues(first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}`;
-const CHILDREN_QUERY = `query WorkflowChildren($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){id body ${COMMENTS_FIELDS} subIssues(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${ISSUE_EVIDENCE_FIELDS}}}}}}`;
+const CHILDREN_QUERY = `query WorkflowChildren($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){issue(number:$number){id body ${COMMENTS_FIELDS} subIssues(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${CHILD_EVIDENCE_FIELDS}}}}}}`;
 const DETAIL_QUERY = `query WorkflowDetail($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){${ISSUE_EVIDENCE_FIELDS}}}}`;
 const LABELS_QUERY = `query WorkflowLabels($id:ID!,$after:String){node(id:$id){... on Issue{labels(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{name}}}}}`;
 const BLOCKED_BY_QUERY = `query WorkflowBlockedBy($id:ID!,$after:String){node(id:$id){... on Issue{blockedBy(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}}`;
 const COMMENTS_QUERY = `query WorkflowComments($id:ID!,$after:String){node(id:$id){... on Issue{comments(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{id url body createdAt author{login} authorAssociation}}}}}`;
+const COMMENTS_BACKWARD_QUERY = `query WorkflowCommentsBackward($id:ID!,$before:String){node(id:$id){... on Issue{comments(last:100,before:$before){pageInfo{hasNextPage endCursor hasPreviousPage startCursor}nodes{id url body createdAt author{login} authorAssociation}}}}}`;
 const ASSIGNEES_QUERY = `query WorkflowAssignees($id:ID!,$after:String){node(id:$id){... on Issue{assignees(first:100,after:$after){pageInfo{hasNextPage endCursor}nodes{login}}}}}`;
 const REOPENED_QUERY = `query WorkflowReopened($id:ID!,$after:String){node(id:$id){... on Issue{timelineItems(first:100,after:$after,itemTypes:[REOPENED_EVENT]){pageInfo{hasNextPage endCursor}nodes{... on ReopenedEvent{createdAt}}}}}}`;
 const EVIDENCE_LOOKUP_QUERY = `query WorkflowEvidenceLookup($id:ID!){node(id:$id){... on Issue{${ISSUE_EVIDENCE_FIELDS}}}}`;
@@ -375,6 +388,7 @@ export const make = Effect.gen(function* () {
     number?: number;
     id?: string;
     cursor?: string;
+    before?: string;
     searchQuery?: string;
   }) {
     const parsed = parseRepository(input.repository);
@@ -395,6 +409,7 @@ export const make = Effect.gen(function* () {
       ...(input.number === undefined ? [] : ["-F", `number=${input.number}`]),
       ...(input.id === undefined ? [] : ["-F", `id=${input.id}`]),
       ...(input.cursor === undefined ? [] : ["-f", `after=${input.cursor}`]),
+      ...(input.before === undefined ? [] : ["-f", `before=${input.before}`]),
       ...(input.searchQuery === undefined ? [] : ["-f", `searchQuery=${input.searchQuery}`]),
     ];
     const result = yield* github
@@ -536,6 +551,45 @@ export const make = Effect.gen(function* () {
     return comments;
   });
 
+  const completeRecentComments = Effect.fn("WorkflowService.completeRecentComments")(function* (
+    cwd: string,
+    repository: string,
+    id: string,
+    initial: RawIssue["comments"],
+  ) {
+    const comments = [...(initial?.nodes ?? [])];
+    let pageInfo = initial?.pageInfo;
+    while (pageInfo?.hasPreviousPage) {
+      if (!pageInfo.startCursor) {
+        return yield* queryError(
+          "invalid-response",
+          "GitHub returned incomplete workflow comment pagination.",
+        );
+      }
+      const raw = yield* executeGraphQl({
+        cwd,
+        repository,
+        query: COMMENTS_BACKWARD_QUERY,
+        id,
+        before: pageInfo.startCursor,
+      });
+      const decoded = yield* Effect.try({
+        try: () => decodeCommentsBackwardPage(raw),
+        catch: (error) =>
+          queryError(
+            "invalid-response",
+            "GitHub returned invalid workflow comments.",
+            String(error),
+          ),
+      });
+      if (!decoded.data.node)
+        return yield* queryError("issue-not-found", "The selected workflow issue was not found.");
+      comments.unshift(...decoded.data.node.comments.nodes);
+      pageInfo = decoded.data.node.comments.pageInfo;
+    }
+    return comments;
+  });
+
   const completeAssignees = Effect.fn("WorkflowService.completeAssignees")(function* (
     cwd: string,
     repository: string,
@@ -626,13 +680,29 @@ export const make = Effect.gen(function* () {
   const completeEvidenceIssue = Effect.fn("WorkflowService.completeEvidenceIssue")(function* (
     cwd: string,
     rawIssue: RawIssue,
+    mode: "child" | "detail" = "detail",
   ) {
     const repository = rawIssue.repository.nameWithOwner;
     const issue = yield* completeLabels(cwd, repository, rawIssue);
-    const comments = yield* completeComments(cwd, repository, issue.id, issue.comments);
-    const assignees = yield* completeAssignees(cwd, repository, issue.id, issue.assignees);
-    const reopened = yield* completeReopened(cwd, repository, issue.id, issue.timelineItems);
-    const blockers = yield* completeBlockerReferences(cwd, repository, issue);
+    const compactClosed = mode === "child" && issue.state === "CLOSED";
+    const comments = compactClosed
+      ? [...(issue.comments?.nodes ?? [])]
+      : mode === "child"
+        ? yield* completeRecentComments(cwd, repository, issue.id, issue.comments)
+        : yield* completeComments(cwd, repository, issue.id, issue.comments);
+    const assignees = compactClosed
+      ? [...(issue.assignees?.nodes ?? [])]
+      : yield* completeAssignees(cwd, repository, issue.id, issue.assignees);
+    const reopened = compactClosed
+      ? [...(issue.timelineItems?.nodes ?? [])]
+      : yield* completeReopened(cwd, repository, issue.id, issue.timelineItems);
+    const blockers = compactClosed
+      ? [...(issue.blockedBy?.nodes ?? [])]
+      : yield* completeBlockerReferences(cwd, repository, issue);
+    const historyComplete =
+      !compactClosed ||
+      (issue.comments?.pageInfo.hasPreviousPage !== true &&
+        issue.timelineItems?.pageInfo.hasNextPage !== true);
     const summary = issueSummary(issue);
     return {
       raw: {
@@ -658,7 +728,9 @@ export const make = Effect.gen(function* () {
         body: issue.body ?? "",
         comments: comments.map(evidenceComment),
         reopenedAt: reopened.map((event) => event.createdAt),
+        lastEditedAt: issue.lastEditedAt ?? null,
       } satisfies WorkflowEvidenceIssue,
+      historyComplete,
     };
   });
 
@@ -684,7 +756,11 @@ export const make = Effect.gen(function* () {
 
   const assessEvidenceIssue = Effect.fn("WorkflowService.assessEvidenceIssue")(function* (input: {
     cwd: string;
-    issue: { readonly raw: RawIssue; readonly issue: WorkflowEvidenceIssue };
+    issue: {
+      readonly raw: RawIssue;
+      readonly issue: WorkflowEvidenceIssue;
+      readonly historyComplete: boolean;
+    };
     approvalComments: ReadonlyArray<WorkflowEvidenceComment>;
     cache: Map<string, WorkflowReadiness>;
   }) {
@@ -733,6 +809,7 @@ export const make = Effect.gen(function* () {
       issue: input.issue.issue,
       approvalComments: input.approvalComments,
       blockers,
+      historyComplete: input.issue.historyComplete,
     });
   });
 
@@ -853,7 +930,9 @@ export const make = Effect.gen(function* () {
           approvalCommentsLoaded = true;
         }
         for (const issue of repository.issue.subIssues.nodes) {
-          children.push(yield* completeEvidenceIssue(selectedProject.workspaceRoot, issue));
+          children.push(
+            yield* completeEvidenceIssue(selectedProject.workspaceRoot, issue, "child"),
+          );
         }
         if (
           repository.issue.subIssues.pageInfo.hasNextPage &&

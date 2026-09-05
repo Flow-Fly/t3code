@@ -112,7 +112,12 @@ export const WorkflowEvidenceSourceAccess = Schema.Literals([
 ]);
 export type WorkflowEvidenceSourceAccess = typeof WorkflowEvidenceSourceAccess.Type;
 
-export const WorkflowEvidenceScope = Schema.Literals(["current", "changed", "not-applicable"]);
+export const WorkflowEvidenceScope = Schema.Literals([
+  "current",
+  "changed",
+  "unknown",
+  "not-applicable",
+]);
 export type WorkflowEvidenceScope = typeof WorkflowEvidenceScope.Type;
 
 export const WorkflowApprovalAuthority = Schema.Literals(["verified", "reported", "unknown"]);
@@ -150,6 +155,7 @@ export type WorkflowManualCondition = typeof WorkflowManualCondition.Type;
 export const WorkflowEvidence = Schema.Struct({
   records: Schema.Array(WorkflowEvidenceRecord),
   manualConditions: Schema.Array(WorkflowManualCondition),
+  historyComplete: Schema.optionalKey(Schema.Boolean),
 });
 export type WorkflowEvidence = typeof WorkflowEvidence.Type;
 
