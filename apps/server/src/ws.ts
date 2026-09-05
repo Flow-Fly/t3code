@@ -114,6 +114,7 @@ import { deletePendingAttachment, issueAttachmentUploadUrl } from "./assets/Atta
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
+import * as WorkflowService from "./workflow/WorkflowService.ts";
 import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
@@ -528,6 +529,7 @@ const makeWsRpcLayer = (
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+      const workflow = yield* WorkflowService.WorkflowService;
       const canReplayPersistedRange = Effect.fnUntraced(function* (
         afterSequence: number,
         headSequence: number,
@@ -2101,6 +2103,22 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.pullRequestsList, pullRequests.list(input), {
             "rpc.aggregate": "pull-requests",
           }),
+        [WS_METHODS.workflowRepositories]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowRepositories, workflow.repositories(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowRoots]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowRoots, workflow.roots(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowChildren]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowChildren, workflow.children(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowIssueDetail]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowIssueDetail, workflow.issueDetail(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.pullRequestsListStats]: (input) =>
           observeRpcEffect(WS_METHODS.pullRequestsListStats, pullRequests.listStats(input), {
             "rpc.aggregate": "pull-requests",
@@ -2881,6 +2899,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         ),
     });
     const pullRequests = yield* PullRequestService.PullRequestService;
+    const workflow = yield* WorkflowService.WorkflowService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -2921,6 +2940,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               // One server-lifetime service means clients share the same PR caches, and a WS
               // mutation invalidates the HTTP diff cache that every client reads from.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
+              Layer.provide(Layer.succeed(WorkflowService.WorkflowService, workflow)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

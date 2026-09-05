@@ -251,6 +251,25 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("opens, reuses, and closes the Workflow singleton", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "workflow");
+    store.open(refA, "workflow");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "workflow",
+      surfaces: [{ id: "workflow", kind: "workflow" }],
+    });
+
+    useRightPanelStore.getState().closeSurface(refA, "workflow");
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: false,
+      activeSurfaceId: null,
+      surfaces: [],
+    });
+  });
+
   it("replaces the standalone explorer with peer file surfaces", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");

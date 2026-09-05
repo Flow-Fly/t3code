@@ -180,6 +180,7 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
+import { WorkflowPanel } from "./workflow/WorkflowPanel";
 import {
   deriveAgentPanelModel,
   foldSubagentActivities,
@@ -2275,6 +2276,8 @@ export default function ChatView(props: ChatViewProps) {
     : (primaryEnvironment?.serverConfig ?? null);
   const pullRequestsCapabilityKnown = serverConfig !== null;
   const supportsPullRequests = serverConfig?.environment.capabilities.pullRequests === true;
+  const workflowCapabilityKnown = serverConfig !== null;
+  const supportsWorkflow = serverConfig?.environment.capabilities.workflow === true;
   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
   const supportsAttachmentUploads =
@@ -3752,6 +3755,10 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
   }, [activeThreadRef]);
+  const addWorkflowSurface = useCallback(() => {
+    if (!activeThreadRef || !activeProject) return;
+    useRightPanelStore.getState().open(activeThreadRef, "workflow");
+  }, [activeProject, activeThreadRef]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
@@ -3996,6 +4003,7 @@ export default function ChatView(props: ChatViewProps) {
     const newlyLinkedPullRequest = shouldOpenProactivePullRequest(
       previousTargetKey,
       linkedThreadPullRequestKey,
+      activeRightPanelSurface?.kind,
     );
     const eligibleLink =
       settings.proactivePanelsEnabled && !shouldUseRightPanelSheet && newlyLinkedPullRequest;
@@ -4015,6 +4023,7 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     activeThreadKey,
     activeThreadRef,
+    activeRightPanelSurface?.kind,
     clientSettingsHydrated,
     isServerThread,
     linkedThreadPullRequest,
@@ -7646,6 +7655,14 @@ export default function ChatView(props: ChatViewProps) {
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
       />
+    ) : renderedRightPanelSurface?.kind === "workflow" && activeProject ? (
+      <WorkflowPanel
+        environmentId={activeThread.environmentId}
+        environmentLabel={activeEnvironment?.label ?? activeThread.environmentId}
+        projectId={activeProject.id}
+        projectTitle={activeProject.title}
+        supported={workflowCapabilityKnown ? supportsWorkflow : null}
+      />
     ) : (renderedRightPanelSurface?.kind === "files" ||
         renderedRightPanelSurface?.kind === "file") &&
       ((activeProject && activeWorkspaceRoot) ||
@@ -8181,12 +8198,14 @@ export default function ChatView(props: ChatViewProps) {
           onAddFiles={addFilesSurface}
           onAddPullRequest={addPullRequestSurface}
           onAddAgents={addAgentsSurface}
+          onAddWorkflow={addWorkflowSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
           terminalAvailable={activeProject !== null}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
           pullRequestAvailable={pullRequestSurfaceAvailable}
           agentsAvailable
+          workflowAvailable={activeProject !== null}
           liveAgentCount={agentPanelModel.liveCount}
         >
           {rightPanelContent}
@@ -8231,12 +8250,14 @@ export default function ChatView(props: ChatViewProps) {
             onAddFiles={addFilesSurface}
             onAddPullRequest={addPullRequestSurface}
             onAddAgents={addAgentsSurface}
+            onAddWorkflow={addWorkflowSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
             terminalAvailable={activeProject !== null}
             diffAvailable={isServerThread && isGitRepo}
             filesAvailable={activeProject !== null}
             pullRequestAvailable={pullRequestSurfaceAvailable}
             agentsAvailable
+            workflowAvailable={activeProject !== null}
             liveAgentCount={agentPanelModel.liveCount}
           >
             {rightPanelContent}

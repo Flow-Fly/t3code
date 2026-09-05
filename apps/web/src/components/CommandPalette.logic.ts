@@ -1,8 +1,11 @@
 import {
+  type EnvironmentId,
   type FilesystemBrowseEntry,
   type KeybindingCommand,
   THREAD_JUMP_KEYBINDING_COMMANDS,
+  type ThreadId,
 } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { filterFilesystemBrowseEntries } from "@t3tools/client-runtime/state/filesystem";
 import type { SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import * as Arr from "effect/Array";
@@ -18,6 +21,19 @@ export { normalizeSearchText } from "../lib/utils";
 export const RECENT_THREAD_LIMIT = 12;
 export const ITEM_ICON_CLASS = "size-4 text-icon-muted";
 export const ADDON_ICON_CLASS = "size-4";
+
+export function resolveWorkflowThreadRef(input: {
+  activeThread: { environmentId: EnvironmentId; id: ThreadId } | null;
+  activeDraftThread: { environmentId: EnvironmentId; threadId: ThreadId } | null;
+}) {
+  if (input.activeThread) {
+    return scopeThreadRef(input.activeThread.environmentId, input.activeThread.id);
+  }
+  if (input.activeDraftThread) {
+    return scopeThreadRef(input.activeDraftThread.environmentId, input.activeDraftThread.threadId);
+  }
+  return null;
+}
 
 export function browseInputEndPaddingClass(input: {
   readonly willCreateProjectPath: boolean;

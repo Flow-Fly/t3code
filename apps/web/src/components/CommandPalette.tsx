@@ -47,6 +47,7 @@ import {
   FileSearchIcon,
   FolderIcon,
   FolderPlusIcon,
+  GitBranchIcon,
   LinkIcon,
   MessageSquareIcon,
   PaletteIcon,
@@ -140,6 +141,7 @@ import {
   ITEM_ICON_CLASS,
   RECENT_THREAD_LIMIT,
   reduceCommandPaletteUiState,
+  resolveWorkflowThreadRef,
   type SearchOverlayMode,
 } from "./CommandPalette.logic";
 import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sidebar.logic";
@@ -973,6 +975,7 @@ function OpenCommandPaletteDialog(props: {
   const currentProjectEnvironmentId =
     activeThread?.environmentId ?? activeDraftThread?.environmentId ?? null;
   const currentProjectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? null;
+  const workflowThreadRef = resolveWorkflowThreadRef({ activeThread, activeDraftThread });
   const currentProjectCwd = currentProjectId
     ? (projectCwdById.get(currentProjectId) ?? null)
     : null;
@@ -1652,6 +1655,20 @@ function OpenCommandPaletteDialog(props: {
       openOverlayMode("files");
     },
   });
+
+  if (workflowThreadRef !== null && currentProjectId !== null) {
+    actionItems.push({
+      kind: "action",
+      value: "action:open-workflow",
+      searchTerms: ["open workflow", "github issues", "wayfinder", "planning", "delivery"],
+      title: "Open Workflow",
+      description: "Browse GitHub planning and delivery work",
+      icon: <GitBranchIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        useRightPanelStore.getState().open(workflowThreadRef, "workflow");
+      },
+    });
+  }
 
   actionItems.push({
     kind: "action",

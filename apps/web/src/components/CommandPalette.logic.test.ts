@@ -9,9 +9,24 @@ import {
   filterPinnedBrowseEntries,
   filterCommandPaletteGroups,
   normalizeSearchText,
+  resolveWorkflowThreadRef,
   reduceCommandPaletteUiState,
   type CommandPaletteGroup,
 } from "./CommandPalette.logic";
+
+describe("resolveWorkflowThreadRef", () => {
+  it("uses an unsent draft as Workflow context without requiring a provider session", () => {
+    expect(
+      resolveWorkflowThreadRef({
+        activeThread: null,
+        activeDraftThread: {
+          environmentId: LOCAL_ENVIRONMENT_ID,
+          threadId: ThreadId.make("draft-1"),
+        },
+      }),
+    ).toEqual({ environmentId: LOCAL_ENVIRONMENT_ID, threadId: ThreadId.make("draft-1") });
+  });
+});
 
 describe("browseInputEndPaddingClass", () => {
   it("reserves the widest space for the create action", () => {

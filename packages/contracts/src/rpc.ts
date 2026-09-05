@@ -129,6 +129,17 @@ import {
   PullRequestUpdateInput,
 } from "./pullRequest.ts";
 import {
+  WorkflowChildrenInput,
+  WorkflowChildrenResult,
+  WorkflowIssueDetail,
+  WorkflowIssueDetailInput,
+  WorkflowQueryError,
+  WorkflowRepositoriesInput,
+  WorkflowRepositoriesResult,
+  WorkflowRootsInput,
+  WorkflowRootsResult,
+} from "./workflow.ts";
+import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
   RelayClientStatusSchema,
@@ -359,6 +370,12 @@ export const WS_METHODS = {
   pullRequestsRequestReviewers: "pullRequests.requestReviewers",
   pullRequestsLabelCandidates: "pullRequests.labelCandidates",
   pullRequestsSetLabels: "pullRequests.setLabels",
+
+  // Workflow browsing methods
+  workflowRepositories: "workflow.repositories",
+  workflowRoots: "workflow.roots",
+  workflowChildren: "workflow.children",
+  workflowIssueDetail: "workflow.issueDetail",
 
   // Source control methods
   sourceControlLookupRepository: "sourceControl.lookupRepository",
@@ -767,6 +784,32 @@ export const WsPullRequestsSetLabelsRpc = Rpc.make(WS_METHODS.pullRequestsSetLab
   payload: PullRequestLabelChangeInput,
   success: Schema.Void,
   error: PullRequestRpcError,
+});
+
+const WorkflowRpcError = Schema.Union([WorkflowQueryError, EnvironmentAuthorizationError]);
+
+export const WsWorkflowRepositoriesRpc = Rpc.make(WS_METHODS.workflowRepositories, {
+  payload: WorkflowRepositoriesInput,
+  success: WorkflowRepositoriesResult,
+  error: WorkflowRpcError,
+});
+
+export const WsWorkflowRootsRpc = Rpc.make(WS_METHODS.workflowRoots, {
+  payload: WorkflowRootsInput,
+  success: WorkflowRootsResult,
+  error: WorkflowRpcError,
+});
+
+export const WsWorkflowChildrenRpc = Rpc.make(WS_METHODS.workflowChildren, {
+  payload: WorkflowChildrenInput,
+  success: WorkflowChildrenResult,
+  error: WorkflowRpcError,
+});
+
+export const WsWorkflowIssueDetailRpc = Rpc.make(WS_METHODS.workflowIssueDetail, {
+  payload: WorkflowIssueDetailInput,
+  success: WorkflowIssueDetail,
+  error: WorkflowRpcError,
 });
 
 export const WsSourceControlLookupRepositoryRpc = Rpc.make(
@@ -1259,6 +1302,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsRequestReviewersRpc,
   WsPullRequestsLabelCandidatesRpc,
   WsPullRequestsSetLabelsRpc,
+  WsWorkflowRepositoriesRpc,
+  WsWorkflowRootsRpc,
+  WsWorkflowChildrenRpc,
+  WsWorkflowIssueDetailRpc,
   WsSourceControlLookupRepositoryRpc,
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,

@@ -234,6 +234,22 @@ describe("proactive panels", () => {
       }),
     ).toBe("ignore");
   });
+
+  it("keeps a selected Workflow surface when proactive results arrive", () => {
+    const changedCheckpoint = {
+      status: "ready",
+      files: [{ path: "src/app.ts", kind: "modified", additions: 1, deletions: 0 }],
+    } satisfies Pick<TurnDiffSummary, "status" | "files">;
+
+    expect(
+      resolveProactiveTurnDiffAction({
+        checkpoint: changedCheckpoint,
+        isGitRepo: true,
+        activeSurfaceKind: "workflow",
+      }),
+    ).toBe("ignore");
+    expect(shouldOpenProactivePullRequest(null, "project:repo:42", "workflow")).toBe(false);
+  });
 });
 
 describe("toolGroupConsumesUpwardNavigation", () => {

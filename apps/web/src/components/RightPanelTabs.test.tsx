@@ -120,6 +120,7 @@ function renderTabs(
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
       onAddAgents={() => undefined}
+      onAddWorkflow={() => undefined}
       liveAgentCount={0}
       browserAvailable
       terminalAvailable={false}
@@ -127,6 +128,7 @@ function renderTabs(
       filesAvailable={false}
       pullRequestAvailable={false}
       agentsAvailable={false}
+      workflowAvailable
     >
       <div>content</div>
     </RightPanelTabs>,
@@ -160,11 +162,13 @@ describe("surface shortcuts", () => {
   const actions = [
     { shortcut: "B", available: true, label: "Browser" },
     { shortcut: "D", available: false, label: "Diff" },
+    { shortcut: "W", available: true, label: "Workflow" },
   ] as const;
 
   it("matches available surface shortcuts case-insensitively", () => {
     expect(surfaceShortcutActionForKey(actions, shortcutEvent("b"))).toBe(actions[0]);
     expect(surfaceShortcutActionForKey(actions, shortcutEvent("B"))).toBe(actions[0]);
+    expect(surfaceShortcutActionForKey(actions, shortcutEvent("w"))).toBe(actions[2]);
   });
 
   it("does not activate unavailable surfaces", () => {

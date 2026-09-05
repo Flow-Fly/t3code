@@ -103,8 +103,14 @@ export function shouldRenderPreviewMiniPlayer(
 export function shouldOpenProactivePullRequest(
   previousTargetKey: string | null | undefined,
   targetKey: string | null,
+  activeSurfaceKind?: RightPanelSurface["kind"] | null,
 ): boolean {
-  return previousTargetKey !== undefined && targetKey !== null && targetKey !== previousTargetKey;
+  return (
+    activeSurfaceKind !== "workflow" &&
+    previousTargetKey !== undefined &&
+    targetKey !== null &&
+    targetKey !== previousTargetKey
+  );
 }
 
 export function shouldOpenProactiveTurnDiff(input: {
@@ -127,7 +133,9 @@ export function resolveProactiveTurnDiffAction(input: {
   isGitRepo: boolean | undefined;
   activeSurfaceKind: RightPanelSurface["kind"] | null;
 }): "defer" | "ignore" | "open" {
-  if (input.activeSurfaceKind === "pull-request") return "ignore";
+  if (input.activeSurfaceKind === "pull-request" || input.activeSurfaceKind === "workflow") {
+    return "ignore";
+  }
   if (input.checkpoint === undefined || input.checkpoint.status === "missing") return "defer";
   if (input.isGitRepo === undefined) return "defer";
   if (
