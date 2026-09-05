@@ -1,9 +1,22 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { WorkflowIssueSummary, WorkflowRepositoriesResult } from "./workflow.ts";
+import {
+  WorkflowIssueSummary,
+  WorkflowRepositoriesResult,
+  WorkflowRootsInput,
+} from "./workflow.ts";
 
 describe("workflow contracts", () => {
+  it("requires an owner and repository separated by one slash", () => {
+    const decode = Schema.decodeUnknownSync(WorkflowRootsInput);
+
+    expect(() =>
+      decode({ projectId: "project-1", repository: "github.com/Flow-Fly/t3code" }),
+    ).toThrow();
+    expect(() => decode({ projectId: "project-1", repository: "Flow-Fly/t3code" })).not.toThrow();
+  });
+
   it("keeps repository selection explicit when a project has fork and upstream remotes", () => {
     const decode = Schema.decodeUnknownSync(WorkflowRepositoriesResult);
     const result = decode({

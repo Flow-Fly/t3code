@@ -18,8 +18,13 @@ export type WorkflowIssueState = typeof WorkflowIssueState.Type;
 export const WorkflowIssueStateReason = Schema.Literals(["completed", "not_planned", "reopened"]);
 export type WorkflowIssueStateReason = typeof WorkflowIssueStateReason.Type;
 
+export const WorkflowRepositoryNameWithOwner = TrimmedNonEmptyString.check(
+  Schema.isPattern(/^[^/\s]+\/[^/\s]+$/u),
+);
+export type WorkflowRepositoryNameWithOwner = typeof WorkflowRepositoryNameWithOwner.Type;
+
 export const WorkflowRepository = Schema.Struct({
-  nameWithOwner: TrimmedNonEmptyString,
+  nameWithOwner: WorkflowRepositoryNameWithOwner,
   remoteNames: Schema.Array(TrimmedNonEmptyString),
 });
 export type WorkflowRepository = typeof WorkflowRepository.Type;
@@ -48,12 +53,12 @@ export type WorkflowRepositoriesResult = typeof WorkflowRepositoriesResult.Type;
 
 export const WorkflowRootsInput = Schema.Struct({
   projectId: ProjectId,
-  repository: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
 });
 export type WorkflowRootsInput = typeof WorkflowRootsInput.Type;
 
 export const WorkflowRootsResult = Schema.Struct({
-  repository: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
   roots: Schema.Array(WorkflowIssueSummary),
 });
 export type WorkflowRootsResult = typeof WorkflowRootsResult.Type;

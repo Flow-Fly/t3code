@@ -36,7 +36,7 @@ function issue(number: number, parent: number | null = null) {
     stateReason: number === 2 ? "COMPLETED" : null,
     updatedAt: "2026-09-05T19:30:00Z",
     labels: {
-      pageInfo: { hasNextPage: false, endCursor: null },
+      pageInfo: { hasNextPage: false, endCursor: `labels-${number}` },
       nodes: [{ name: number === 1 ? "workflow:capability" : "workflow:ticket" }],
     },
     parent: parent === null ? null : { number: parent },
@@ -111,7 +111,7 @@ describe("WorkflowService", () => {
               data: {
                 repository: {
                   issues: {
-                    pageInfo: { hasNextPage: false, endCursor: null },
+                    pageInfo: { hasNextPage: false, endCursor: "roots-terminal" },
                     nodes: [issue(3)],
                   },
                 },
@@ -152,7 +152,7 @@ describe("WorkflowService", () => {
                         {
                           ...issue(12, 10),
                           labels: {
-                            pageInfo: { hasNextPage: false, endCursor: null },
+                            pageInfo: { hasNextPage: false, endCursor: "labels-12" },
                             nodes: [],
                           },
                           subIssuesSummary: { total: 2 },
@@ -174,12 +174,12 @@ describe("WorkflowService", () => {
                 repository: {
                   issue: {
                     subIssues: {
-                      pageInfo: { hasNextPage: false, endCursor: null },
+                      pageInfo: { hasNextPage: false, endCursor: "children-terminal" },
                       nodes: [
                         {
                           ...issue(13, 10),
                           labels: {
-                            pageInfo: { hasNextPage: false, endCursor: null },
+                            pageInfo: { hasNextPage: false, endCursor: "labels-13" },
                             nodes: [],
                           },
                         },
@@ -205,6 +205,7 @@ describe("WorkflowService", () => {
         { number: 12, kind: "container" },
         { number: 13, kind: "task" },
       ]);
+      expect(execute).toHaveBeenCalledTimes(2);
       expect(execute.mock.calls[1]?.[0].args).toContain("after=page-2");
     }).pipe(Effect.provide(layer(execute)));
   });
@@ -219,7 +220,7 @@ describe("WorkflowService", () => {
               data: {
                 repository: {
                   issues: {
-                    pageInfo: { hasNextPage: false, endCursor: null },
+                    pageInfo: { hasNextPage: false, endCursor: "roots-terminal" },
                     nodes: [
                       {
                         ...issue(7),
@@ -245,7 +246,7 @@ describe("WorkflowService", () => {
               data: {
                 node: {
                   labels: {
-                    pageInfo: { hasNextPage: false, endCursor: null },
+                    pageInfo: { hasNextPage: false, endCursor: "labels-terminal" },
                     nodes: [{ name: "wayfinder:map" }],
                   },
                 },

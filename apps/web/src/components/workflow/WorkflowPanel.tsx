@@ -154,6 +154,7 @@ function WorkflowTreeItem(props: {
         )}
         <button
           type="button"
+          aria-current={selected ? "true" : undefined}
           className="min-w-0 flex-1 py-1 text-left outline-none focus-visible:underline"
           onClick={() => props.onSelect(props.issue)}
         >
@@ -252,7 +253,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
 
   if (props.supported === null) {
     return (
-      <section className="flex min-h-0 flex-1 flex-col" aria-label="Workflow">
+      <section className="@container/workflow flex min-h-0 flex-1 flex-col" aria-label="Workflow">
         {targetHeader}
         <QueryMessage title="Loading Workflow…" description="Checking environment support." />
       </section>
@@ -261,7 +262,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
 
   if (!props.supported) {
     return (
-      <section className="flex min-h-0 flex-1 flex-col" aria-label="Workflow">
+      <section className="@container/workflow flex min-h-0 flex-1 flex-col" aria-label="Workflow">
         {targetHeader}
         <QueryMessage
           title="Workflow unavailable"
@@ -272,7 +273,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
   }
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label="Workflow">
+    <section className="@container/workflow flex min-h-0 flex-1 flex-col" aria-label="Workflow">
       {targetHeader}
 
       {repositoriesQuery.isPending && repositoriesQuery.data === null ? (
@@ -312,8 +313,8 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           retry={rootsQuery.refresh}
         />
       ) : (
-        <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(12rem,0.8fr)_minmax(12rem,1.2fr)] xl:grid-cols-[minmax(14rem,0.85fr)_minmax(18rem,1.15fr)] xl:grid-rows-1">
-          <div className="flex min-h-0 flex-col border-b border-border xl:border-e xl:border-b-0">
+        <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(12rem,0.8fr)_minmax(12rem,1.2fr)] @lg/workflow:grid-cols-[minmax(14rem,0.85fr)_minmax(18rem,1.15fr)] @lg/workflow:grid-rows-1">
+          <div className="flex min-h-0 flex-col border-b border-border @lg/workflow:border-e @lg/workflow:border-b-0">
             <div className="border-b border-border p-3">
               <Input
                 aria-label="Search workflow roots"

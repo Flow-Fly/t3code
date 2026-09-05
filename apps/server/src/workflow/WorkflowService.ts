@@ -10,6 +10,7 @@ import {
   type WorkflowRepositoriesInput,
   type WorkflowRepositoriesResult,
   type WorkflowRepository,
+  WorkflowRepositoryNameWithOwner,
   type WorkflowRootsInput,
   type WorkflowRootsResult,
 } from "@t3tools/contracts";
@@ -102,6 +103,7 @@ const decodeRootsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawRootsP
 const decodeChildrenPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawChildrenPage));
 const decodeDetail = Schema.decodeUnknownSync(Schema.fromJsonString(RawDetail));
 const decodeLabelsPage = Schema.decodeUnknownSync(Schema.fromJsonString(RawLabelsPage));
+const isWorkflowRepositoryNameWithOwner = Schema.is(WorkflowRepositoryNameWithOwner);
 
 const ISSUE_FIELDS = `id number title url state stateReason updatedAt labels(first:100){pageInfo{hasNextPage endCursor}nodes{name}} parent{number} subIssuesSummary{total}`;
 const ROOTS_QUERY = `query WorkflowRoots($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){issues(first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor}nodes{${ISSUE_FIELDS}}}}}`;
@@ -114,8 +116,9 @@ function queryError(failure: WorkflowQueryError["failure"], message: string, det
 }
 
 function parseRepository(repository: string): { owner: string; name: string } | null {
-  const [owner, name, ...rest] = repository.trim().split("/");
-  return owner && name && rest.length === 0 ? { owner, name } : null;
+  if (!isWorkflowRepositoryNameWithOwner(repository)) return null;
+  const [owner, name] = repository.split("/") as [string, string];
+  return { owner, name };
 }
 
 function issueKind(labels: ReadonlyArray<{ readonly name: string }>): WorkflowIssueKind | null {
@@ -363,7 +366,9 @@ export const make = Effect.gen(function* () {
             "GitHub returned incomplete workflow root pagination.",
           );
         }
-        cursor = repository.issues.pageInfo.endCursor ?? undefined;
+        cursor = repository.issues.pageInfo.hasNextPage
+          ? (repository.issues.pageInfo.endCursor ?? undefined)
+          : undefined;
       } while (cursor);
       return { repository: input.repository, roots };
     },
@@ -412,7 +417,9 @@ export const make = Effect.gen(function* () {
             "GitHub returned incomplete workflow child pagination.",
           );
         }
-        cursor = repository.issue.subIssues.pageInfo.endCursor ?? undefined;
+        cursor = repository.issue.subIssues.pageInfo.hasNextPage
+          ? (repository.issue.subIssues.pageInfo.endCursor ?? undefined)
+          : undefined;
       } while (cursor);
       return { parentNumber: input.parentNumber, children };
     },
