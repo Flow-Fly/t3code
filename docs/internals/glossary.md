@@ -54,7 +54,9 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Decision ticket   | A question whose resolution records a decision rather than delivering code.                         |
 | Decision frontier | A map's unclaimed, open decision tickets with satisfied dependencies and no pending reassessment.   |
 | Capability        | A coherent piece of functionality described by one specification and delivered through its tickets. |
+| Workflow director | An agent that coordinates a capability's delivery tickets and independent review.                   |
+| Director batch    | The distinct delivery tickets taken on by one director before handing over to a successor.          |
 | Delivery ticket   | A bounded piece of implementation work with acceptance criteria and explicit blockers.              |
 | Workflow approval | The owner's acceptance of a specific specification or ticket breakdown.                             |
-| Resolution record | An outcome and supporting evidence for a decision or delivery ticket.                               |
+| Resolution record | An outcome and supporting evidence for a decision, delivery ticket or capability.                   |
 | Reassessment      | Review of affected work after its scope or prerequisites change or their completion is unverified.  |

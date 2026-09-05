@@ -52,6 +52,30 @@ parent is authoritative. Use native blocking for prerequisites. Artifact labels
 identify kind, issue IDs identify work, and titles remain readable names. A
 conflicting kind or parent needs classification before work starts.
 
+Keep specification drafting and ticket slicing in the planning thread. Begin
+implementation in a fresh director thread after the explicit Start action;
+returning to ongoing work reuses its current thread.
+
+## Director batches
+
+Each director takes on at most 10 distinct delivery tickets. Count a ticket when
+it enters the batch, including attempts that later fail or become blocked.
+Retries and reviews of a ticket already in the batch use the same slot. Re-read
+live readiness before claiming or dispatching work.
+
+Before taking on another batch, stop admissions and settle or explicitly stop
+the current workers and reviewers. Retain a handoff in durable workflow history
+before starting the successor, and keep only one active director for the
+capability. Reuse the capability worktree and preserve previous threads. If work
+is complete, finish the capability; if it is blocked or awaiting approval, show
+that state rather than spawning idle directors.
+
+The handoff identifies its source thread, handled tickets and outcomes, and the
+implementation head. Link existing specifications, issues, reviews and commits;
+add only useful lessons, pitfalls or unresolved context, plus suggested skills.
+The successor re-reads live approvals, ticket state and dependencies. A summary
+or an untracked temporary file is insufficient as the durable work record.
+
 ## Workflow records
 
 Keep records as issue comments with a visible heading and the exact marker
@@ -79,6 +103,18 @@ supports the outcome. A heading or marker alone is not evidence. References
 that cannot be checked remain unverified.
 
 ## Completion and reassessment
+
+Resolve a delivery ticket after committed implementation, passing agreed checks
+and fresh independent review. The director verifies findings against the fixed
+base and final implementation head: fix confirmed blockers, settle owner
+judgement calls, and record other dispositions. Attach the reviewed commit and
+verification evidence to the resolution record.
+
+Complete a capability when every required approved ticket is resolved and the
+combined result passes its agreed acceptance checks. Record the outcome and
+integrated evidence on the capability. Completion may span multiple director
+batches; unchanged approved scope needs no extra final approval. Merge and
+release remain separate actions.
 
 - **Resolved:** closed as completed, with a resolution record whose resolved
   outcome and evidence cover the current scope and any subsequent reopening.
