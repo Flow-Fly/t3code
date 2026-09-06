@@ -287,7 +287,7 @@ it.live("starts workflow work once and reconciles real bootstrap failures", () =
           },
         ],
         slashCommands: [],
-        skills: ["wayfinder", "research"].map((name) => ({
+        skills: ["wayfinder", "research", "to-spec"].map((name) => ({
           name,
           path: `/skills/${name}/SKILL.md`,
           enabled: true,
@@ -319,6 +319,26 @@ it.live("starts workflow work once and reconciles real bootstrap failures", () =
           }),
       });
       const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
+        children: ({ parentNumber }) =>
+          Effect.succeed({
+            parentNumber,
+            children: [
+              {
+                ...decisionFor(15),
+                state: "closed" as const,
+                stateReason: "completed" as const,
+                readiness: {
+                  status: "resolved" as const,
+                  reasons: [{ kind: "resolution" as const, message: "Resolved with evidence." }],
+                },
+              },
+            ],
+            frontier: {
+              status: "complete" as const,
+              message: "All visible work is resolved.",
+              readyIssueIds: [],
+            },
+          }),
         issueDetail: ({ number }) =>
           Effect.succeed({
             ...(number === 10 ? root : number === 12 ? map : decisionFor(number)),
@@ -496,6 +516,91 @@ it.live("starts workflow work once and reconciles real bootstrap failures", () =
         { name: "research", path: "/skills/research/SKILL.md" },
       ]);
       assert.deepEqual(harness.adapterHarness!.getTurnInputs()[0]?.modelSelection, modelSelection);
+
+      const specificationTurnId = "workflow-specification-turn";
+      yield* harness.adapterHarness!.queueTurnResponse(threadId, {
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("workflow-specification-started", "2026-05-01T00:00:02.100Z"),
+            threadId,
+            turnId: specificationTurnId,
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("workflow-specification-completed", "2026-05-01T00:00:02.200Z"),
+            threadId,
+            turnId: specificationTurnId,
+            status: "completed",
+          },
+        ],
+      });
+      let planningDispatchCount = 0;
+      let planningCommandId: CommandId | null = null;
+      const planningDispatch: Parameters<
+        WorkflowStartService.WorkflowStartService["Service"]["start"]
+      >[1] = (command) => {
+        planningDispatchCount += 1;
+        planningCommandId = command.commandId;
+        return harness.engine.dispatch(command).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationDispatchCommandError({
+                message: "Workflow planning dispatch failed.",
+                cause,
+              }),
+          ),
+        );
+      };
+      const specificationResults = yield* Effect.gen(function* () {
+        const start = yield* WorkflowStartService.WorkflowStartService;
+        const input = {
+          projectId: PROJECT_ID,
+          repository,
+          rootNumber: 10,
+          issueNumber: 12,
+          phase: "specification" as const,
+          planningThreadId: threadId,
+          modelSelection,
+        };
+        return yield* Effect.all(
+          [start.start(input, planningDispatch), start.start(input, planningDispatch)],
+          { concurrency: "unbounded" },
+        );
+      }).pipe(Effect.provide(startLayer));
+      assert(planningCommandId !== null);
+      const phaseCommandReceipt = yield* harness.commandReceiptRepository.getByCommandId({
+        commandId: planningCommandId,
+      });
+      assert.equal(Option.isSome(phaseCommandReceipt), true);
+      if (Option.isSome(phaseCommandReceipt)) {
+        assert.equal(phaseCommandReceipt.value.status, "accepted");
+      }
+      yield* harness.waitForReceipt(
+        (receipt): receipt is TurnProcessingQuiescedReceipt =>
+          receipt.type === "turn.processing.quiesced" &&
+          receipt.threadId === threadId &&
+          receipt.checkpointTurnCount === 2,
+      );
+      yield* harness.drainProviderRuntime;
+      yield* harness.drainCheckpointReactor;
+      assert.deepEqual(specificationResults.map((result) => result.disposition).sort(), [
+        "existing",
+        "started",
+      ]);
+      assert.equal(planningDispatchCount, 1);
+      assert.equal(new Set(specificationResults.map((result) => result.attemptId)).size, 1);
+      assert.equal(harness.adapterHarness!.getStartCount(), 1);
+      assert.equal(harness.adapterHarness!.getTurnInputs().length, 2);
+      assert.deepEqual(harness.adapterHarness!.getTurnInputs()[1]?.skills, [
+        { name: "to-spec", path: "/skills/to-spec/SKILL.md" },
+      ]);
+      assert.match(harness.adapterHarness!.getTurnInputs()[1]?.input ?? "", /Source map:/u);
+      const afterSpecification = yield* harness.snapshotQuery.getSnapshot();
+      assert.equal(
+        afterSpecification.threads.find((candidate) => candidate.id === threadId)?.messages.length,
+        2,
+      );
 
       assignees.clear();
       const rejectedDispatch = makeDispatch("workflow-rejected", "reject-before-turn");

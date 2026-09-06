@@ -7661,6 +7661,7 @@ export default function ChatView(props: ChatViewProps) {
         environmentLabel={activeEnvironment?.label ?? activeThread.environmentId}
         projectId={activeProject.id}
         projectTitle={activeProject.title}
+        planningThreadId={activeThread.id}
         supported={workflowCapabilityKnown ? supportsWorkflow : null}
       />
     ) : (renderedRightPanelSurface?.kind === "files" ||

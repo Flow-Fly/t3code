@@ -9,6 +9,7 @@ import {
   type ServerProvider,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
+  type WorkflowChildrenResult,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -67,6 +68,19 @@ function summary(
 const root = summary(10, "container", null, ["workflow:container"]);
 const map = summary(12, "map", 10, ["wayfinder:map"]);
 const decision = summary(15, "decision", 12, ["wayfinder:research"]);
+const capabilityBody = [
+  "## Summary",
+  "",
+  "Deliver the approved workflow planning actions.",
+  "",
+  "## Origin",
+  "",
+  "Standalone capability requested directly by the repository owner.",
+].join("\n");
+const capability = {
+  ...summary(17, "capability", null, ["workflow:capability"]),
+  title: "Plan workflow delivery",
+};
 
 function detail(
   issue: WorkflowIssueSummary,
@@ -124,7 +138,7 @@ function output(stdout: string) {
   };
 }
 
-function provider(skills = ["wayfinder", "research"]): ServerProvider {
+function provider(skills = ["wayfinder", "research", "to-spec", "to-tickets"]): ServerProvider {
   return {
     instanceId,
     driver: ProviderDriverKind.make("codex"),
@@ -163,6 +177,58 @@ function provider(skills = ["wayfinder", "research"]): ServerProvider {
   };
 }
 
+function capabilityDetail(
+  options: { readonly approvedContent?: string } = {},
+): WorkflowIssueDetail {
+  const approvalSource = {
+    id: "approval-source",
+    url: `https://github.com/${repository}/issues/17#issuecomment-1`,
+    body: "I approve this specification and proceeding to the ticket proposal.",
+    createdAt: "2026-09-06T09:00:00.000Z",
+    author: "Flow-Fly",
+    authorAssociation: "OWNER",
+  } as const;
+  const approval = {
+    id: "approval-record",
+    url: `https://github.com/${repository}/issues/17#issuecomment-2`,
+    body: [
+      "## Approval",
+      "<!-- t3-workflow:v1 approval -->",
+      "Kind: specification",
+      "Approved by: Flow-Fly",
+      `Source: ${approvalSource.url}`,
+      "### Approved content",
+      options.approvedContent ?? capabilityBody,
+    ].join("\n"),
+    createdAt: "2026-09-06T10:00:00.000Z",
+    author: "Flow-Fly",
+    authorAssociation: "OWNER",
+  } as const;
+  const interpreted = interpretWorkflowEvidence({
+    issue: {
+      id: capability.id,
+      url: capability.url,
+      number: capability.number,
+      title: capability.title,
+      kind: capability.kind,
+      state: capability.state,
+      stateReason: capability.stateReason,
+      labels: capability.labels,
+      assignees: [],
+      body: capabilityBody,
+      comments: [approvalSource, approval],
+      reopenedAt: [],
+    },
+  });
+  return {
+    ...capability,
+    body: capabilityBody,
+    blockedBy: [],
+    evidence: interpreted.evidence,
+    readiness: interpreted.readiness,
+  };
+}
+
 function harness(
   options: {
     readonly provider?: ServerProvider | undefined;
@@ -175,6 +241,9 @@ function harness(
     readonly identityFailureCount?: number | undefined;
     readonly threadState?: "running" | "interrupted" | "completed" | "error" | undefined;
     readonly blocked?: boolean | undefined;
+    readonly details?: ReadonlyMap<number, WorkflowIssueDetail> | undefined;
+    readonly children?: ReadonlyMap<number, WorkflowChildrenResult> | undefined;
+    readonly planningThreadState?: "running" | "interrupted" | "completed" | "error" | undefined;
   } = {},
 ) {
   const commands = new Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>();
@@ -192,11 +261,24 @@ function harness(
   const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
     issueDetail: ({ number }) =>
       Effect.succeed(
-        detail(
-          number === 10 ? root : number === 12 ? map : selectedIssue,
-          number === selectedIssue.number ? [...assignees] : [],
-          options.blocked === true && number === selectedIssue.number,
-        ),
+        options.details?.get(number) ??
+          detail(
+            number === 10 ? root : number === 12 ? map : selectedIssue,
+            number === selectedIssue.number ? [...assignees] : [],
+            options.blocked === true && number === selectedIssue.number,
+          ),
+      ),
+    children: ({ parentNumber }) =>
+      Effect.succeed(
+        options.children?.get(parentNumber) ?? {
+          parentNumber,
+          children: [],
+          frontier: {
+            status: "empty",
+            message: "No immediate work is visible in this branch.",
+            readyIssueIds: [],
+          },
+        },
       ),
     locate: () =>
       Effect.succeed({
@@ -269,12 +351,13 @@ function harness(
           Effect.succeed(Option.some({ id: projectId, title: "T3 Code", workspaceRoot } as never)),
         getThreadShellById: (threadId) =>
           Effect.succeed(
-            options.threadState
+            options.threadState || options.planningThreadState
               ? Option.some({
                   id: threadId,
+                  projectId,
                   latestTurn: {
                     turnId: "turn-1",
-                    state: options.threadState,
+                    state: options.threadState ?? options.planningThreadState,
                     requestedAt: "2026-09-06T10:00:00.000Z",
                     startedAt: "2026-09-06T10:00:00.000Z",
                     completedAt: null,
@@ -346,6 +429,293 @@ function harness(
 }
 
 describe("WorkflowStartService", () => {
+  it.effect(
+    "continues capability specification once in the explicit planning thread and reopens it on repeat",
+    () => {
+      const planningThreadId = ThreadId.make("planning-thread");
+      const resolvedDecision = {
+        ...decision,
+        state: "closed" as const,
+        stateReason: "completed" as const,
+        readiness: {
+          status: "resolved" as const,
+          reasons: [{ kind: "resolution" as const, message: "Resolved with current evidence." }],
+        },
+      };
+      const test = harness({
+        planningThreadState: "completed",
+        children: new Map([
+          [
+            map.number,
+            {
+              parentNumber: map.number,
+              children: [resolvedDecision],
+              frontier: {
+                status: "complete",
+                message: "All visible work is resolved.",
+                readyIssueIds: [],
+              },
+            },
+          ],
+        ]),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowStartService.WorkflowStartService;
+        const input = {
+          ...test.input,
+          issueNumber: map.number,
+          phase: "specification" as const,
+          planningThreadId,
+        };
+
+        const started = yield* service.start(input, test.dispatch);
+        const repeated = yield* service.start(input, test.dispatch);
+        const recovery = yield* service.recovery({
+          projectId,
+          repository,
+          issueNumber: map.number,
+          phase: "specification",
+        });
+        const duplicate = yield* Effect.flip(
+          service.recover(
+            {
+              ...input,
+              attemptId: recovery.currentAttempt?.attemptId,
+              action: "start-fresh",
+              observation: recovery.observation,
+            },
+            test.dispatch,
+          ),
+        );
+
+        expect(started).toMatchObject({
+          disposition: "started",
+          phase: "specification",
+          threadId: planningThreadId,
+        });
+        expect(started.message).toContain("Capability specification");
+        expect(repeated).toMatchObject({ disposition: "existing", threadId: planningThreadId });
+        expect(recovery.actions).toEqual(["open"]);
+        expect(recovery.currentAttempt?.threadId).toBe(planningThreadId);
+        expect(duplicate.message).toContain("only reopen");
+        expect(test.commands).toHaveLength(1);
+        expect(test.commands[0]).not.toHaveProperty("bootstrap");
+        expect(test.commands[0]?.skills).toEqual([
+          { name: "to-spec", path: "/skills/to-spec/SKILL.md" },
+        ]);
+        expect(test.commands[0]?.message.text).toContain("Use the to-spec skill explicitly");
+        expect(test.commands[0]?.message.text).toContain(map.url);
+        expect(test.githubCalls).toHaveLength(0);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "holds capability creation while complete descendant evidence or map fog is unresolved",
+    () => {
+      const test = harness({
+        planningThreadState: "completed",
+        children: new Map([
+          [
+            map.number,
+            {
+              parentNumber: map.number,
+              children: [],
+              frontier: {
+                status: "empty-review",
+                message:
+                  "No immediate work can proceed while this map still records remaining unknowns.",
+                readyIssueIds: [],
+              },
+            },
+          ],
+        ]),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowStartService.WorkflowStartService;
+        const error = yield* Effect.flip(
+          service.start(
+            {
+              ...test.input,
+              issueNumber: map.number,
+              phase: "specification",
+              planningThreadId: ThreadId.make("planning-thread"),
+            },
+            test.dispatch,
+          ),
+        );
+
+        expect(error).toMatchObject({ failure: "not-ready" });
+        expect(error.detail).toContain("remaining unknowns");
+        expect(test.commands).toHaveLength(0);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "starts a standalone capability ticket proposal only from current verified specification approval and preserves publication authority",
+    () => {
+      const planningThreadId = ThreadId.make("planning-thread");
+      const approved = capabilityDetail();
+      const test = harness({
+        selectedIssue: capability,
+        ancestry: [],
+        planningThreadState: "completed",
+        details: new Map([
+          [root.number, detail(root, [], false)],
+          [capability.number, approved],
+        ]),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowStartService.WorkflowStartService;
+        const started = yield* service.start(
+          {
+            ...test.input,
+            issueNumber: capability.number,
+            phase: "ticket-breakdown",
+            planningThreadId,
+          },
+          test.dispatch,
+        );
+
+        expect(started).toMatchObject({ phase: "ticket-breakdown", threadId: planningThreadId });
+        expect(started.message).toContain("Ticket breakdown proposal");
+        expect(test.commands).toHaveLength(1);
+        expect(test.commands[0]?.skills).toEqual([
+          { name: "to-tickets", path: "/skills/to-tickets/SKILL.md" },
+        ]);
+        expect(test.commands[0]?.message.text).toContain("draft the proposed breakdown");
+        expect(test.commands[0]?.message.text).toContain(
+          "Do not publish delivery issues until the owner separately approves",
+        );
+        expect(test.commands[0]?.message.text).toContain("native sub-issues");
+        expect(test.commands[0]).not.toHaveProperty("bootstrap");
+        expect(test.githubCalls).toHaveLength(0);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("rejects ticket slicing when the preserved specification no longer matches", () => {
+    const stale = capabilityDetail({ approvedContent: `${capabilityBody}\n\nOld scope.` });
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([
+        [root.number, detail(root, [], false)],
+        [capability.number, stale],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(
+        service.start(
+          {
+            ...test.input,
+            issueNumber: capability.number,
+            phase: "ticket-breakdown",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.detail).toContain("approved snapshot");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("does not duplicate a planning turn whose command outcome is unknown", () => {
+    const planningThreadId = ThreadId.make("planning-thread");
+    const test = harness({
+      planningThreadState: "completed",
+      dispatchFailure: new OrchestrationDispatchCommandError({ message: "response lost" }),
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [
+              {
+                ...decision,
+                state: "closed" as const,
+                stateReason: "completed" as const,
+                readiness: { status: "resolved" as const, reasons: [] },
+              },
+            ],
+            frontier: {
+              status: "complete",
+              message: "All visible work is resolved.",
+              readyIssueIds: [],
+            },
+          },
+        ],
+      ]),
+    });
+    const input = {
+      ...test.input,
+      issueNumber: map.number,
+      phase: "specification" as const,
+      planningThreadId,
+    };
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(service.start(input, test.dispatch));
+      const repeated = yield* service.start(input, test.dispatch);
+
+      expect(error).toMatchObject({ failure: "dispatch-failed" });
+      expect(repeated).toMatchObject({ disposition: "held", phase: "specification" });
+      expect(repeated.message).toContain("uncertain");
+      expect(test.commands).toHaveLength(1);
+      expect(test.githubCalls).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("does not add a phase turn while the explicit planning thread is active", () => {
+    const test = harness({
+      planningThreadState: "running",
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [
+              {
+                ...decision,
+                state: "closed" as const,
+                stateReason: "completed" as const,
+                readiness: { status: "resolved" as const, reasons: [] },
+              },
+            ],
+            frontier: {
+              status: "complete",
+              message: "All visible work is resolved.",
+              readyIssueIds: [],
+            },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(
+        service.start(
+          {
+            ...test.input,
+            issueNumber: map.number,
+            phase: "specification",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.message).toContain("active turn");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
   it.effect(
     "persists one attempt before claiming and submits the existing bootstrap with explicit skills",
     () => {

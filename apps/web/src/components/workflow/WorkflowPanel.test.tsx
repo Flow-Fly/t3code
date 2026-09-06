@@ -20,6 +20,7 @@ const query = vi.hoisted(() => {
     recoveryState: false,
     externalClaim: false,
     heldAfterRefresh: false,
+    planningKind: null as "map" | "capability" | null,
     startCalls: new Array<unknown>(),
     navigateCalls: new Array<unknown>(),
     destinationRepository: "Flow-Fly/t3code",
@@ -97,6 +98,11 @@ vi.mock("~/state/use-atom-command", () => ({
         },
       };
     }
+    const input = (
+      request as {
+        input?: { phase?: "specification" | "ticket-breakdown"; planningThreadId?: string };
+      }
+    ).input;
     return {
       _tag: "Success",
       value: {
@@ -108,8 +114,8 @@ vi.mock("~/state/use-atom-command", () => ({
         repository: "Flow-Fly/t3code",
         rootNumber: 10,
         issueNumber: 11,
-        phase: "decision",
-        threadId: "workflow-thread-15",
+        phase: input?.phase ?? "decision",
+        threadId: input?.planningThreadId ?? "workflow-thread-15",
         createdAt: "2026-09-06T10:00:00.000Z",
         message: "Decision work started.",
       },
@@ -178,13 +184,17 @@ vi.mock("~/state/query", () => ({
                     number: 10,
                     title: "Capability",
                     url: "https://github.com/Flow-Fly/t3code/issues/10",
-                    kind: query.startReady ? "map" : "capability",
+                    kind: query.planningKind ?? (query.startReady ? "map" : "capability"),
                     state: "open",
                     stateReason: null,
                     updatedAt: "2026-09-05T00:00:00Z",
                     childCount: 1,
                     parentNumber: null,
-                    labels: [query.startReady ? "wayfinder:map" : "workflow:capability"],
+                    labels: [
+                      query.planningKind === "map" || query.startReady
+                        ? "wayfinder:map"
+                        : "workflow:capability",
+                    ],
                   },
                   ...(query.moved && destinationIsCurrent
                     ? [
@@ -263,6 +273,30 @@ vi.mock("~/state/query", () => ({
       };
     }
     if (descriptor.kind === "detail") {
+      if (query.planningKind) {
+        return {
+          ...idle,
+          data: {
+            id: "issue-10",
+            repository: "Flow-Fly/t3code",
+            number: 10,
+            title: "Capability",
+            url: "https://github.com/Flow-Fly/t3code/issues/10",
+            kind: query.planningKind,
+            state: "open",
+            stateReason: null,
+            updatedAt: "2026-09-05T00:00:00Z",
+            childCount: 1,
+            parentNumber: null,
+            body: "## Summary\n\nPlan the capability.",
+            labels: [query.planningKind === "map" ? "wayfinder:map" : "workflow:capability"],
+            blockedBy: [],
+            ...(query.planningKind === "capability"
+              ? { readiness: { status: "ready", reasons: [] } }
+              : {}),
+          },
+        };
+      }
       return {
         ...idle,
         data: {
@@ -508,6 +542,7 @@ beforeEach(() => {
   query.recoveryState = false;
   query.externalClaim = false;
   query.heldAfterRefresh = false;
+  query.planningKind = null;
   query.startCalls.length = 0;
   query.navigateCalls.length = 0;
   query.destinationRepository = "Flow-Fly/t3code";
@@ -520,6 +555,79 @@ afterEach(() => {
 });
 
 describe("WorkflowPanel browsing", () => {
+  it.each([
+    {
+      kind: "map" as const,
+      label: "Create capability",
+      phase: "specification" as const,
+    },
+    {
+      kind: "capability" as const,
+      label: "Slice tickets",
+      phase: "ticket-breakdown" as const,
+    },
+  ])("submits $label in the current planning thread", async ({ kind, label, phase }) => {
+    query.planningKind = kind;
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const planningThreadId = ThreadId.make("planning-thread");
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={environmentId}
+          environmentLabel="Remote environment"
+          projectId={projectId}
+          projectTitle="Draft project"
+          planningThreadId={planningThreadId}
+          supported
+        />,
+      );
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const rootButton = renderer!.root
+        .findByProps({ "aria-label": "Synchronized workflow outline" })
+        .findAllByType("button")
+        .find((button) => button.children.join("").includes("#10 Capability"));
+      await act(() => rootButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": `Start workflow ${phase}` });
+      expect(start.findByType("button").children.join("")).toBe(label);
+      await act(() => start.findByType("button").props.onClick());
+
+      expect(query.startCalls).toEqual([
+        {
+          environmentId,
+          input: {
+            projectId,
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            issueNumber: 10,
+            phase,
+            planningThreadId,
+            modelSelection: {
+              instanceId: "codex-workflow",
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+        },
+      ]);
+      expect(query.navigateCalls).toContainEqual({
+        to: "/$environmentId/$threadId",
+        params: { environmentId, threadId: planningThreadId },
+      });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("starts ready decision work and opens Workflow on the durable destination thread", async () => {
     query.startReady = true;
     const environmentId = EnvironmentId.make("remote-environment");

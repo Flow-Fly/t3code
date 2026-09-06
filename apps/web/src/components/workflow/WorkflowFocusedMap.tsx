@@ -112,6 +112,7 @@ function ChildrenLoader(props: {
 function WorkflowDetails(props: {
   environmentId: EnvironmentId;
   projectId: ProjectId;
+  planningThreadId?: ThreadId;
   rootNumber: number;
   issue: WorkflowIssueSummary;
   refreshRequest: number;
@@ -121,6 +122,12 @@ function WorkflowDetails(props: {
   const serverConfigs = useServerConfigs();
   const providers = serverConfigs.get(props.environmentId)?.providers ?? [];
   const startSelection = resolveWorkflowStartSelection(providers, project?.defaultModelSelection);
+  const phase =
+    props.issue.kind === "map"
+      ? ("specification" as const)
+      : props.issue.kind === "capability"
+        ? ("ticket-breakdown" as const)
+        : ("decision" as const);
   const startWorkflow = useAtomCommand(workflowEnvironment.start, { reportFailure: false });
   const recoverWorkflow = useAtomCommand(workflowEnvironment.recover, { reportFailure: false });
   const [startPending, setStartPending] = useState(false);
@@ -136,13 +143,17 @@ function WorkflowDetails(props: {
     }),
   );
   const recoveryQuery = useEnvironmentQuery(
-    props.issue.kind === "decision" || props.issue.labels.includes("wayfinder:task")
+    props.issue.kind === "decision" ||
+      props.issue.kind === "map" ||
+      props.issue.kind === "capability" ||
+      props.issue.labels.includes("wayfinder:task")
       ? workflowEnvironment.recovery({
           environmentId: props.environmentId,
           input: {
             projectId: props.projectId,
             repository: props.issue.repository,
             issueNumber: props.issue.number,
+            ...(phase !== "decision" ? { phase } : {}),
           },
         })
       : null,
@@ -179,8 +190,17 @@ function WorkflowDetails(props: {
   });
   const evidence = query.data.evidence;
   const canStart =
-    query.data.readiness?.status === "ready" &&
-    (query.data.kind === "decision" || query.data.labels.includes("wayfinder:task"));
+    (query.data.kind === "map" || query.data.readiness?.status === "ready") &&
+    (query.data.kind === "decision" ||
+      query.data.kind === "map" ||
+      query.data.kind === "capability" ||
+      query.data.labels.includes("wayfinder:task"));
+  const startLabel =
+    phase === "specification"
+      ? "Create capability"
+      : phase === "ticket-breakdown"
+        ? "Slice tickets"
+        : "Start";
   const recovery = recoveryQuery.data;
   const hasRecoveryDetails =
     recovery !== null &&
@@ -206,6 +226,10 @@ function WorkflowDetails(props: {
         repository: selectedIssue.repository,
         rootNumber: props.rootNumber,
         issueNumber: selectedIssue.number,
+        ...(phase !== "decision" ? { phase } : {}),
+        ...(phase !== "decision" && props.planningThreadId
+          ? { planningThreadId: props.planningThreadId }
+          : {}),
         modelSelection: startSelection.selection,
       },
     });
@@ -216,7 +240,7 @@ function WorkflowDetails(props: {
       setStartMessage(
         failure instanceof Error
           ? failure.message
-          : "Decision work could not start. Refresh Workflow and try again.",
+          : "Workflow planning could not start. Refresh Workflow and try again.",
       );
       return;
     }
@@ -247,6 +271,7 @@ function WorkflowDetails(props: {
         repository: selectedIssue.repository,
         rootNumber: props.rootNumber,
         issueNumber: selectedIssue.number,
+        ...(phase !== "decision" ? { phase } : {}),
         action,
         observation: state.observation,
         ...(state.currentAttempt ? { attemptId: state.currentAttempt.attemptId } : {}),
@@ -294,13 +319,17 @@ function WorkflowDetails(props: {
         {workflowIssueBrief(query.data) ?? "No description provided."}
       </p>
       {canStart && !hasRecoveryDetails ? (
-        <section aria-label="Start workflow decision">
+        <section aria-label={`Start workflow ${phase}`}>
           <Button
             size="sm"
-            disabled={startPending || startSelection.selection === null}
+            disabled={
+              startPending ||
+              startSelection.selection === null ||
+              (phase !== "decision" && !props.planningThreadId)
+            }
             onClick={() => void handleStart()}
           >
-            {startPending ? "Starting…" : "Start"}
+            {startPending ? "Starting…" : startLabel}
           </Button>
           {(startMessage ?? startSelection.message) ? (
             <p
@@ -314,7 +343,11 @@ function WorkflowDetails(props: {
             </p>
           ) : (
             <p className="mt-1 text-muted-foreground text-xs">
-              Claims this issue and starts Codex with its required Wayfinder skills.
+              {phase === "specification"
+                ? "Continues in this planning thread after the server verifies every map decision and remaining unknown."
+                : phase === "ticket-breakdown"
+                  ? "Continues in this planning thread after the server verifies the current specification approval. Publishing still needs separate owner approval."
+                  : "Claims this issue and starts Codex with its required Wayfinder skills."}
             </p>
           )}
         </section>
@@ -567,6 +600,7 @@ function WorkflowDetails(props: {
 export function WorkflowFocusedMap(props: {
   environmentId: EnvironmentId;
   projectId: ProjectId;
+  planningThreadId?: ThreadId;
   root: WorkflowIssueSummary;
   onRefreshRoot: () => void;
   onNavigateMatch: (match: WorkflowSearchMatch) => void;
@@ -1243,6 +1277,7 @@ export function WorkflowFocusedMap(props: {
           <WorkflowDetails
             environmentId={props.environmentId}
             projectId={props.projectId}
+            {...(props.planningThreadId ? { planningThreadId: props.planningThreadId } : {})}
             rootNumber={props.root.number}
             issue={selected}
             refreshRequest={refreshRequest}

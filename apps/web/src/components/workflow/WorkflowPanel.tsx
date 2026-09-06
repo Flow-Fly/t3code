@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   ProjectId,
+  ThreadId,
   WorkflowRepository,
   WorkflowSearchMatch,
 } from "@t3tools/contracts";
@@ -27,6 +28,7 @@ interface WorkflowPanelProps {
   environmentLabel: string;
   projectId: ProjectId;
   projectTitle: string;
+  planningThreadId?: ThreadId;
   supported: boolean | null;
 }
 
@@ -317,6 +319,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           key={issueIdentity(focusedRoot)}
           environmentId={props.environmentId}
           projectId={props.projectId}
+          {...(props.planningThreadId ? { planningThreadId: props.planningThreadId } : {})}
           root={focusedRoot}
           onRefreshRoot={rootsQuery.refresh}
           onNavigateMatch={navigateToMatch}

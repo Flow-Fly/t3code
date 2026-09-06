@@ -263,11 +263,16 @@ export type WorkflowLocateInput = typeof WorkflowLocateInput.Type;
 export const WorkflowLocateResult = WorkflowSearchMatch;
 export type WorkflowLocateResult = typeof WorkflowLocateResult.Type;
 
+export const WorkflowPhase = Schema.Literals(["decision", "specification", "ticket-breakdown"]);
+export type WorkflowPhase = typeof WorkflowPhase.Type;
+
 export const WorkflowStartInput = Schema.Struct({
   projectId: ProjectId,
   repository: WorkflowRepositoryNameWithOwner,
   rootNumber: PositiveInt,
   issueNumber: PositiveInt,
+  phase: Schema.optional(WorkflowPhase),
+  planningThreadId: Schema.optional(ThreadId),
   modelSelection: ModelSelection,
 });
 export type WorkflowStartInput = typeof WorkflowStartInput.Type;
@@ -283,7 +288,7 @@ export const WorkflowStartResult = Schema.Struct({
   repository: WorkflowRepositoryNameWithOwner,
   rootNumber: PositiveInt,
   issueNumber: PositiveInt,
-  phase: Schema.Literal("decision"),
+  phase: WorkflowPhase,
   threadId: ThreadId,
   status: WorkflowStartAttemptStatus,
   createdAt: IsoDateTime,
@@ -295,6 +300,7 @@ export const WorkflowRecoveryInput = Schema.Struct({
   projectId: ProjectId,
   repository: WorkflowRepositoryNameWithOwner,
   issueNumber: PositiveInt,
+  phase: Schema.optional(WorkflowPhase),
 });
 export type WorkflowRecoveryInput = typeof WorkflowRecoveryInput.Type;
 
@@ -308,7 +314,7 @@ export const WorkflowRecoveryAttempt = Schema.Struct({
   repository: WorkflowRepositoryNameWithOwner,
   rootNumber: PositiveInt,
   issueNumber: PositiveInt,
-  phase: Schema.Literal("decision"),
+  phase: WorkflowPhase,
   threadId: ThreadId,
   status: Schema.Literals(["claiming", "submitting", "submitted", "held"]),
   evidence: WorkflowRecoveryEvidence,
@@ -339,6 +345,7 @@ export const WorkflowRecoverInput = Schema.Struct({
   repository: WorkflowRepositoryNameWithOwner,
   rootNumber: PositiveInt,
   issueNumber: PositiveInt,
+  phase: Schema.optional(WorkflowPhase),
   attemptId: Schema.optional(TrimmedNonEmptyString),
   action: Schema.Literals(["open", "resume", "start-fresh", "takeover"]),
   observation: Schema.optional(TrimmedNonEmptyString),

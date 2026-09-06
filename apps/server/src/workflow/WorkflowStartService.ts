@@ -14,7 +14,10 @@ import {
   type WorkflowRecoveryAttempt,
   type WorkflowRecoveryInput,
   type WorkflowRecoveryResult,
+  type WorkflowPhase,
   WorkflowStartError,
+  type WorkflowIssueDetail,
+  type WorkflowIssueSummary,
   type WorkflowStartInput,
   type WorkflowStartResult,
 } from "@t3tools/contracts";
@@ -49,6 +52,7 @@ const AttemptRow = Schema.Struct({
   repository: Schema.String,
   rootNumber: Schema.Number,
   issueNumber: Schema.Number,
+  phase: Schema.String,
   commandId: Schema.String,
   threadId: Schema.String,
   status: Schema.String,
@@ -62,6 +66,10 @@ const AttemptRow = Schema.Struct({
   isCurrent: Schema.Number,
 });
 type AttemptRow = typeof AttemptRow.Type;
+
+function workflowPhase(input: { readonly phase?: WorkflowPhase | undefined }): WorkflowPhase {
+  return input.phase ?? "decision";
+}
 
 function startError(failure: WorkflowStartError["failure"], message: string, detail?: string) {
   return new WorkflowStartError({ failure, message, ...(detail ? { detail } : {}) });
@@ -128,6 +136,68 @@ export function workflowDecisionInstructions(input: {
   ].join("\n");
 }
 
+function currentSpecificationApproval(issue: WorkflowIssueDetail) {
+  return issue.evidence?.records.findLast(
+    (record) =>
+      record.kind === "approval" &&
+      record.approvalKind === "specification" &&
+      record.state === "current" &&
+      record.scope === "current" &&
+      record.authority === "verified" &&
+      record.sourceAccess === "verified" &&
+      typeof record.approvedBy === "string" &&
+      record.approvedBy.length > 0 &&
+      record.approvedContent === issue.body,
+  );
+}
+
+export function workflowSpecificationInstructions(input: {
+  readonly map: WorkflowIssueDetail;
+  readonly resolvedDecisions: ReadonlyArray<WorkflowIssueSummary>;
+}): string {
+  return [
+    "Use the to-spec skill explicitly to turn this resolved Wayfinder map into a capability specification.",
+    "",
+    `Source map: ${input.map.url}`,
+    `Map title: ${input.map.title}`,
+    "",
+    "Accepted map context:",
+    input.map.body,
+    "",
+    "Resolved in-scope decisions:",
+    ...input.resolvedDecisions.map(
+      (decision) =>
+        `- ${decision.repository}#${decision.number} — ${decision.title} (${decision.url})`,
+    ),
+    "",
+    "Publish the new capability as the specification issue. Start its body with a concise Summary, include this Source map, and apply workflow:capability. Keep decision issues under the map; the map may inform other capabilities later.",
+    "After publishing the specification, stop and ask the owner for explicit specification approval. Preserve any approval as a versioned Approval record with the owner, its explicit source, and the exact approved content. Do not infer approval from labels, issue prose, silence, or an earlier map decision.",
+    "Do not slice or publish delivery tickets in this phase.",
+  ].join("\n");
+}
+
+export function workflowTicketBreakdownInstructions(input: {
+  readonly capability: WorkflowIssueDetail;
+  readonly approvalUrl: string;
+  readonly approvedBy: string;
+}): string {
+  return [
+    "Use the to-tickets skill explicitly for the current approved capability specification.",
+    "",
+    `Capability: ${input.capability.repository}#${input.capability.number} — ${input.capability.title}`,
+    `Source: ${input.capability.url}`,
+    `Current specification approval: ${input.approvalUrl} by ${input.approvedBy}`,
+    "",
+    "Current approved specification:",
+    input.capability.body,
+    "",
+    "First draft the proposed breakdown and present it to the owner with scopes, acceptance criteria, and blocking edges.",
+    "Do not publish delivery issues until the owner separately approves that complete proposed breakdown in a later message. Specification approval authorizes this proposal step only.",
+    "When that separate approval arrives, preserve the exact approved breakdown in a ticket-breakdown Approval record with the owner and explicit source. Then publish delivery tickets as native sub-issues of this capability, add native blocker edges, and apply workflow:ticket. Apply ready-for-agent only from current live readiness.",
+    "Publishing tickets does not start implementation or a director. Implementation remains behind the capability Start action.",
+  ].join("\n");
+}
+
 function resultFromRow(
   row: Pick<
     AttemptRow,
@@ -137,6 +207,7 @@ function resultFromRow(
     | "repository"
     | "rootNumber"
     | "issueNumber"
+    | "phase"
     | "threadId"
     | "status"
     | "createdAt"
@@ -145,6 +216,17 @@ function resultFromRow(
   disposition: WorkflowStartResult["disposition"],
 ): WorkflowStartResult {
   const held = row.status !== "submitted";
+  const phase = row.phase as WorkflowPhase;
+  const submittedMessage =
+    phase === "decision"
+      ? "Decision work started."
+      : phase === "specification"
+        ? "Capability specification started in the planning thread."
+        : "Ticket breakdown proposal started in the planning thread.";
+  const existingMessage =
+    phase === "decision"
+      ? "Opening the existing decision attempt."
+      : "Opening the existing planning phase.";
   return {
     disposition: held ? "held" : disposition,
     attemptId: row.attemptId,
@@ -153,15 +235,15 @@ function resultFromRow(
     repository: row.repository,
     rootNumber: row.rootNumber,
     issueNumber: row.issueNumber,
-    phase: "decision",
+    phase,
     threadId: row.threadId,
     status: held ? "held" : "submitted",
     createdAt: row.createdAt,
     message: held
       ? (row.detail ?? "The first submission is uncertain. Reconcile this attempt before retrying.")
       : disposition === "started"
-        ? "Decision work started."
-        : "Opening the existing decision attempt.",
+        ? submittedMessage
+        : existingMessage,
   } as WorkflowStartResult;
 }
 
@@ -195,18 +277,18 @@ export const make = Effect.gen(function* () {
   const lock = yield* Semaphore.make(1);
 
   const loadAttempts = Effect.fn("WorkflowStartService.loadAttempts")(function* (
-    input: Pick<WorkflowStartInput, "projectId" | "repository" | "issueNumber">,
+    input: Pick<WorkflowStartInput, "projectId" | "repository" | "issueNumber" | "phase">,
   ) {
     const rows = yield* sql<AttemptRow>`
       SELECT attempt_id AS "attemptId", environment_id AS "environmentId",
         project_id AS "projectId", repository, root_number AS "rootNumber",
-        issue_number AS "issueNumber", command_id AS "commandId", thread_id AS "threadId", status,
+        issue_number AS "issueNumber", phase, command_id AS "commandId", thread_id AS "threadId", status,
         claim_login AS "claimLogin", claim_owned AS "claimOwned", sequence,
         created_at AS "createdAt", updated_at AS "updatedAt", detail,
         initial_turn_disposition AS "initialTurnDisposition", is_current AS "isCurrent"
       FROM workflow_start_attempts
       WHERE project_id = ${input.projectId} AND repository = ${input.repository}
-        AND issue_number = ${input.issueNumber} AND phase = 'decision'
+        AND issue_number = ${input.issueNumber} AND phase = ${workflowPhase(input)}
       ORDER BY is_current DESC, created_at DESC
     `.pipe(
       Effect.mapError((error) =>
@@ -346,7 +428,7 @@ export const make = Effect.gen(function* () {
     repository: row.repository as WorkflowRecoveryAttempt["repository"],
     rootNumber: row.rootNumber,
     issueNumber: row.issueNumber,
-    phase: "decision",
+    phase: row.phase as WorkflowPhase,
     threadId: ThreadId.make(row.threadId),
     status:
       row.status === "claiming" ||
@@ -380,6 +462,44 @@ export const make = Effect.gen(function* () {
     const reconciled = yield* Effect.forEach(rows, readEvidence);
     const attempts = reconciled.map(({ row, evidence }) => recoveryAttempt(row, evidence));
     const currentAttempt = attempts.find((attempt) => attempt.isCurrent) ?? null;
+    if (workflowPhase(input) !== "decision") {
+      const shell = currentAttempt
+        ? yield* projection
+            .getThreadShellById(currentAttempt.threadId)
+            .pipe(
+              Effect.mapError((error) =>
+                startError(
+                  "persistence-failed",
+                  "The linked planning thread state could not be read.",
+                  String(error),
+                ),
+              ),
+            )
+        : Option.none();
+      const observation = [
+        workflowPhase(input),
+        currentAttempt?.attemptId ?? "none",
+        currentAttempt?.status ?? "none",
+        currentAttempt?.evidence ?? "none",
+      ].join("|");
+      const canOpen = currentAttempt !== null && Option.isSome(shell);
+      return {
+        environmentId,
+        projectId: input.projectId,
+        repository: input.repository,
+        issueNumber: input.issueNumber,
+        attempts,
+        currentAttempt,
+        assignees: [],
+        observation,
+        actions: canOpen ? ["open" as const] : [],
+        message: canOpen
+          ? currentAttempt.evidence === "accepted"
+            ? "This planning phase is linked to its preserved thread."
+            : "The planning submission is uncertain. Open the linked thread before taking another action."
+          : "No planning phase is linked to this issue in this environment.",
+      } satisfies WorkflowRecoveryResult;
+    }
     const resumeRows = currentAttempt
       ? yield* sql<{
           readonly resumeId: string;
@@ -811,6 +931,327 @@ export const make = Effect.gen(function* () {
       threadId: ThreadId.make(current.threadId),
       message: "Interrupted work resumed in the preserved thread.",
     } satisfies WorkflowRecoverResult;
+  });
+
+  const preparePlanningPhase = Effect.fn("WorkflowStartService.preparePlanningPhase")(function* (
+    input: WorkflowStartInput,
+    skillName: "to-spec" | "to-tickets",
+  ) {
+    const project = yield* selectedProject(input.projectId);
+    const workspace = yield* fileSystem
+      .stat(project.workspaceRoot)
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "workspace-unavailable",
+            "The target workspace is not accessible in this environment.",
+            String(error),
+          ),
+        ),
+      );
+    if (workspace.type !== "Directory") {
+      return yield* startError(
+        "workspace-unavailable",
+        "The target workspace is not a directory in this environment.",
+      );
+    }
+    if (!input.planningThreadId) {
+      return yield* startError(
+        "workspace-unavailable",
+        "Open this action from the planning thread that should retain the specification history.",
+      );
+    }
+    const shellOption = yield* projection
+      .getThreadShellById(input.planningThreadId)
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "The target planning thread could not be read.",
+            String(error),
+          ),
+        ),
+      );
+    if (Option.isNone(shellOption) || shellOption.value.projectId !== input.projectId) {
+      return yield* startError(
+        "workspace-unavailable",
+        "The selected planning thread is unavailable in this project and environment.",
+      );
+    }
+    const shell = shellOption.value;
+    if (
+      shell.latestTurn?.state === "running" ||
+      shell.session?.activeTurnId != null ||
+      shell.session?.status === "running" ||
+      shell.session?.status === "starting"
+    ) {
+      return yield* startError(
+        "not-ready",
+        "The planning thread already has an active turn.",
+        "Wait for the current turn to settle before starting another planning phase.",
+      );
+    }
+    const scopedProvider = yield* providerRegistry
+      .probeWorkspaceSnapshot({
+        instanceId: input.modelSelection.instanceId,
+        cwd: project.workspaceRoot,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "provider-unavailable",
+            "Codex workspace discovery failed. Check the provider and retry.",
+            String(error),
+          ),
+        ),
+      );
+    if (
+      !scopedProvider ||
+      scopedProvider.driver !== ProviderDriverKind.make("codex") ||
+      !scopedProvider.enabled ||
+      !scopedProvider.installed ||
+      scopedProvider.auth.status !== "authenticated" ||
+      scopedProvider.status === "error" ||
+      scopedProvider.status === "disabled"
+    ) {
+      return yield* startError(
+        "provider-unavailable",
+        "Choose an enabled, authenticated Codex provider in this environment.",
+      );
+    }
+    const model = scopedProvider.models.find(
+      (candidate) => candidate.slug === input.modelSelection.model,
+    );
+    if (!model) {
+      return yield* startError(
+        "model-unavailable",
+        `Model '${input.modelSelection.model}' is not available from this Codex provider.`,
+      );
+    }
+    const effort = getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort");
+    const effortDescriptor = model.capabilities?.optionDescriptors?.find(
+      (descriptor) => descriptor.id === "reasoningEffort",
+    );
+    if (
+      !effort ||
+      effortDescriptor?.type !== "select" ||
+      !effortDescriptor.options.some((option) => option.id === effort)
+    ) {
+      return yield* startError(
+        "effort-required",
+        "Choose a supported Codex reasoning effort before starting this planning phase.",
+      );
+    }
+    const matches = scopedProvider.skills.filter(
+      (skill) => skill.name === skillName && skill.enabled,
+    );
+    if (matches.length !== 1) {
+      return yield* startError(
+        "skill-unavailable",
+        `Enable the '${skillName}' skill at one unambiguous path in the target workspace.`,
+      );
+    }
+    return { project, shell, skill: matches[0]! };
+  });
+
+  const resolvedMapContext = Effect.fn("WorkflowStartService.resolvedMapContext")(function* (
+    input: Pick<WorkflowStartInput, "projectId" | "repository">,
+    map: WorkflowIssueDetail,
+  ) {
+    const visited = new Set<string>();
+    const resolved: WorkflowIssueSummary[] = [];
+    const pending = [{ parentNumber: map.number, root: true }];
+    while (pending.length > 0) {
+      const next = pending.shift()!;
+      const result = yield* workflow.children({
+        projectId: input.projectId,
+        repository: input.repository,
+        parentNumber: next.parentNumber,
+      });
+      if (next.root && result.frontier?.status !== "complete") {
+        return yield* startError(
+          "not-ready",
+          "This map is not ready to become a capability.",
+          result.frontier?.message ??
+            "Complete every in-scope decision and clear the map's remaining unknowns first.",
+        );
+      }
+      for (const child of result.children) {
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
+        if (child.readiness?.status !== "resolved") {
+          return yield* startError(
+            "not-ready",
+            "This map is not ready to become a capability.",
+            `Descendant #${child.number} ${child.title} is ${child.readiness?.status ?? "unverified"}.`,
+          );
+        }
+        resolved.push(child);
+        if (child.childCount > 0) pending.push({ parentNumber: child.number, root: false });
+      }
+    }
+    return resolved;
+  });
+
+  const startPlanningUnlocked = Effect.fn("WorkflowStartService.startPlanning")(function* (
+    input: WorkflowStartInput,
+    dispatch: Dispatch,
+  ) {
+    const phase = workflowPhase(input);
+    const existing = yield* loadAttempt(input);
+    if (existing) return resultFromRow(existing, "existing");
+    const issue = yield* workflow.issueDetail({
+      projectId: input.projectId,
+      repository: input.repository,
+      number: input.issueNumber,
+    });
+    let instructions: string;
+    let skillName: "to-spec" | "to-tickets";
+    if (phase === "specification") {
+      if (issue.kind !== "map") {
+        return yield* startError(
+          "unsupported-issue",
+          "Create capability is available for a Wayfinder map.",
+        );
+      }
+      const resolvedDecisions = yield* resolvedMapContext(input, issue);
+      instructions = workflowSpecificationInstructions({ map: issue, resolvedDecisions });
+      skillName = "to-spec";
+    } else {
+      if (issue.kind !== "capability") {
+        return yield* startError(
+          "unsupported-issue",
+          "Slice tickets is available for a capability specification.",
+        );
+      }
+      const approval = currentSpecificationApproval(issue);
+      if (issue.readiness?.status !== "ready" || !approval) {
+        return yield* startError(
+          "not-ready",
+          "This capability does not have current verified specification approval.",
+          issue.readiness?.reasons.map((reason) => reason.message).join(" ") ??
+            "Record the owner's explicit approval source and exact current specification content.",
+        );
+      }
+      instructions = workflowTicketBreakdownInstructions({
+        capability: issue,
+        approvalUrl: approval.url,
+        approvedBy: approval.approvedBy!,
+      });
+      skillName = "to-tickets";
+    }
+    const prepared = yield* preparePlanningPhase(input, skillName);
+    const environmentId = yield* environment.getEnvironmentId.pipe(
+      Effect.mapError((error) =>
+        startError(
+          "workspace-unavailable",
+          "The environment identity could not be read.",
+          String(error),
+        ),
+      ),
+    );
+    const createdAt = DateTime.formatIso(yield* DateTime.now);
+    const attemptId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const messageId = MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const threadId = input.planningThreadId!;
+    yield* sql`
+      INSERT INTO workflow_start_attempts (
+        attempt_id, environment_id, project_id, repository, root_number,
+        issue_number, phase, thread_id, command_id, message_id, status,
+        initial_turn_disposition, created_at, updated_at
+      ) VALUES (
+        ${attemptId}, ${environmentId}, ${input.projectId}, ${input.repository}, ${input.rootNumber},
+        ${input.issueNumber}, ${phase}, ${threadId}, ${commandId}, ${messageId}, 'submitting',
+        'unknown', ${createdAt}, ${createdAt}
+      )
+    `.pipe(
+      Effect.mapError((error) =>
+        startError(
+          "persistence-failed",
+          "The planning phase intent could not be saved.",
+          String(error),
+        ),
+      ),
+    );
+    const command = {
+      type: "thread.turn.start" as const,
+      commandId,
+      threadId,
+      message: { messageId, role: "user" as const, text: instructions, attachments: [] },
+      modelSelection: input.modelSelection,
+      skills: [{ name: prepared.skill.name, path: prepared.skill.path }],
+      runtimeMode: "approval-required" as const,
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      createdAt,
+    } satisfies Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+    const dispatched = yield* dispatch(command).pipe(
+      Effect.catch((error) =>
+        commandReceipts.getByCommandId({ commandId }).pipe(
+          Effect.mapError((cause) =>
+            startError(
+              "persistence-failed",
+              "Planning command evidence could not be read.",
+              String(cause),
+            ),
+          ),
+          Effect.flatMap((receipt) => {
+            const accepted = Option.isSome(receipt) && receipt.value.status === "accepted";
+            const detail = accepted
+              ? null
+              : "The planning submission is uncertain and will not be sent again automatically.";
+            return sql`
+              UPDATE workflow_start_attempts SET status = ${accepted ? "submitted" : "held"},
+                sequence = ${accepted ? receipt.value.resultSequence : null}, detail = ${detail},
+                initial_turn_disposition = ${accepted ? "accepted" : "unknown"}, updated_at = ${createdAt}
+              WHERE attempt_id = ${attemptId}
+            `.pipe(
+              Effect.mapError((cause) =>
+                startError(
+                  "persistence-failed",
+                  "The planning phase outcome could not be saved.",
+                  String(cause),
+                ),
+              ),
+              Effect.andThen(
+                accepted
+                  ? Effect.succeed({ sequence: receipt.value.resultSequence })
+                  : Effect.fail(startError("dispatch-failed", detail!, String(error))),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+    yield* sql`
+      UPDATE workflow_start_attempts SET status = 'submitted', sequence = ${dispatched.sequence},
+        detail = NULL, initial_turn_disposition = 'accepted', updated_at = ${createdAt}
+      WHERE attempt_id = ${attemptId}
+    `.pipe(
+      Effect.mapError((error) =>
+        startError(
+          "persistence-failed",
+          "The accepted planning phase could not be saved.",
+          String(error),
+        ),
+      ),
+    );
+    return resultFromRow(
+      {
+        attemptId,
+        environmentId,
+        projectId: input.projectId,
+        repository: input.repository,
+        rootNumber: input.rootNumber,
+        issueNumber: input.issueNumber,
+        phase,
+        threadId,
+        status: "submitted",
+        createdAt,
+        detail: null,
+      },
+      "started",
+    );
   });
 
   const startUnlocked = Effect.fn("WorkflowStartService.start")(function* (
@@ -1332,6 +1773,7 @@ export const make = Effect.gen(function* () {
         repository: input.repository,
         rootNumber: input.rootNumber,
         issueNumber: input.issueNumber,
+        phase: "decision",
         threadId,
         status: "submitted",
         createdAt,
@@ -1354,6 +1796,12 @@ export const make = Effect.gen(function* () {
       return yield* startError(
         "claim-failed",
         "The workflow claim or attempt changed. Refresh before confirming this action again.",
+      );
+    }
+    if (workflowPhase(input) !== "decision" && input.action !== "open") {
+      return yield* startError(
+        "dispatch-failed",
+        "Planning phases can only reopen their linked thread.",
       );
     }
     const current = state.currentAttempt;
@@ -1417,7 +1865,12 @@ export const make = Effect.gen(function* () {
   });
 
   return WorkflowStartService.of({
-    start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
+    start: (input, dispatch) =>
+      lock.withPermits(1)(
+        workflowPhase(input) === "decision"
+          ? startUnlocked(input, dispatch)
+          : startPlanningUnlocked(input, dispatch),
+      ),
     recovery: (input) => lock.withPermits(1)(recoveryUnlocked(input)),
     recover: (input, dispatch) => lock.withPermits(1)(recoverUnlocked(input, dispatch)),
   });

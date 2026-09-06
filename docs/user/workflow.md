@@ -9,6 +9,14 @@ model and reasoning effort, and the target workspace must expose the required Wa
 T3 Code rechecks those conditions, claims the GitHub issue, creates a thread, submits the first
 turn, and opens Workflow beside that thread.
 
+When a map's in-scope decisions are resolved and its remaining unknowns are clear, open the map
+from its planning thread and choose **Create capability**. T3 Code continues that thread with the
+map context and the `to-spec` skill. Approve the resulting specification before choosing **Slice
+tickets** on the capability. Ticket slicing returns to the same planning thread and first proposes
+a breakdown; publishing the delivery issues requires a separate owner approval of that exact
+breakdown. If the panel cannot identify an available planning thread in the selected project and
+environment, open the intended thread before starting either phase.
+
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the
 GitHub assignment; it does not stop another agent or make the assignment an atomic lock.
