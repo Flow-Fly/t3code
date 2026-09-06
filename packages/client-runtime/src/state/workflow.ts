@@ -45,6 +45,12 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       tag: WS_METHODS.workflowLocate,
       staleTimeMs: 30_000,
     }),
+    start: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:start",
+      tag: WS_METHODS.workflowStart,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     adoptionPreview: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:adoption-preview",
       tag: WS_METHODS.workflowAdoptionPreview,

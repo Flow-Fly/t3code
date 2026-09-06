@@ -16,6 +16,7 @@ import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 import type { ProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
+import type { ProviderDriverError } from "../Errors.ts";
 
 export type ProviderMaintenanceActionKind = "update";
 
@@ -52,6 +53,12 @@ export interface ProviderRegistryShape {
     readonly instanceId: ProviderInstanceId;
     readonly cwd: string;
   }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
+
+  /** Probe the selected provider's workspace inventory without accepting a cached fallback. */
+  readonly probeWorkspaceSnapshot: (input: {
+    readonly instanceId: ProviderInstanceId;
+    readonly cwd: string;
+  }) => Effect.Effect<ServerProvider | undefined, ProviderDriverError>;
 
   /**
    * Resolve the maintenance capabilities owned by one live provider instance.

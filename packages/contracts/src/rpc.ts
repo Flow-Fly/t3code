@@ -152,6 +152,9 @@ import {
   WorkflowRootsResult,
   WorkflowSearchInput,
   WorkflowSearchResult,
+  WorkflowStartError,
+  WorkflowStartInput,
+  WorkflowStartResult,
 } from "./workflow.ts";
 import {
   RelayClientInstallFailedError,
@@ -392,6 +395,7 @@ export const WS_METHODS = {
   workflowIssueDetail: "workflow.issueDetail",
   workflowSearch: "workflow.search",
   workflowLocate: "workflow.locate",
+  workflowStart: "workflow.start",
   workflowAdoptionPreview: "workflow.adoption.preview",
   workflowAdoptionApply: "workflow.adoption.apply",
   workflowAdoptionHistory: "workflow.adoption.history",
@@ -843,6 +847,12 @@ export const WsWorkflowLocateRpc = Rpc.make(WS_METHODS.workflowLocate, {
   payload: WorkflowLocateInput,
   success: WorkflowLocateResult,
   error: WorkflowRpcError,
+});
+
+export const WsWorkflowStartRpc = Rpc.make(WS_METHODS.workflowStart, {
+  payload: WorkflowStartInput,
+  success: WorkflowStartResult,
+  error: Schema.Union([WorkflowQueryError, WorkflowStartError, EnvironmentAuthorizationError]),
 });
 
 const WorkflowAdoptionRpcError = Schema.Union([
@@ -1377,6 +1387,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowIssueDetailRpc,
   WsWorkflowSearchRpc,
   WsWorkflowLocateRpc,
+  WsWorkflowStartRpc,
   WsWorkflowAdoptionPreviewRpc,
   WsWorkflowAdoptionApplyRpc,
   WsWorkflowAdoptionHistoryRpc,

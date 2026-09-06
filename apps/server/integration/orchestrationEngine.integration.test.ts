@@ -9,19 +9,25 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
+  EnvironmentId,
   EventId,
   MessageId,
+  OrchestrationDispatchCommandError,
   ProjectId,
   ProviderDriverKind,
   ThreadId,
   ModelSelection,
   ProviderInstanceId,
+  type ServerProvider,
+  type WorkflowIssueSummary,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { ChildProcessSpawner } from "effect/unstable/process";
 
 import type { TestTurnResponse } from "./TestProviderAdapter.integration.ts";
 import {
@@ -31,6 +37,15 @@ import {
   type OrchestrationIntegrationHarness,
 } from "./OrchestrationEngineHarness.integration.ts";
 import { checkpointRefForThreadTurn } from "../src/checkpointing/Utils.ts";
+import { dispatchCreatedThreadTurnStart } from "../src/orchestration/dispatchCreatedThreadTurnStart.ts";
+import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
+import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
+import * as ProviderRegistry from "../src/provider/Services/ProviderRegistry.ts";
+import { makeProviderRegistryMock } from "../src/provider/testUtils/providerRegistryMock.ts";
+import * as ServerEnvironment from "../src/environment/ServerEnvironment.ts";
+import * as GitHubCli from "../src/sourceControl/GitHubCli.ts";
+import * as WorkflowService from "../src/workflow/WorkflowService.ts";
+import * as WorkflowStartService from "../src/workflow/WorkflowStartService.ts";
 import type {
   CheckpointDiffFinalizedReceipt,
   TurnProcessingQuiescedReceipt,
@@ -181,6 +196,227 @@ const startTurn = (input: {
     runtimeMode: "approval-required",
     createdAt: input.createdAt ?? nowIso(),
   });
+
+it.live("serializes workflow starts into one durable provider first turn", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const modelSelection = {
+        instanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+        model: DEFAULT_MODEL_BY_PROVIDER[CODEX_PROVIDER] ?? DEFAULT_MODEL,
+        options: [{ id: "reasoningEffort", value: "high" }] as const,
+      };
+      yield* harness.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("workflow-start-project"),
+        projectId: PROJECT_ID,
+        title: "Workflow project",
+        workspaceRoot: harness.workspaceDir,
+        defaultModelSelection: modelSelection,
+        createdAt: nowIso(),
+      });
+      yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("workflow-started", "2026-05-01T00:00:01.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("workflow-completed", "2026-05-01T00:00:02.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+      });
+      const repository = "Flow-Fly/t3code" as const;
+      const workflowIssue = (
+        number: number,
+        kind: WorkflowIssueSummary["kind"],
+        parentNumber: number | null,
+        labels: ReadonlyArray<string>,
+      ): WorkflowIssueSummary => ({
+        id: `workflow-${number}`,
+        repository,
+        number,
+        title: number === 15 ? "Choose the workflow launch contract" : `Workflow ${kind}`,
+        url: `https://github.com/${repository}/issues/${number}`,
+        kind,
+        state: "open",
+        stateReason: null,
+        updatedAt: nowIso(),
+        childCount: 1,
+        parentNumber,
+        labels: [...labels],
+        readiness: { status: "ready", reasons: [] },
+      });
+      const root = workflowIssue(10, "container", null, ["workflow:container"]);
+      const map = workflowIssue(12, "map", 10, ["wayfinder:map"]);
+      const decision = workflowIssue(15, "decision", 12, ["wayfinder:research"]);
+      const provider = {
+        instanceId: modelSelection.instanceId,
+        driver: CODEX_PROVIDER,
+        status: "ready",
+        enabled: true,
+        installed: true,
+        auth: { status: "authenticated" },
+        checkedAt: nowIso(),
+        version: "1.0.0",
+        models: [
+          {
+            slug: modelSelection.model,
+            name: "Codex integration model",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning effort",
+                  type: "select",
+                  options: [{ id: "high", label: "High" }],
+                },
+              ],
+            },
+          },
+        ],
+        slashCommands: [],
+        skills: ["wayfinder", "research"].map((name) => ({
+          name,
+          path: `/skills/${name}/SKILL.md`,
+          enabled: true,
+        })),
+      } satisfies ServerProvider;
+      const assignees = new Set<string>();
+      const githubLayer = Layer.mock(GitHubCli.GitHubCli)({
+        execute: ({ args }) =>
+          Effect.sync(() => {
+            let stdout = "";
+            if (args[0] === "api") stdout = "Flow-Fly\n";
+            else if (args.includes("--json")) stdout = [...assignees].join("\n");
+            else {
+              const addAt = args.indexOf("--add-assignee");
+              if (addAt >= 0) assignees.add(args[addAt + 1]!);
+            }
+            return {
+              stdout,
+              stderr: "",
+              exitCode: ChildProcessSpawner.ExitCode(0),
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            };
+          }),
+      });
+      const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
+        issueDetail: ({ number }) =>
+          Effect.succeed({
+            ...(number === 10 ? root : decision),
+            body: "Decision context",
+            blockedBy: [],
+          }),
+        locate: () =>
+          Effect.succeed({ issue: decision, ancestry: [root, map], ancestryComplete: true }),
+      });
+      const startLayer = WorkflowStartService.layer.pipe(
+        Layer.provide(workflowLayer),
+        Layer.provide(
+          Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, harness.snapshotQuery),
+        ),
+        Layer.provide(
+          Layer.succeed(ProviderRegistry.ProviderRegistry, makeProviderRegistryMock([provider])),
+        ),
+        Layer.provide(githubLayer),
+        Layer.provide(
+          Layer.mock(ServerEnvironment.ServerEnvironment)({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("workflow-environment")),
+          }),
+        ),
+        Layer.provide(makeSqlitePersistenceLive(harness.dbPath)),
+        Layer.provide(NodeServices.layer),
+      );
+      let dispatchCount = 0;
+      const dispatch: Parameters<
+        WorkflowStartService.WorkflowStartService["Service"]["start"]
+      >[1] = (command) => {
+        dispatchCount += 1;
+        return dispatchCreatedThreadTurnStart({
+          command: command as typeof command & {
+            readonly bootstrap: {
+              readonly createThread: NonNullable<
+                NonNullable<typeof command.bootstrap>["createThread"]
+              >;
+            };
+          },
+          createCommandId: Effect.succeed(CommandId.make("workflow-start-thread")),
+          dispatch: (bootstrapCommand) =>
+            harness.engine.dispatch(bootstrapCommand).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationDispatchCommandError({
+                    message: "Workflow bootstrap dispatch failed.",
+                    cause,
+                  }),
+              ),
+            ),
+          drainThreadDeletionThrough: () => Effect.void,
+        });
+      };
+      const results = yield* Effect.gen(function* () {
+        const start = yield* WorkflowStartService.WorkflowStartService;
+        return yield* Effect.all(
+          [
+            start.start(
+              {
+                projectId: PROJECT_ID,
+                repository,
+                rootNumber: 10,
+                issueNumber: 15,
+                modelSelection,
+              },
+              dispatch,
+            ),
+            start.start(
+              {
+                projectId: PROJECT_ID,
+                repository,
+                rootNumber: 10,
+                issueNumber: 15,
+                modelSelection,
+              },
+              dispatch,
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+      }).pipe(Effect.provide(startLayer));
+      const threadId = results[0]!.threadId;
+      yield* harness.waitForReceipt(
+        (receipt): receipt is TurnProcessingQuiescedReceipt =>
+          receipt.type === "turn.processing.quiesced" && receipt.threadId === threadId,
+      );
+      yield* harness.drainProviderRuntime;
+      yield* harness.drainCheckpointReactor;
+
+      const snapshot = yield* harness.snapshotQuery.getSnapshot();
+      const thread = snapshot.threads.find((candidate) => candidate.id === threadId);
+      assert.equal(thread?.title, "Choose the workflow launch contract");
+      assert.match(thread?.messages[0]?.text ?? "", /Map: Flow-Fly\/t3code#12/u);
+      assert.deepEqual(results.map((result) => result.disposition).sort(), ["existing", "started"]);
+      assert.equal(new Set(results.map((result) => result.attemptId)).size, 1);
+      assert.equal(dispatchCount, 1);
+      assert.equal(harness.adapterHarness!.getStartCount(), 1);
+      assert.deepEqual(harness.adapterHarness!.getTurnInputs()[0]?.skills, [
+        { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+        { name: "research", path: "/skills/research/SKILL.md" },
+      ]);
+      assert.deepEqual(harness.adapterHarness!.getTurnInputs()[0]?.modelSelection, modelSelection);
+    }),
+  ),
+);
 
 it.live("runs a single turn end-to-end and persists checkpoint state in sqlite + git", () =>
   withHarness((harness) =>

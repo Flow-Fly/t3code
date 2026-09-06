@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { useWorkflowMapStore } from "~/workflowMapStore";
+import { useRightPanelStore } from "~/rightPanelStore";
 
 const query = vi.hoisted(() => {
   const calls = new Array<{ kind: string; request: unknown }>();
@@ -15,9 +16,84 @@ const query = vi.hoisted(() => {
     descriptor,
     moved: false,
     evidence: false,
+    startReady: false,
+    startCalls: new Array<unknown>(),
+    navigateCalls: new Array<unknown>(),
     destinationRepository: "Flow-Fly/t3code",
   };
 });
+
+vi.mock("@tanstack/react-router", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tanstack/react-router")>()),
+  useNavigate: () => (request: unknown) => {
+    query.navigateCalls.push(request);
+  },
+}));
+
+vi.mock("~/state/entities", () => ({
+  useProject: () => ({
+    defaultModelSelection: {
+      instanceId: "codex-workflow",
+      model: "gpt-6-astra",
+      options: [{ id: "reasoningEffort", value: "high" }],
+    },
+  }),
+  useServerConfigs: () =>
+    new Map([
+      [
+        "remote-environment",
+        {
+          providers: [
+            {
+              instanceId: "codex-workflow",
+              driver: "codex",
+              status: "ready",
+              enabled: true,
+              installed: true,
+              models: [
+                {
+                  slug: "gpt-6-astra",
+                  capabilities: {
+                    optionDescriptors: [
+                      {
+                        id: "reasoningEffort",
+                        label: "Reasoning effort",
+                        type: "select",
+                        options: [{ id: "high", label: "High" }],
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    ]),
+}));
+
+vi.mock("~/state/use-atom-command", () => ({
+  useAtomCommand: () => async (request: unknown) => {
+    query.startCalls.push(request);
+    return {
+      _tag: "Success",
+      value: {
+        disposition: "started",
+        status: "submitted",
+        attemptId: "attempt-15",
+        environmentId: "remote-environment",
+        projectId: "project-draft",
+        repository: "Flow-Fly/t3code",
+        rootNumber: 10,
+        issueNumber: 11,
+        phase: "decision",
+        threadId: "workflow-thread-15",
+        createdAt: "2026-09-06T10:00:00.000Z",
+        message: "Decision work started.",
+      },
+    };
+  },
+}));
 
 vi.mock("~/state/workflow", () => ({
   workflowEnvironment: {
@@ -27,6 +103,7 @@ vi.mock("~/state/workflow", () => ({
     issueDetail: (request: unknown) => query.descriptor("detail", request),
     search: (request: unknown) => query.descriptor("search", request),
     locate: (request: unknown) => query.descriptor("locate", request),
+    start: { label: "workflow:start", run: vi.fn() },
   },
 }));
 
@@ -77,13 +154,13 @@ vi.mock("~/state/query", () => ({
                     number: 10,
                     title: "Capability",
                     url: "https://github.com/Flow-Fly/t3code/issues/10",
-                    kind: "capability",
+                    kind: query.startReady ? "map" : "capability",
                     state: "open",
                     stateReason: null,
                     updatedAt: "2026-09-05T00:00:00Z",
                     childCount: 1,
                     parentNumber: null,
-                    labels: ["workflow:capability"],
+                    labels: [query.startReady ? "wayfinder:map" : "workflow:capability"],
                   },
                   ...(query.moved && destinationIsCurrent
                     ? [
@@ -170,14 +247,14 @@ vi.mock("~/state/query", () => ({
           number: 11,
           title: "Browse work",
           url: "https://github.com/Flow-Fly/t3code/issues/11",
-          kind: "ticket",
+          kind: query.startReady ? "decision" : "ticket",
           state: "open",
           stateReason: null,
           updatedAt: "2026-09-05T00:00:00Z",
           childCount: 0,
           parentNumber: 10,
           body: "## Summary\n\nBrowse work without starting an agent.\n\n## Source map\n\n[Map](https://github.com/Flow-Fly/t3code/issues/1)\n\n## Notes\n\n[Related](https://github.com/Flow-Fly/t3code/issues/2)",
-          labels: ["wayfinder:task"],
+          labels: [query.startReady ? "wayfinder:research" : "wayfinder:task"],
           blockedBy: [
             {
               id: "issue-1",
@@ -194,47 +271,50 @@ vi.mock("~/state/query", () => ({
               labels: ["wayfinder:map"],
             },
           ],
-          ...(query.evidence
-            ? {
-                readiness: {
-                  status: "needs-review",
-                  reasons: [
-                    {
-                      kind: "reassessment",
-                      message:
-                        "Ticket approval matches scope, but owner authority is not verified.",
-                      source: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
-                    },
-                  ],
-                },
-                evidence: {
-                  records: [
-                    {
-                      id: "approval-record",
-                      url: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
-                      createdAt: "2026-09-05T19:32:15Z",
-                      kind: "approval",
-                      state: "current",
-                      sourceAccess: "reported",
-                      scope: "current",
-                      summary: "Approval: ticket-breakdown",
-                      approvalKind: "ticket-breakdown",
-                      approvedBy: "Flow-Fly",
-                      authority: "reported",
-                      source: "T3 thread thread-1",
-                      approvedContent: "Approved ticket snapshot",
-                    },
-                  ],
-                  manualConditions: [
-                    {
-                      description: "Provide a staging account or an approved fixture.",
-                      source: "https://github.com/acme/runbook/issues/4",
-                      status: "review-required",
-                    },
-                  ],
-                },
-              }
-            : {}),
+          ...(query.startReady
+            ? { readiness: { status: "ready", reasons: [] } }
+            : query.evidence
+              ? {
+                  readiness: {
+                    status: "needs-review",
+                    reasons: [
+                      {
+                        kind: "reassessment",
+                        message:
+                          "Ticket approval matches scope, but owner authority is not verified.",
+                        source:
+                          "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
+                      },
+                    ],
+                  },
+                  evidence: {
+                    records: [
+                      {
+                        id: "approval-record",
+                        url: "https://github.com/Flow-Fly/t3code/issues/10#issuecomment-approval",
+                        createdAt: "2026-09-05T19:32:15Z",
+                        kind: "approval",
+                        state: "current",
+                        sourceAccess: "reported",
+                        scope: "current",
+                        summary: "Approval: ticket-breakdown",
+                        approvalKind: "ticket-breakdown",
+                        approvedBy: "Flow-Fly",
+                        authority: "reported",
+                        source: "T3 thread thread-1",
+                        approvedContent: "Approved ticket snapshot",
+                      },
+                    ],
+                    manualConditions: [
+                      {
+                        description: "Provide a staging account or an approved fixture.",
+                        source: "https://github.com/acme/runbook/issues/4",
+                        status: "review-required",
+                      },
+                    ],
+                  },
+                }
+              : {}),
         },
       };
     }
@@ -343,8 +423,12 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} });
+  useRightPanelStore.setState({ byThreadKey: {} });
   query.moved = false;
   query.evidence = false;
+  query.startReady = false;
+  query.startCalls.length = 0;
+  query.navigateCalls.length = 0;
   query.destinationRepository = "Flow-Fly/t3code";
 });
 
@@ -355,6 +439,71 @@ afterEach(() => {
 });
 
 describe("WorkflowPanel browsing", () => {
+  it("starts ready decision work and opens Workflow on the durable destination thread", async () => {
+    query.startReady = true;
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={environmentId}
+          environmentLabel="Remote environment"
+          projectId={projectId}
+          projectTitle="Draft project"
+          supported
+        />,
+      );
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow decision" });
+      await act(() => start.findByType("button").props.onClick());
+
+      expect(query.startCalls).toEqual([
+        {
+          environmentId,
+          input: {
+            projectId,
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            issueNumber: 11,
+            modelSelection: {
+              instanceId: "codex-workflow",
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+        },
+      ]);
+      expect(query.navigateCalls).toEqual([
+        {
+          to: "/$environmentId/$threadId",
+          params: { environmentId, threadId: "workflow-thread-15" },
+        },
+      ]);
+      expect(Object.values(useRightPanelStore.getState().byThreadKey)[0]).toMatchObject({
+        isOpen: true,
+        activeSurfaceId: "workflow",
+        surfaces: [{ id: "workflow", kind: "workflow" }],
+      });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("browses an unsent draft through read queries without launching a provider", async () => {
     const draft = {
       environmentId: EnvironmentId.make("remote-environment"),

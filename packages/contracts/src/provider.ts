@@ -76,6 +76,14 @@ export const ProviderSendTurnInput = Schema.Struct({
   attachments: Schema.optional(
     Schema.Array(ChatAttachment).check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS)),
   ),
+  skills: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        name: TrimmedNonEmptyString,
+        path: TrimmedNonEmptyString,
+      }),
+    ),
+  ),
   modelSelection: Schema.optional(ModelSelection),
   interactionMode: Schema.optional(ProviderInteractionMode),
 });

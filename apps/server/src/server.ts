@@ -83,6 +83,7 @@ import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkflowService from "./workflow/WorkflowService.ts";
 import * as WorkflowAdoptionService from "./workflow/WorkflowAdoptionService.ts";
+import * as WorkflowStartService from "./workflow/WorkflowStartService.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
@@ -322,6 +323,11 @@ const WorkflowServiceLive = WorkflowService.layer.pipe(Layer.provide(ProcessRunn
 const WorkflowAdoptionServiceLive = WorkflowAdoptionService.layer.pipe(
   Layer.provide(SqlitePersistenceLayerLive),
 );
+const WorkflowStartServiceLive = WorkflowStartService.layer.pipe(
+  Layer.provide(SqlitePersistenceLayerLive),
+  Layer.provide(WorkflowServiceLive),
+  Layer.provide(GitHubCli.layer),
+);
 
 const GitManagerLayerLive = GitManager.layer.pipe(
   Layer.provideMerge(ProjectSetupScriptRunner.layer),
@@ -559,6 +565,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(PullRequestServiceLive),
   Layer.provide(WorkflowServiceLive),
   Layer.provide(WorkflowAdoptionServiceLive),
+  Layer.provide(WorkflowStartServiceLive),
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(DesktopAppUpdateLayerLive))),
   Layer.provide(commandReadinessLayer),

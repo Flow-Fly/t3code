@@ -63,6 +63,26 @@ function makeThreadOpenResponse(
 }
 
 describe("buildTurnStartParams", () => {
+  it.effect("passes explicit skills as native Codex turn inputs", () =>
+    Effect.gen(function* () {
+      const params = yield* buildTurnStartParams({
+        threadId: "provider-thread-1",
+        runtimeMode: "full-access",
+        prompt: "Investigate the decision",
+        skills: [
+          { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+          { name: "research", path: "/skills/research/SKILL.md" },
+        ],
+      });
+
+      NodeAssert.deepStrictEqual(params.input, [
+        { type: "text", text: "Investigate the decision" },
+        { type: "skill", name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+        { type: "skill", name: "research", path: "/skills/research/SKILL.md" },
+      ]);
+    }),
+  );
+
   it("keeps invalid turn values only in the schema cause", () => {
     const secret = "codex-turn-input-secret-sentinel";
     const error = Effect.runSync(

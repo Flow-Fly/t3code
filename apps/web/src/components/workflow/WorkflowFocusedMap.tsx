@@ -1,3 +1,5 @@
+import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
   EnvironmentId,
   ProjectId,
@@ -6,6 +8,7 @@ import type {
   WorkflowIssueSummary,
   WorkflowSearchMatch,
 } from "@t3tools/contracts";
+import { useNavigate } from "@tanstack/react-router";
 import {
   ChevronDown,
   ChevronRight,
@@ -26,10 +29,14 @@ import {
 } from "react";
 
 import { useEnvironmentQuery } from "~/state/query";
+import { useAtomCommand } from "~/state/use-atom-command";
+import { useProject, useServerConfigs } from "~/state/entities";
 import { workflowEnvironment } from "~/state/workflow";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { cn } from "~/lib/utils";
+import { useRightPanelStore } from "~/rightPanelStore";
+import { buildThreadRouteParams } from "~/threadRoutes";
 import {
   selectWorkflowMapView,
   useWorkflowMapStore,
@@ -51,6 +58,7 @@ import {
   workflowIssueStateLabel,
   workflowSourceLinks,
 } from "./WorkflowPanel.logic";
+import { resolveWorkflowStartSelection } from "./WorkflowStart.logic";
 
 function ChildrenLoader(props: {
   environmentId: EnvironmentId;
@@ -103,9 +111,18 @@ function ChildrenLoader(props: {
 function WorkflowDetails(props: {
   environmentId: EnvironmentId;
   projectId: ProjectId;
+  rootNumber: number;
   issue: WorkflowIssueSummary;
   refreshRequest: number;
 }) {
+  const navigate = useNavigate();
+  const project = useProject(scopeProjectRef(props.environmentId, props.projectId));
+  const serverConfigs = useServerConfigs();
+  const providers = serverConfigs.get(props.environmentId)?.providers ?? [];
+  const startSelection = resolveWorkflowStartSelection(providers, project?.defaultModelSelection);
+  const startWorkflow = useAtomCommand(workflowEnvironment.start, { reportFailure: false });
+  const [startPending, setStartPending] = useState(false);
+  const [startMessage, setStartMessage] = useState<string | null>(null);
   const query = useEnvironmentQuery(
     workflowEnvironment.issueDetail({
       environmentId: props.environmentId,
@@ -136,6 +153,7 @@ function WorkflowDetails(props: {
       </div>
     );
   if (!query.data) return null;
+  const selectedIssue = query.data;
   const seen = new Set(query.data.blockedBy.map((issue) => `${issue.repository}#${issue.number}`));
   const links = workflowSourceLinks(query.data.body).filter((link) => {
     const match = /github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/.exec(link.url);
@@ -146,6 +164,44 @@ function WorkflowDetails(props: {
     return true;
   });
   const evidence = query.data.evidence;
+  const canStart =
+    query.data.readiness?.status === "ready" &&
+    (query.data.kind === "decision" || query.data.labels.includes("wayfinder:task"));
+  const handleStart = async () => {
+    if (startPending || !startSelection.selection) return;
+    setStartPending(true);
+    setStartMessage(null);
+    const result = await startWorkflow({
+      environmentId: props.environmentId,
+      input: {
+        projectId: props.projectId,
+        repository: selectedIssue.repository,
+        rootNumber: props.rootNumber,
+        issueNumber: selectedIssue.number,
+        modelSelection: startSelection.selection,
+      },
+    });
+    setStartPending(false);
+    if (result._tag === "Failure") {
+      const failure = squashAtomCommandFailure(result);
+      setStartMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Decision work could not start. Refresh Workflow and try again.",
+      );
+      return;
+    }
+    if (result.value.status === "held") {
+      setStartMessage(result.value.message);
+      return;
+    }
+    const threadRef = scopeThreadRef(result.value.environmentId, result.value.threadId);
+    useRightPanelStore.getState().open(threadRef, "workflow");
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: buildThreadRouteParams(threadRef),
+    });
+  };
   return (
     <article
       className="grid gap-3 border-t border-border p-3"
@@ -173,6 +229,32 @@ function WorkflowDetails(props: {
       <p className="whitespace-pre-wrap text-muted-foreground text-xs leading-relaxed">
         {workflowIssueBrief(query.data) ?? "No description provided."}
       </p>
+      {canStart ? (
+        <section aria-label="Start workflow decision">
+          <Button
+            size="sm"
+            disabled={startPending || startSelection.selection === null}
+            onClick={() => void handleStart()}
+          >
+            {startPending ? "Starting…" : "Start"}
+          </Button>
+          {(startMessage ?? startSelection.message) ? (
+            <p
+              className={cn(
+                "mt-1 text-xs",
+                startMessage ? "text-destructive" : "text-muted-foreground",
+              )}
+              role={startMessage ? "alert" : undefined}
+            >
+              {startMessage ?? startSelection.message}
+            </p>
+          ) : (
+            <p className="mt-1 text-muted-foreground text-xs">
+              Claims this issue and starts Codex with its required Wayfinder skills.
+            </p>
+          )}
+        </section>
+      ) : null}
       {query.data.readiness ? (
         <section aria-label="Readiness evidence">
           <h3 className="font-medium text-xs">Readiness · {workflowIssueStateLabel(query.data)}</h3>
@@ -1010,6 +1092,7 @@ export function WorkflowFocusedMap(props: {
           <WorkflowDetails
             environmentId={props.environmentId}
             projectId={props.projectId}
+            rootNumber={props.root.number}
             issue={selected}
             refreshRequest={refreshRequest}
           />

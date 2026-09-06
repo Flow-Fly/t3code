@@ -121,6 +121,22 @@ describe("ProviderSessionStartInput", () => {
 });
 
 describe("ProviderSendTurnInput", () => {
+  it("accepts explicit skill inputs", () => {
+    const parsed = decodeProviderSendTurnInput({
+      threadId: "thread-1",
+      input: "Investigate the decision",
+      skills: [
+        { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+        { name: "research", path: "/skills/research/SKILL.md" },
+      ],
+    });
+
+    expect(parsed.skills).toEqual([
+      { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+      { name: "research", path: "/skills/research/SKILL.md" },
+    ]);
+  });
+
   it("accepts codex modelSelection", () => {
     const parsed = decodeProviderSendTurnInput({
       threadId: "thread-1",

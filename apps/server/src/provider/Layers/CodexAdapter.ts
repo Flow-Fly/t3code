@@ -2468,6 +2468,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     return yield* session.runtime
       .sendTurn({
         ...(input.input !== undefined ? { input: input.input } : {}),
+        ...(input.skills !== undefined ? { skills: input.skills } : {}),
         ...(input.modelSelection?.instanceId === boundInstanceId
           ? { model: input.modelSelection.model }
           : {}),

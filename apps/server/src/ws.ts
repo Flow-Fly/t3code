@@ -87,6 +87,7 @@ import {
   cleanupFailedUploadedAttachments,
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
+import { dispatchCreatedThreadTurnStart } from "./orchestration/dispatchCreatedThreadTurnStart.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
@@ -116,6 +117,7 @@ import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkflowService from "./workflow/WorkflowService.ts";
 import * as WorkflowAdoptionService from "./workflow/WorkflowAdoptionService.ts";
+import * as WorkflowStartService from "./workflow/WorkflowStartService.ts";
 import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
@@ -532,6 +534,7 @@ const makeWsRpcLayer = (
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const workflow = yield* WorkflowService.WorkflowService;
       const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const workflowStart = yield* WorkflowStartService.WorkflowStartService;
       const canReplayPersistedRange = Effect.fnUntraced(function* (
         afterSequence: number,
         headSequence: number,
@@ -1091,6 +1094,29 @@ const makeWsRpcLayer = (
             });
 
           const bootstrapProgram = Effect.gen(function* () {
+            if (
+              bootstrap?.createThread &&
+              !bootstrap.prepareWorktree &&
+              !bootstrap.runSetupScript
+            ) {
+              return yield* dispatchCreatedThreadTurnStart({
+                command: command as typeof command & {
+                  readonly bootstrap: { readonly createThread: typeof bootstrap.createThread };
+                },
+                createCommandId: serverCommandId("bootstrap-thread-create"),
+                dispatch: (bootstrapCommand) =>
+                  dispatchFromClient(bootstrapCommand).pipe(
+                    Effect.mapError((error) =>
+                      toDispatchCommandError(error, "Failed to dispatch bootstrap command."),
+                    ),
+                  ),
+                drainThreadDeletionThrough: (sequence) =>
+                  threadDeletionReactor.drainThrough(sequence),
+                markThreadCreated: Effect.sync(() => {
+                  createdThread = true;
+                }),
+              });
+            }
             if (bootstrap?.createThread) {
               const created = yield* dispatchFromClient({
                 type: "thread.create",
@@ -2129,6 +2155,12 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowLocate, workflow.locate(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowStart]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.workflowStart,
+            workflowStart.start(input, dispatchNormalizedCommand),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.workflowAdoptionPreview]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionPreview, workflowAdoption.preview(input), {
             "rpc.aggregate": "workflow",
@@ -2931,6 +2963,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
     const pullRequests = yield* PullRequestService.PullRequestService;
     const workflow = yield* WorkflowService.WorkflowService;
     const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+    const workflowStart = yield* WorkflowStartService.WorkflowStartService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -2974,6 +3007,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               Layer.provide(Layer.succeed(WorkflowService.WorkflowService, workflow)),
               Layer.provide(
                 Layer.succeed(WorkflowAdoptionService.WorkflowAdoptionService, workflowAdoption),
+              ),
+              Layer.provide(
+                Layer.succeed(WorkflowStartService.WorkflowStartService, workflowStart),
               ),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(

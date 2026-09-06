@@ -17,7 +17,7 @@ import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -457,14 +457,16 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
+    const receiptQueue = yield* tryRuntimePromise("subscribe to runtime receipts", () =>
+      runtime.runPromise(
+        Stream.toQueue(runtimeReceiptBus.streamEventsForTest, { capacity: "unbounded" }).pipe(
+          Scope.provide(scope),
+        ),
+      ),
+    ).pipe(Effect.orDie);
     yield* tryRuntimePromise("start OrchestrationReactor", () =>
       runtime.runPromise(reactor.start().pipe(Scope.provide(scope))),
     ).pipe(Effect.orDie);
-    const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
-    yield* Stream.runForEach(runtimeReceiptBus.streamEventsForTest, (receipt) =>
-      Ref.update(receiptHistory, (history) => [...history, receipt]).pipe(Effect.asVoid),
-    ).pipe(Effect.forkIn(scope));
-    yield* Effect.sleep(10);
 
     const waitForThread: OrchestrationIntegrationHarness["waitForThread"] = (
       threadId,
@@ -547,15 +549,16 @@ export const makeOrchestrationIntegrationHarness = (
       predicate: (receipt: OrchestrationRuntimeReceipt) => boolean,
       timeoutMs?: number,
     ) {
-      const readMatchingReceipt = Ref.get(receiptHistory).pipe(
-        Effect.map((history) => history.find(predicate)),
-      );
-
-      return waitFor(
-        readMatchingReceipt,
-        (receipt): receipt is OrchestrationRuntimeReceipt => receipt !== undefined,
-        "runtime receipt",
-        timeoutMs,
+      return Effect.gen(function* () {
+        while (true) {
+          const receipt = yield* Queue.take(receiptQueue).pipe(Effect.orDie);
+          if (predicate(receipt)) return receipt;
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: `${timeoutMs ?? 40_000} millis`,
+          orElse: () => Effect.die(new WaitForTimeoutError({ description: "runtime receipt" })),
+        }),
       );
     }
 

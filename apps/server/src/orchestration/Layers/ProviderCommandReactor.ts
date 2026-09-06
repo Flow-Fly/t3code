@@ -842,6 +842,7 @@ const make = Effect.gen(function* () {
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
+    readonly skills?: ReadonlyArray<{ readonly name: string; readonly path: string }>;
     readonly interactionMode?: "default" | "plan";
     readonly createdAt: string;
   }) {
@@ -892,6 +893,7 @@ const make = Effect.gen(function* () {
       threadId: input.threadId,
       ...(normalizedInput ? { input: normalizedInput } : {}),
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
+      ...(input.skills !== undefined ? { skills: input.skills } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
     };
@@ -1428,6 +1430,7 @@ const make = Effect.gen(function* () {
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
         : {}),
+      ...(event.payload.skills !== undefined ? { skills: event.payload.skills } : {}),
       interactionMode: event.payload.interactionMode,
       createdAt: event.payload.createdAt,
     }).pipe(

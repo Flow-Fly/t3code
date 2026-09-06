@@ -320,6 +320,10 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
             { id: "reasoningEffort", value: "high" },
             { id: "fastMode", value: true },
           ]),
+          skills: [
+            { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+            { name: "research", path: "/skills/research/SKILL.md" },
+          ],
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "approval-required",
           createdAt: now,
@@ -345,6 +349,10 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           { id: "fastMode", value: true },
         ]),
         runtimeMode: "approval-required",
+        skills: [
+          { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
+          { name: "research", path: "/skills/research/SKILL.md" },
+        ],
       });
     }),
   );

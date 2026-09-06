@@ -43,6 +43,7 @@ import * as Semaphore from "effect/Semaphore";
 import { ServerConfig } from "../../config.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import { ProviderRegistry, type ProviderRegistryShape } from "../Services/ProviderRegistry.ts";
+import { ProviderDriverError } from "../Errors.ts";
 import {
   hydrateCachedProvider,
   isCachedProviderCorrelated,
@@ -827,6 +828,36 @@ export const ProviderRegistryLive = Layer.effect(
       );
     });
 
+    const probeWorkspaceSnapshot = Effect.fn("probeWorkspaceSnapshot")(function* (input: {
+      readonly instanceId: ProviderInstanceId;
+      readonly cwd: string;
+    }) {
+      const instance = yield* instanceRegistry.getInstance(input.instanceId);
+      if (!instance?.snapshotForCwd) return undefined;
+      const scopedSnapshot = yield* instance.snapshotForCwd(input.cwd);
+      const currentInstance = yield* instanceRegistry.getInstance(input.instanceId);
+      if (currentInstance !== instance) {
+        return yield* new ProviderDriverError({
+          driver: instance.driverKind,
+          instanceId: input.instanceId,
+          detail: "Provider instance changed during workspace discovery.",
+        });
+      }
+      if (scopedSnapshot.status === "error") return scopedSnapshot;
+      const [previousProviders, nextProviders] = yield* Ref.modify(providersRef, (providers) => {
+        const next = providers.map((provider) =>
+          provider.instanceId === input.instanceId
+            ? upsertProviderWorkspaceSnapshot(provider, input.cwd, scopedSnapshot)
+            : provider,
+        );
+        return [[providers, next] as const, next];
+      });
+      if (haveProvidersChanged(previousProviders, nextProviders)) {
+        yield* PubSub.publish(changesPubSub, nextProviders);
+      }
+      return scopedSnapshot;
+    });
+
     return {
       getProviders: Ref.get(providersRef),
       refresh: (provider?: ProviderDriverKind) =>
@@ -835,6 +866,7 @@ export const ProviderRegistryLive = Layer.effect(
         refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshWorkspaceSnapshot: (input) =>
         refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
+      probeWorkspaceSnapshot,
       getProviderMaintenanceCapabilitiesForInstance,
       setProviderMaintenanceActionState,
       get streamChanges() {

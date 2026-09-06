@@ -5,6 +5,7 @@ import {
   ProviderRuntimeEvent,
   RuntimeSessionId,
   ProviderSession,
+  type ProviderSendTurnInput,
   ProviderTurnStartResult,
   ThreadId,
   TurnId,
@@ -187,6 +188,7 @@ export interface TestProviderAdapterHarness {
     response: TestTurnResponse,
   ) => Effect.Effect<void, never>;
   readonly getStartCount: () => number;
+  readonly getTurnInputs: () => ReadonlyArray<ProviderSendTurnInput>;
   readonly getRollbackCalls: (threadId: ThreadId) => ReadonlyArray<number>;
   readonly getInterruptCalls: (threadId: ThreadId) => ReadonlyArray<TurnId | undefined>;
   readonly listActiveSessionIds: () => ReadonlyArray<ThreadId>;
@@ -230,6 +232,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
     let eventCount = 0;
     const sessions = new Map<ThreadId, SessionState>();
     const queuedResponsesForNextSession: TestTurnResponse[] = [];
+    const turnInputs: ProviderSendTurnInput[] = [];
     const interruptCallsBySession = new Map<ThreadId, Array<TurnId | undefined>>();
     const approvalResponsesBySession = new Map<
       ThreadId,
@@ -294,6 +297,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         if (!state) {
           return yield* missingSessionEffect(provider, input.threadId);
         }
+        turnInputs.push(input);
 
         state.turnCount += 1;
         const turnCount = state.turnCount;
@@ -528,6 +532,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
     };
 
     const getStartCount = (): number => sessionCount;
+    const getTurnInputs = (): ReadonlyArray<ProviderSendTurnInput> => [...turnInputs];
 
     const getInterruptCalls = (threadId: ThreadId): ReadonlyArray<TurnId | undefined> => {
       const calls = interruptCallsBySession.get(threadId);
@@ -560,6 +565,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       queueTurnResponse,
       queueTurnResponseForNextSession,
       getStartCount,
+      getTurnInputs,
       getRollbackCalls,
       getInterruptCalls,
       listActiveSessionIds,

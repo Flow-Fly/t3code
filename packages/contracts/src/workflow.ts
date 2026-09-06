@@ -1,6 +1,14 @@
 import * as Schema from "effect/Schema";
 
-import { PositiveInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  EnvironmentId,
+  IsoDateTime,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+import { ModelSelection } from "./orchestration.ts";
 
 export const WorkflowIssueKind = Schema.Literals([
   "map",
@@ -254,6 +262,57 @@ export type WorkflowLocateInput = typeof WorkflowLocateInput.Type;
 
 export const WorkflowLocateResult = WorkflowSearchMatch;
 export type WorkflowLocateResult = typeof WorkflowLocateResult.Type;
+
+export const WorkflowStartInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  modelSelection: ModelSelection,
+});
+export type WorkflowStartInput = typeof WorkflowStartInput.Type;
+
+export const WorkflowStartAttemptStatus = Schema.Literals(["submitted", "held"]);
+export type WorkflowStartAttemptStatus = typeof WorkflowStartAttemptStatus.Type;
+
+export const WorkflowStartResult = Schema.Struct({
+  disposition: Schema.Literals(["started", "existing", "held"]),
+  attemptId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  phase: Schema.Literal("decision"),
+  threadId: ThreadId,
+  status: WorkflowStartAttemptStatus,
+  createdAt: IsoDateTime,
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowStartResult = typeof WorkflowStartResult.Type;
+
+export const WorkflowStartFailure = Schema.Literals([
+  "not-ready",
+  "unsupported-issue",
+  "workspace-unavailable",
+  "provider-unavailable",
+  "model-unavailable",
+  "effort-required",
+  "skill-unavailable",
+  "claim-failed",
+  "persistence-failed",
+  "dispatch-failed",
+]);
+export type WorkflowStartFailure = typeof WorkflowStartFailure.Type;
+
+export class WorkflowStartError extends Schema.TaggedErrorClass<WorkflowStartError>()(
+  "WorkflowStartError",
+  {
+    failure: WorkflowStartFailure,
+    message: TrimmedNonEmptyString,
+    detail: Schema.optional(TrimmedNonEmptyString),
+  },
+) {}
 
 export const WorkflowAdoptionRelationship = Schema.Struct({
   issueNumber: PositiveInt,

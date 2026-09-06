@@ -1450,6 +1450,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             );
             yield* registry.refreshWorkspaceSnapshot({ instanceId, cwd: "/workspace" });
             assert.strictEqual(yield* Ref.get(snapshotCalls), 2);
+            assert.deepStrictEqual(
+              yield* registry.probeWorkspaceSnapshot({ instanceId, cwd: "/workspace" }),
+              scopedProvider,
+            );
+            assert.strictEqual(yield* Ref.get(snapshotCalls), 3);
 
             yield* Ref.set(instancesRef, [rebuiltInstance]);
             yield* PubSub.publish(registryChanges, undefined);

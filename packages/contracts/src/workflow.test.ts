@@ -7,9 +7,45 @@ import {
   WorkflowIssueSummary,
   WorkflowRepositoriesResult,
   WorkflowRootsInput,
+  WorkflowStartInput,
+  WorkflowStartResult,
 } from "./workflow.ts";
 
+const decodeWorkflowStartInput = Schema.decodeUnknownSync(WorkflowStartInput);
+const decodeWorkflowStartResult = Schema.decodeUnknownSync(WorkflowStartResult);
+
 describe("workflow contracts", () => {
+  it("carries the explicit environment model choice and durable start identity", () => {
+    const input = decodeWorkflowStartInput({
+      projectId: "project-1",
+      repository: "Flow-Fly/t3code",
+      rootNumber: 10,
+      issueNumber: 15,
+      modelSelection: {
+        instanceId: "codex-workflow",
+        model: "gpt-6-astra",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+    });
+    const result = decodeWorkflowStartResult({
+      disposition: "started",
+      attemptId: "attempt-15",
+      environmentId: "environment-1",
+      projectId: input.projectId,
+      repository: input.repository,
+      rootNumber: input.rootNumber,
+      issueNumber: input.issueNumber,
+      phase: "decision",
+      threadId: "thread-15",
+      status: "submitted",
+      createdAt: "2026-09-06T10:00:00.000Z",
+      message: "Decision work started.",
+    });
+
+    expect(input.modelSelection.options).toEqual([{ id: "reasoningEffort", value: "high" }]);
+    expect(result).toMatchObject({ attemptId: "attempt-15", threadId: "thread-15" });
+  });
+
   it("requires an owner and repository separated by one slash", () => {
     const decode = Schema.decodeUnknownSync(WorkflowRootsInput);
 
