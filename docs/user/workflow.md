@@ -28,6 +28,13 @@ recorded but never submitted. A director admits up to ten delivery slices in one
 or failed slices still count, while retries, review, and nested tasks reuse their slice's slot.
 At ten, finish or settle admitted work and wait for a successor before admitting more.
 
+Workflow details show each admitted worker's ticket, write ownership, requested and observed
+model settings, provider state, and reported implementation handoff. An unassociated child or
+unknown/mismatched model remains visible for reconciliation. An idle child has only finished its
+current turn; wait for an explicit handoff with commits and checks before treating its work as
+settled. Write ownership remains reserved until T3 Code has verified settlement, so an overlapping
+ticket stays held even after a worker reports a handoff.
+
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the
 GitHub assignment; it does not stop another agent or make the assignment an atomic lock.

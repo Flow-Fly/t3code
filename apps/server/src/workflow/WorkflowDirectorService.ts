@@ -6,6 +6,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationDispatchCommandError,
   ProjectId,
+  ProviderInstanceId,
   ProviderDriverKind,
   ThreadId,
   WorkflowDirectorError,
@@ -17,6 +18,11 @@ import {
   type WorkflowDirectorStartResult,
   type WorkflowDirectorStatus,
   type WorkflowDirectorStatusInput,
+  type WorkflowWorkerAssociateInput,
+  type WorkflowWorkerHandoffInput,
+  type WorkflowWorkerPrepareInput,
+  type WorkflowWorkerPrepareResult,
+  type WorkflowWorkerStatus,
   type WorkflowEvidenceRecord,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
@@ -49,6 +55,8 @@ import * as WorkflowService from "./WorkflowService.ts";
 const ADMISSION_LIMIT = 10;
 const DIRECTOR_MODEL = "gpt-6-astra";
 const DIRECTOR_EFFORT = "high";
+const WORKER_MODEL = "gpt-5.6-sol";
+const WORKER_EFFORT = "high";
 const REQUIRED_SKILLS = ["implement", "code-review"] as const;
 
 type Dispatch = (
@@ -100,6 +108,35 @@ const AdmissionRow = Schema.Struct({
 });
 type AdmissionRow = typeof AdmissionRow.Type;
 const decodeAdmissionRow = Schema.decodeUnknownEffect(AdmissionRow);
+
+const WorkerRow = Schema.Struct({
+  dispatchId: Schema.NullOr(Schema.String),
+  associationToken: Schema.NullOr(Schema.String),
+  admissionId: Schema.NullOr(Schema.String),
+  ticketNumber: Schema.NullOr(Schema.Number),
+  providerThreadId: Schema.NullOr(Schema.String),
+  parentProviderThreadId: Schema.NullOr(Schema.String),
+  ownership: Schema.NullOr(Schema.String),
+  writePathsJson: Schema.NullOr(Schema.String),
+  requestedModel: Schema.NullOr(Schema.String),
+  requestedEffort: Schema.NullOr(Schema.String),
+  requestedSkillPath: Schema.NullOr(Schema.String),
+  dispatchStatus: Schema.NullOr(Schema.String),
+  providerStatus: Schema.String,
+  observedModel: Schema.NullOr(Schema.String),
+  observedEffort: Schema.NullOr(Schema.String),
+  handoffSummary: Schema.NullOr(Schema.String),
+  handoffCommitsJson: Schema.NullOr(Schema.String),
+  handoffChecksJson: Schema.NullOr(Schema.String),
+  title: Schema.NullOr(Schema.String),
+  role: Schema.NullOr(Schema.String),
+  updatedAt: Schema.String,
+});
+type WorkerRow = typeof WorkerRow.Type;
+const decodeWorkerRow = Schema.decodeUnknownEffect(WorkerRow);
+const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String));
+const decodeStringArrayJson = Schema.decodeUnknownEffect(StringArrayJson);
+const encodeStringArrayJson = Schema.encodeUnknownSync(StringArrayJson);
 
 function directorError(
   failure: WorkflowDirectorError["failure"],
@@ -236,7 +273,8 @@ export function workflowDirectorInstructions(input: {
         `- ${ticket.repository}#${ticket.number} — ${ticket.title}: ${ticket.readiness?.status ?? "unknown"} (${ticket.url})`,
     ),
     "",
-    "Before every ticket admission, use the host admission RPC so readiness, approval, slot and explicit ownership are persisted before delegation.",
+    "Before every implementation delegation, call the host workflow_prepare_worker MCP tool with the durable ticket number, a plain ownership summary, and exact repository-relative write paths. It persists readiness, admission, slot and ownership before returning native spawn instructions.",
+    "After native spawn, call workflow_associate_worker with the returned token and exact child provider thread id. When the child returns, call workflow_report_worker_handoff with its result, commits and checks. Provider idle or a finished turn is not a handoff, ticket resolution or proof that descendants settled.",
     `This batch admits at most ${ADMISSION_LIMIT} distinct delivery slices. Failed or blocked admitted slices keep their slot; retry and review reuse it; nested tasks reuse their parent slice. At the limit, stop new admissions, finish or settle admitted work, and wait for a successor.`,
     "Re-read live tracker state before each admission. Do not infer approval from labels, assignment, closure, silence or unavailable evidence.",
     "GitHub assignment is observational and is not a cross-environment atomic lock.",
@@ -261,6 +299,24 @@ export class WorkflowDirectorService extends Context.Service<
     readonly admit: (
       input: WorkflowDirectorAdmissionInput,
     ) => Effect.Effect<WorkflowDirectorAdmissionResult, WorkflowQueryError | WorkflowDirectorError>;
+    readonly prepareWorker: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowWorkerPrepareInput,
+    ) => Effect.Effect<WorkflowWorkerPrepareResult, WorkflowQueryError | WorkflowDirectorError>;
+    readonly associateWorker: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowWorkerAssociateInput,
+    ) => Effect.Effect<WorkflowWorkerStatus, WorkflowDirectorError>;
+    readonly reportWorkerHandoff: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowWorkerHandoffInput,
+    ) => Effect.Effect<WorkflowWorkerStatus, WorkflowDirectorError>;
   }
 >()("t3/workflow/WorkflowDirectorService") {}
 
@@ -278,6 +334,10 @@ export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const lock = yield* Semaphore.make(1);
+  const persistence = <A, E, R>(effect: Effect.Effect<A, E, R>, message: string) =>
+    effect.pipe(
+      Effect.mapError((error) => directorError("persistence-failed", message, String(error))),
+    );
 
   const selectedProject = Effect.fn("WorkflowDirectorService.selectedProject")(function* (
     projectId: ProjectId,
@@ -302,7 +362,14 @@ export const make = Effect.gen(function* () {
 
   const loadDirectorByCapability = Effect.fn("WorkflowDirectorService.loadDirectorByCapability")(
     function* (input: WorkflowDirectorStatusInput, environmentId: EnvironmentId) {
-      const rows = yield* sql<Record<string, unknown>>`
+      if (!input.capabilityNumber && !input.ticketNumber) {
+        return yield* directorError(
+          "director-not-found",
+          "A capability or admitted ticket identity is required to find its director.",
+        );
+      }
+      const rows = input.capabilityNumber
+        ? yield* sql<Record<string, unknown>>`
       SELECT director_id AS "directorId", batch_id AS "batchId", environment_id AS "environmentId",
         project_id AS "projectId", repository, root_number AS "rootNumber",
         capability_number AS "capabilityNumber", thread_id AS "threadId", command_id AS "commandId",
@@ -317,14 +384,39 @@ export const make = Effect.gen(function* () {
         AND capability_number = ${input.capabilityNumber} AND is_current = 1
       LIMIT 1
     `.pipe(
-        Effect.mapError((error) =>
-          directorError(
-            "persistence-failed",
-            "The capability director could not be read.",
-            String(error),
-          ),
-        ),
-      );
+            Effect.mapError((error) =>
+              directorError(
+                "persistence-failed",
+                "The capability director could not be read.",
+                String(error),
+              ),
+            ),
+          )
+        : yield* sql<Record<string, unknown>>`
+      SELECT d.director_id AS "directorId", d.batch_id AS "batchId", d.environment_id AS "environmentId",
+        d.project_id AS "projectId", d.repository, d.root_number AS "rootNumber",
+        d.capability_number AS "capabilityNumber", d.thread_id AS "threadId", d.command_id AS "commandId",
+        d.message_id AS "messageId", d.worktree_path AS "worktreePath", d.worktree_branch AS "worktreeBranch",
+        d.status, d.requested_model AS "requestedModel", d.requested_instance_id AS "requestedInstanceId",
+        d.requested_effort AS "requestedEffort", d.observed_model AS "observedModel",
+        d.observed_effort AS "observedEffort", d.observed_match AS "observedMatch", d.sequence,
+        d.initial_turn_disposition AS "initialTurnDisposition", d.detail,
+        d.created_at AS "createdAt", d.updated_at AS "updatedAt"
+      FROM workflow_directors d
+      JOIN workflow_director_admissions a ON a.director_id = d.director_id
+      WHERE d.environment_id = ${environmentId} AND d.project_id = ${input.projectId}
+        AND d.repository COLLATE NOCASE = ${input.repository} AND d.is_current = 1
+        AND a.ticket_number = ${input.ticketNumber}
+      LIMIT 1
+    `.pipe(
+            Effect.mapError((error) =>
+              directorError(
+                "persistence-failed",
+                "The admitted ticket director could not be read.",
+                String(error),
+              ),
+            ),
+          );
       return rows[0]
         ? yield* decodeDirectorRow(rows[0]).pipe(
             Effect.mapError((error) =>
@@ -877,6 +969,114 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const workerStatusFromRow = Effect.fn("WorkflowDirectorService.workerStatusFromRow")(
+    function* (row: WorkerRow): Effect.fn.Return<WorkflowWorkerStatus, WorkflowDirectorError> {
+      const decode = (value: string) =>
+        decodeStringArrayJson(value).pipe(
+          Effect.mapError((error) =>
+            directorError("persistence-failed", "Worker history JSON is invalid.", String(error)),
+          ),
+        );
+      const writePaths = row.writePathsJson ? yield* decode(row.writePathsJson) : [];
+      const commits = row.handoffCommitsJson ? yield* decode(row.handoffCommitsJson) : [];
+      const checks = row.handoffChecksJson ? yield* decode(row.handoffChecksJson) : [];
+      const match =
+        !row.requestedModel || !row.observedModel || !row.requestedEffort || !row.observedEffort
+          ? "unknown"
+          : row.requestedModel === row.observedModel && row.requestedEffort === row.observedEffort
+            ? "match"
+            : "mismatch";
+      const outcome = row.dispatchStatus?.startsWith("reported-")
+        ? (row.dispatchStatus.slice("reported-".length) as "succeeded" | "failed")
+        : row.dispatchStatus === "unconfirmed"
+          ? "unconfirmed"
+          : null;
+      return {
+        dispatchId: row.dispatchId,
+        admissionId: row.admissionId,
+        ticketNumber: row.ticketNumber,
+        providerThreadId: row.providerThreadId,
+        parentProviderThreadId: row.parentProviderThreadId,
+        ownership: row.ownership,
+        writePaths,
+        association: row.dispatchId
+          ? row.providerThreadId
+            ? "associated"
+            : "unconfirmed"
+          : "unassociated",
+        providerStatus: row.providerStatus,
+        requestedProfile:
+          row.requestedModel && row.requestedEffort && row.requestedSkillPath
+            ? {
+                model: row.requestedModel,
+                effort: row.requestedEffort,
+                skillPath: row.requestedSkillPath,
+              }
+            : null,
+        observedProfile: {
+          model: row.observedModel,
+          effort: row.observedEffort,
+          match,
+        },
+        handoff:
+          outcome && row.handoffSummary
+            ? { outcome, summary: row.handoffSummary, commits, checks }
+            : null,
+        title: row.title,
+        role: row.role,
+        updatedAt: row.updatedAt,
+      };
+    },
+    Effect.mapError((error) =>
+      directorError("persistence-failed", "A worker history record is invalid.", String(error)),
+    ),
+  );
+
+  const workers = Effect.fn("WorkflowDirectorService.workers")(function* (directorId: string) {
+    const rows = yield* sql<Record<string, unknown>>`
+      SELECT d.dispatch_id AS "dispatchId", d.association_token AS "associationToken",
+        d.admission_id AS "admissionId", d.ticket_number AS "ticketNumber",
+        o.provider_thread_id AS "providerThreadId", o.parent_provider_thread_id AS "parentProviderThreadId",
+        d.ownership, d.write_paths_json AS "writePathsJson", d.requested_model AS "requestedModel",
+        d.requested_effort AS "requestedEffort", d.requested_skill_path AS "requestedSkillPath",
+        d.status AS "dispatchStatus", COALESCE(o.provider_status, 'unconfirmed') AS "providerStatus",
+        o.observed_model AS "observedModel", o.observed_effort AS "observedEffort",
+        d.handoff_summary AS "handoffSummary", d.handoff_commits_json AS "handoffCommitsJson",
+        d.handoff_checks_json AS "handoffChecksJson", o.title, o.role,
+        COALESCE(o.updated_at, d.updated_at) AS "updatedAt"
+      FROM workflow_worker_dispatches d
+      LEFT JOIN workflow_worker_observations o
+        ON o.director_id = d.director_id AND o.provider_thread_id = d.provider_thread_id
+      WHERE d.director_id = ${directorId}
+      UNION ALL
+      SELECT NULL AS "dispatchId", NULL AS "associationToken", NULL AS "admissionId",
+        NULL AS "ticketNumber", o.provider_thread_id AS "providerThreadId",
+        o.parent_provider_thread_id AS "parentProviderThreadId", NULL AS ownership,
+        NULL AS "writePathsJson", NULL AS "requestedModel", NULL AS "requestedEffort",
+        NULL AS "requestedSkillPath", NULL AS "dispatchStatus", o.provider_status AS "providerStatus",
+        o.observed_model AS "observedModel", o.observed_effort AS "observedEffort",
+        NULL AS "handoffSummary", NULL AS "handoffCommitsJson", NULL AS "handoffChecksJson",
+        o.title, o.role, o.updated_at AS "updatedAt"
+      FROM workflow_worker_observations o
+      WHERE o.director_id = ${directorId}
+        AND NOT EXISTS (
+          SELECT 1 FROM workflow_worker_dispatches d
+          WHERE d.director_id = o.director_id AND d.provider_thread_id = o.provider_thread_id
+        )
+      ORDER BY "updatedAt"
+    `.pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "Worker history could not be read.", String(error)),
+      ),
+    );
+    const decoded = yield* Effect.forEach(rows, (row) => decodeWorkerRow(row)).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "A worker history row is invalid.", String(error)),
+      ),
+    );
+    return yield* Effect.forEach(decoded, (row) => workerStatusFromRow(row));
+  });
+
   const reconcileDirector = Effect.fn("WorkflowDirectorService.reconcileDirector")(function* (
     row: DirectorRow,
   ) {
@@ -1006,6 +1206,7 @@ export const make = Effect.gen(function* () {
       },
       admissionCount,
       admissionLimit: ADMISSION_LIMIT,
+      workers: yield* workers(row.directorId),
       observation,
       actions,
       createdAt: row.createdAt,
@@ -1834,11 +2035,369 @@ export const make = Effect.gen(function* () {
     } satisfies WorkflowDirectorAdmissionResult;
   });
 
+  const directorForMcpScope = Effect.fn("WorkflowDirectorService.directorForMcpScope")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT director_id AS "directorId", batch_id AS "batchId", environment_id AS "environmentId",
+          project_id AS "projectId", repository, root_number AS "rootNumber",
+          capability_number AS "capabilityNumber", thread_id AS "threadId", command_id AS "commandId",
+          message_id AS "messageId", worktree_path AS "worktreePath", worktree_branch AS "worktreeBranch",
+          status, requested_model AS "requestedModel", requested_instance_id AS "requestedInstanceId",
+          requested_effort AS "requestedEffort", observed_model AS "observedModel",
+          observed_effort AS "observedEffort", observed_match AS "observedMatch", sequence,
+          initial_turn_disposition AS "initialTurnDisposition", detail,
+          created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM workflow_directors
+        WHERE environment_id = ${environmentId} AND thread_id = ${threadId} AND is_current = 1
+        LIMIT 1
+      `,
+      "The scoped capability director could not be read.",
+    );
+    if (!rows[0]) {
+      return yield* directorError(
+        "director-not-found",
+        "Workflow worker tools are available only to the current capability director thread.",
+      );
+    }
+    const row = yield* decodeDirectorRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "The scoped director record is invalid.",
+          String(error),
+        ),
+      ),
+    );
+    if (row.requestedInstanceId !== providerInstanceId) {
+      return yield* directorError(
+        "provider-unavailable",
+        "This MCP session does not use the Codex provider recorded for the capability director.",
+      );
+    }
+    return row;
+  });
+
+  const normalizeWritePaths = Effect.fn("WorkflowDirectorService.normalizeWritePaths")(function* (
+    paths: ReadonlyArray<string>,
+  ) {
+    const normalized = [
+      ...new Set(
+        paths.map((entry) =>
+          path
+            .normalize(entry.trim().replaceAll("\\", "/"))
+            .replaceAll("\\", "/")
+            .replace(/^\.\//u, "")
+            .replace(/\/+$/u, ""),
+        ),
+      ),
+    ];
+    if (
+      normalized.length === 0 ||
+      normalized.some(
+        (entry) =>
+          entry.length === 0 ||
+          entry === "." ||
+          path.isAbsolute(entry) ||
+          entry === ".." ||
+          entry.startsWith("../"),
+      )
+    ) {
+      return yield* directorError(
+        "not-ready",
+        "Write ownership requires one or more repository-relative file or directory paths.",
+      );
+    }
+    return normalized;
+  });
+
+  const pathsOverlap = (left: string, right: string) =>
+    left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+
+  const workerPreflight = Effect.fn("WorkflowDirectorService.workerPreflight")(function* (
+    row: DirectorRow,
+  ) {
+    const provider = yield* providerRegistry
+      .probeWorkspaceSnapshot({
+        instanceId:
+          row.requestedInstanceId as WorkflowDirectorStartInput["modelSelection"]["instanceId"],
+        cwd: row.worktreePath,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError("provider-unavailable", "Worker provider preflight failed.", String(error)),
+        ),
+      );
+    const workerModel = provider?.models.find((model) => model.slug === WORKER_MODEL);
+    const effort = workerModel?.capabilities?.optionDescriptors?.find(
+      (descriptor) => descriptor.id === "reasoningEffort",
+    );
+    const implementSkills = provider?.skills.filter(
+      (skill) => skill.name === "implement" && skill.enabled,
+    );
+    if (
+      provider?.driver !== ProviderDriverKind.make("codex") ||
+      !workerModel ||
+      effort?.type !== "select" ||
+      !effort.options.some((option) => option.id === WORKER_EFFORT) ||
+      implementSkills?.length !== 1
+    ) {
+      return yield* directorError(
+        "provider-unavailable",
+        "The requested Sol/high worker and one enabled implement skill must pass preflight before dispatch.",
+      );
+    }
+    return { skillPath: implementSkills[0]!.path };
+  });
+
+  const prepareWorkerUnlocked = Effect.fn("WorkflowDirectorService.prepareWorker")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowWorkerPrepareInput,
+  ) {
+    const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    const writePaths = yield* normalizeWritePaths(input.writePaths);
+    const activeRows = yield* persistence(
+      sql<{ readonly ticketNumber: number; readonly paths: string }>`
+      SELECT ticket_number AS "ticketNumber", write_paths_json AS paths
+      FROM workflow_worker_dispatches
+      WHERE director_id = ${row.directorId}
+    `,
+      "Worker ownership could not be read.",
+    );
+    for (const active of activeRows) {
+      if (active.ticketNumber === input.ticketNumber) continue;
+      const activePaths = yield* decodeStringArrayJson(active.paths).pipe(
+        Effect.mapError((error) =>
+          directorError("persistence-failed", "Stored worker ownership is invalid.", String(error)),
+        ),
+      );
+      const overlap = writePaths.find((candidate) =>
+        activePaths.some((owned) => pathsOverlap(candidate, owned)),
+      );
+      if (overlap) {
+        return yield* directorError(
+          "not-ready",
+          "Worker write ownership overlaps unsettled work.",
+          `${overlap} overlaps ticket #${active.ticketNumber}.`,
+        );
+      }
+    }
+
+    const { skillPath } = yield* workerPreflight(row);
+
+    const existingAdmission = (yield* admissions(row.directorId)).find(
+      (admission) => admission.ticketNumber === input.ticketNumber,
+    );
+    const admissionResult = yield* admitUnlocked({
+      projectId: ProjectId.make(row.projectId),
+      directorId: row.directorId,
+      repository: row.repository as WorkflowDirectorAdmissionInput["repository"],
+      ticketNumber: input.ticketNumber,
+      ...(input.parentTicketNumber ? { parentTicketNumber: input.parentTicketNumber } : {}),
+      purpose: existingAdmission ? "retry" : "implement",
+      ownership: input.ownership,
+    });
+    const admission = admissionResult.admission;
+    if (!admission || admission.claimStatus !== "confirmed") {
+      return yield* directorError(
+        "claim-failed",
+        "Ticket ownership is not confirmed, so child dispatch is held.",
+        admissionResult.message,
+      );
+    }
+    const existingRows = yield* persistence(
+      sql<Record<string, unknown>>`
+      SELECT d.dispatch_id AS "dispatchId", d.association_token AS "associationToken",
+        d.admission_id AS "admissionId", d.ticket_number AS "ticketNumber",
+        d.provider_thread_id AS "providerThreadId", NULL AS "parentProviderThreadId",
+        d.ownership, d.write_paths_json AS "writePathsJson", d.requested_model AS "requestedModel",
+        d.requested_effort AS "requestedEffort", d.requested_skill_path AS "requestedSkillPath",
+        d.status AS "dispatchStatus", 'unconfirmed' AS "providerStatus", NULL AS "observedModel",
+        NULL AS "observedEffort", d.handoff_summary AS "handoffSummary",
+        d.handoff_commits_json AS "handoffCommitsJson", d.handoff_checks_json AS "handoffChecksJson",
+        NULL AS title, NULL AS role, d.updated_at AS "updatedAt"
+      FROM workflow_worker_dispatches d
+      WHERE d.director_id = ${row.directorId} AND d.admission_id = ${admission.admissionId}
+      ORDER BY d.created_at DESC LIMIT 1
+    `,
+      "Prepared worker dispatches could not be read.",
+    );
+    if (existingRows[0]) {
+      const existing = yield* decodeWorkerRow(existingRows[0]).pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "persistence-failed",
+            "The prepared worker dispatch is invalid.",
+            String(error),
+          ),
+        ),
+      );
+      return {
+        dispatchId: existing.dispatchId!,
+        associationToken: existing.associationToken!,
+        admission,
+        requestedProfile: {
+          model: existing.requestedModel!,
+          effort: existing.requestedEffort!,
+          skillPath: existing.requestedSkillPath!,
+        },
+        taskName: `ticket-${admission.ticketNumber}-${existing.dispatchId!.slice(0, 8)}`,
+        instructions:
+          "A worker dispatch is already unconfirmed. Reconcile or associate its observed child before spawning another child.",
+        disposition: "existing-unconfirmed",
+      } satisfies WorkflowWorkerPrepareResult;
+    }
+
+    const dispatchId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const associationToken = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const createdAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql`
+      INSERT INTO workflow_worker_dispatches (
+        dispatch_id, association_token, director_id, batch_id, admission_id, repository,
+        ticket_number, ownership, write_paths_json, requested_model, requested_effort,
+        requested_skill_path, status, created_at, updated_at
+      ) VALUES (
+        ${dispatchId}, ${associationToken}, ${row.directorId}, ${row.batchId},
+        ${admission.admissionId}, ${row.repository}, ${admission.ticketNumber}, ${input.ownership},
+        ${encodeStringArrayJson(writePaths)}, ${WORKER_MODEL}, ${WORKER_EFFORT}, ${skillPath},
+        'prepared', ${createdAt}, ${createdAt}
+      )
+    `,
+      "The prepared worker dispatch could not be saved.",
+    );
+    const taskName = `ticket-${admission.ticketNumber}-${dispatchId.slice(0, 8)}`;
+    return {
+      dispatchId,
+      associationToken,
+      admission,
+      requestedProfile: { model: WORKER_MODEL, effort: WORKER_EFFORT, skillPath },
+      taskName,
+      instructions: [
+        `Spawn one worker for ${row.repository}#${admission.ticketNumber} in ${row.worktreePath}.`,
+        `Use model ${WORKER_MODEL}, reasoning effort ${WORKER_EFFORT}, and $implement at ${skillPath}.`,
+        `Task name: ${taskName}.`,
+        `Write ownership: ${input.ownership}. Paths: ${writePaths.join(", ")}.`,
+        `Tell the worker it is not alone in the shared capability worktree and must preserve others' edits.`,
+        `After the native spawn returns its child thread id, call workflow_associate_worker with token ${associationToken}.`,
+      ].join("\n"),
+      disposition: "prepared",
+    } satisfies WorkflowWorkerPrepareResult;
+  });
+
+  const associateWorkerUnlocked = Effect.fn("WorkflowDirectorService.associateWorker")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowWorkerAssociateInput,
+  ) {
+    const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    const observed = yield* persistence(
+      sql<{ readonly providerThreadId: string }>`
+      SELECT provider_thread_id AS "providerThreadId" FROM workflow_worker_observations
+      WHERE director_id = ${row.directorId} AND provider_thread_id = ${input.providerThreadId}
+      LIMIT 1
+    `,
+      "Observed child identity could not be read.",
+    );
+    if (!observed[0]) {
+      return yield* directorError(
+        "not-ready",
+        "The child cannot be associated until its native provider activity is observed under this director.",
+      );
+    }
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql`
+      UPDATE workflow_worker_dispatches SET provider_thread_id = ${input.providerThreadId},
+        status = 'associated', updated_at = ${updatedAt}
+      WHERE director_id = ${row.directorId} AND association_token = ${input.associationToken}
+        AND provider_thread_id IS NULL
+    `,
+      "The worker association could not be saved.",
+    );
+    const association = yield* persistence(
+      sql<{ readonly dispatchId: string }>`
+      SELECT dispatch_id AS "dispatchId" FROM workflow_worker_dispatches
+      WHERE director_id = ${row.directorId} AND association_token = ${input.associationToken}
+        AND provider_thread_id = ${input.providerThreadId}
+      LIMIT 1
+    `,
+      "The worker association could not be confirmed.",
+    );
+    if (!association[0]) {
+      return yield* directorError(
+        "not-ready",
+        "This association token is unknown, already used, or belongs to another director.",
+      );
+    }
+    return (yield* workers(row.directorId)).find(
+      (worker) => worker.providerThreadId === input.providerThreadId,
+    )!;
+  });
+
+  const reportWorkerHandoffUnlocked = Effect.fn("WorkflowDirectorService.reportWorkerHandoff")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowWorkerHandoffInput,
+    ) {
+      const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+      UPDATE workflow_worker_dispatches SET status = ${
+        input.outcome === "unconfirmed" ? "unconfirmed" : `reported-${input.outcome}`
+      }, handoff_summary = ${input.summary}, handoff_commits_json = ${encodeStringArrayJson(input.commits)},
+        handoff_checks_json = ${encodeStringArrayJson(input.checks)}, updated_at = ${updatedAt}
+      WHERE director_id = ${row.directorId} AND provider_thread_id = ${input.providerThreadId}
+    `,
+        "The worker handoff could not be saved.",
+      );
+      const handoff = yield* persistence(
+        sql<{ readonly dispatchId: string }>`
+      SELECT dispatch_id AS "dispatchId" FROM workflow_worker_dispatches
+      WHERE director_id = ${row.directorId} AND provider_thread_id = ${input.providerThreadId}
+        AND handoff_summary = ${input.summary}
+      LIMIT 1
+    `,
+        "The worker handoff could not be confirmed.",
+      );
+      if (!handoff[0]) {
+        return yield* directorError(
+          "not-ready",
+          "Report a handoff only for an explicitly associated worker.",
+        );
+      }
+      return (yield* workers(row.directorId)).find(
+        (worker) => worker.providerThreadId === input.providerThreadId,
+      )!;
+    },
+  );
+
   return WorkflowDirectorService.of({
     start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
     status: (input) => lock.withPermits(1)(statusUnlocked(input)),
     resume: (input, dispatch) => lock.withPermits(1)(resumeUnlocked(input, dispatch)),
     admit: (input) => lock.withPermits(1)(admitUnlocked(input)),
+    prepareWorker: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        prepareWorkerUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    associateWorker: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        associateWorkerUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    reportWorkerHandoff: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        reportWorkerHandoffUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
   });
 });
 

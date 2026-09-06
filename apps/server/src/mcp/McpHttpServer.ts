@@ -22,6 +22,8 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import { WorkflowDirectorToolkitHandlersLive } from "./toolkits/workflow/handlers.ts";
+import { WorkflowDirectorToolkit } from "./toolkits/workflow/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -215,6 +217,14 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
+export const WorkflowDirectorToolkitRegistrationLive = McpServer.toolkit(
+  WorkflowDirectorToolkit,
+).pipe(
+  // MCP advertises a static tool list. Each handler authorizes the bearer-bound
+  // environment, thread, and provider instance against the durable director.
+  Layer.provide(WorkflowDirectorToolkitHandlersLive),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -222,4 +232,7 @@ const McpTransportLive = McpServer.layerHttp({
   protocols: [McpProtocol.v2025_06_18],
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  WorkflowDirectorToolkitRegistrationLive,
+).pipe(Layer.provideMerge(McpTransportLive));

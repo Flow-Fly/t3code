@@ -401,9 +401,50 @@ export type WorkflowDirectorLifecycleStatus = typeof WorkflowDirectorLifecycleSt
 export const WorkflowDirectorStatusInput = Schema.Struct({
   projectId: ProjectId,
   repository: WorkflowRepositoryNameWithOwner,
-  capabilityNumber: PositiveInt,
+  capabilityNumber: Schema.optional(PositiveInt),
+  ticketNumber: Schema.optional(PositiveInt),
 });
 export type WorkflowDirectorStatusInput = typeof WorkflowDirectorStatusInput.Type;
+
+export const WorkflowWorkerRequestedProfile = Schema.Struct({
+  model: TrimmedNonEmptyString,
+  effort: TrimmedNonEmptyString,
+  skillPath: TrimmedNonEmptyString,
+});
+export type WorkflowWorkerRequestedProfile = typeof WorkflowWorkerRequestedProfile.Type;
+
+export const WorkflowWorkerObservedProfile = Schema.Struct({
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  effort: Schema.NullOr(TrimmedNonEmptyString),
+  match: Schema.Literals(["match", "mismatch", "unknown"]),
+});
+export type WorkflowWorkerObservedProfile = typeof WorkflowWorkerObservedProfile.Type;
+
+export const WorkflowWorkerStatus = Schema.Struct({
+  dispatchId: Schema.NullOr(TrimmedNonEmptyString),
+  admissionId: Schema.NullOr(TrimmedNonEmptyString),
+  ticketNumber: Schema.NullOr(PositiveInt),
+  providerThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  parentProviderThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  ownership: Schema.NullOr(TrimmedNonEmptyString),
+  writePaths: Schema.Array(TrimmedNonEmptyString),
+  association: Schema.Literals(["associated", "unassociated", "unconfirmed"]),
+  providerStatus: TrimmedNonEmptyString,
+  requestedProfile: Schema.NullOr(WorkflowWorkerRequestedProfile),
+  observedProfile: WorkflowWorkerObservedProfile,
+  handoff: Schema.NullOr(
+    Schema.Struct({
+      outcome: Schema.Literals(["succeeded", "failed", "unconfirmed"]),
+      summary: TrimmedNonEmptyString,
+      commits: Schema.Array(TrimmedNonEmptyString),
+      checks: Schema.Array(TrimmedNonEmptyString),
+    }),
+  ),
+  title: Schema.NullOr(TrimmedNonEmptyString),
+  role: Schema.NullOr(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+export type WorkflowWorkerStatus = typeof WorkflowWorkerStatus.Type;
 
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
@@ -421,6 +462,7 @@ export const WorkflowDirectorStatus = Schema.Struct({
   observedProfile: WorkflowDirectorObservedProfile,
   admissionCount: Schema.Number,
   admissionLimit: PositiveInt,
+  workers: Schema.Array(WorkflowWorkerStatus),
   observation: TrimmedNonEmptyString,
   actions: Schema.Array(Schema.Literals(["open", "resume", "retry"])),
   createdAt: IsoDateTime,
@@ -436,7 +478,9 @@ export const WorkflowDirectorStartResult = Schema.Struct({
 export type WorkflowDirectorStartResult = typeof WorkflowDirectorStartResult.Type;
 
 export const WorkflowDirectorResumeInput = Schema.Struct({
-  ...WorkflowDirectorStatusInput.fields,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  capabilityNumber: PositiveInt,
   directorId: TrimmedNonEmptyString,
   observation: TrimmedNonEmptyString,
   modelSelection: ModelSelection,
@@ -482,6 +526,40 @@ export const WorkflowDirectorAdmissionResult = Schema.Struct({
   message: TrimmedNonEmptyString,
 });
 export type WorkflowDirectorAdmissionResult = typeof WorkflowDirectorAdmissionResult.Type;
+
+export const WorkflowWorkerPrepareInput = Schema.Struct({
+  ticketNumber: PositiveInt,
+  parentTicketNumber: Schema.optional(PositiveInt),
+  ownership: TrimmedNonEmptyString,
+  writePaths: Schema.Array(TrimmedNonEmptyString),
+});
+export type WorkflowWorkerPrepareInput = typeof WorkflowWorkerPrepareInput.Type;
+
+export const WorkflowWorkerPrepareResult = Schema.Struct({
+  dispatchId: TrimmedNonEmptyString,
+  associationToken: TrimmedNonEmptyString,
+  admission: WorkflowDirectorAdmission,
+  requestedProfile: WorkflowWorkerRequestedProfile,
+  taskName: TrimmedNonEmptyString,
+  instructions: TrimmedNonEmptyString,
+  disposition: Schema.Literals(["prepared", "existing-unconfirmed"]),
+});
+export type WorkflowWorkerPrepareResult = typeof WorkflowWorkerPrepareResult.Type;
+
+export const WorkflowWorkerAssociateInput = Schema.Struct({
+  associationToken: TrimmedNonEmptyString,
+  providerThreadId: TrimmedNonEmptyString,
+});
+export type WorkflowWorkerAssociateInput = typeof WorkflowWorkerAssociateInput.Type;
+
+export const WorkflowWorkerHandoffInput = Schema.Struct({
+  providerThreadId: TrimmedNonEmptyString,
+  outcome: Schema.Literals(["succeeded", "failed", "unconfirmed"]),
+  summary: TrimmedNonEmptyString,
+  commits: Schema.Array(TrimmedNonEmptyString),
+  checks: Schema.Array(TrimmedNonEmptyString),
+});
+export type WorkflowWorkerHandoffInput = typeof WorkflowWorkerHandoffInput.Type;
 
 export const WorkflowDirectorFailure = Schema.Literals([
   "not-ready",

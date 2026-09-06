@@ -51,6 +51,7 @@ import { projectActivityPayload } from "../ActivityPayloadProjection.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { canReplaceThreadTitle } from "../threadTitles.ts";
+import { recordWorkflowWorkerObservation } from "../../workflow/WorkflowWorkerPersistence.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
@@ -2096,6 +2097,13 @@ const make = Effect.gen(function* () {
         if (description) {
           yield* rememberTaskDescription(thread.id, event.payload.taskId, description);
         }
+      }
+      if (
+        event.type === "task.started" ||
+        event.type === "task.updated" ||
+        event.type === "task.completed"
+      ) {
+        yield* recordWorkflowWorkerObservation(event);
       }
       // Working-indicator plan progress: current step while the turn runs,
       // cleared on settle so a finished plan never lingers as stale UI.

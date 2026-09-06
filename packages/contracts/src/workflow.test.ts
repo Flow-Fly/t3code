@@ -53,6 +53,7 @@ describe("workflow contracts", () => {
       observedProfile: { model: null, effort: null, match: "unknown" },
       admissionCount: 1,
       admissionLimit: 10,
+      workers: [],
       observation: "director-17|active|thread-17|1",
       actions: ["open"],
       createdAt: "2026-09-06T10:00:00.000Z",

@@ -1,8 +1,12 @@
 import {
   EnvironmentId,
+  EventId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  type ProviderSession,
+  RuntimeTaskId,
   type OrchestrationCommand,
   type ServerProvider,
   type WorkflowIssueDetail,
@@ -10,24 +14,42 @@ import {
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
+import { ProviderRuntimeIngestionLive } from "../orchestration/Layers/ProviderRuntimeIngestion.ts";
+import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ProviderRuntimeIngestionService } from "../orchestration/Services/ProviderRuntimeIngestion.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../provider/Services/ProviderService.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { workflowDirectorHandlers } from "../mcp/toolkits/workflow/handlers.ts";
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
+import { recordWorkflowWorkerObservation } from "./WorkflowWorkerPersistence.ts";
 import {
   interpretWorkflowEvidence,
   type WorkflowBlockerEvidence,
@@ -71,6 +93,21 @@ function provider(): ServerProvider {
                 { id: "medium", label: "Medium" },
                 { id: "high", label: "High" },
               ],
+            },
+          ],
+        },
+      },
+      {
+        slug: "gpt-5.6-sol",
+        name: "GPT-5.6 Sol",
+        isCustom: false,
+        capabilities: {
+          optionDescriptors: [
+            {
+              id: "reasoningEffort",
+              label: "Reasoning effort",
+              type: "select",
+              options: [{ id: "high", label: "High" }],
             },
           ],
         },
@@ -243,6 +280,60 @@ function processOutput(stdout: string) {
     stdoutInvalidUtf8: false,
     stderrInvalidUtf8: false,
   };
+}
+
+function controlledProviderService() {
+  return Effect.gen(function* () {
+    const events = yield* Queue.unbounded<{
+      readonly events: ReadonlyArray<ProviderRuntimeEvent>;
+      readonly enqueued: Deferred.Deferred<void>;
+    }>();
+    const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
+    const service: ProviderServiceShape = {
+      startSession: () => unsupported(),
+      sendTurn: () => unsupported(),
+      compactThread: () => unsupported(),
+      interruptTurn: () => unsupported(),
+      respondToRequest: () => unsupported(),
+      respondToUserInput: () => unsupported(),
+      stopSession: () => unsupported(),
+      listSessions: () => Effect.succeed([] as ProviderSession[]),
+      getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
+      assertConversationRollbackSupported: () => unsupported(),
+      getInstanceInfo: (providerInstanceId) =>
+        Effect.succeed({
+          instanceId: providerInstanceId,
+          driverKind: ProviderDriverKind.make("codex"),
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: ProviderDriverKind.make("codex"),
+            continuationKey: `codex:instance:${providerInstanceId}`,
+          },
+        }),
+      rollbackConversation: () => unsupported(),
+      uploadFeedback: () => unsupported(),
+      get streamEvents() {
+        return Stream.fromQueue(events).pipe(
+          Stream.flatMap((batch) =>
+            Stream.concat(
+              Stream.fromIterable(batch.events),
+              Stream.fromEffect(Deferred.succeed(batch.enqueued, undefined)).pipe(Stream.drain),
+            ),
+          ),
+        );
+      },
+    };
+    return {
+      service,
+      emitAndWaitForEnqueue: (batch: ReadonlyArray<ProviderRuntimeEvent>) =>
+        Effect.gen(function* () {
+          const enqueued = yield* Deferred.make<void>();
+          yield* Queue.offer(events, { events: batch, enqueued });
+          yield* Deferred.await(enqueued);
+        }),
+    };
+  });
 }
 
 const runGit = (cwd: string, args: ReadonlyArray<string>) =>
@@ -577,6 +668,7 @@ interface HarnessOptions {
   readonly extraDetails?: ReadonlyArray<WorkflowIssueDetail>;
   readonly locate?: WorkflowService.WorkflowService["Service"]["locate"];
   readonly threadShell?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadShellById"];
+  readonly threadRuntimeContext?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadRuntimeContext"];
   readonly threadDetail?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadDetailById"];
   readonly githubExecute?: GitHubCli.GitHubCli["Service"]["execute"];
   readonly githubGetRepositoryCloneUrls?: GitHubCli.GitHubCli["Service"]["getRepositoryCloneUrls"];
@@ -602,6 +694,19 @@ function harness(options: HarnessOptions = {}) {
   const testCapability = options.capability ?? capability;
   const ticketDetails = options.ticketDetails ?? [ticketDetail];
   const registry = makeProviderRegistryMock([selectedProvider]);
+  const projectionLayer = Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+    getProjectShellById: () =>
+      Effect.succeed(
+        Option.some({
+          id: projectId,
+          title: "T3 Code",
+          workspaceRoot: selectedWorkspaceRoot,
+        } as never),
+      ),
+    getThreadShellById: options.threadShell ?? (() => Effect.succeed(Option.none())),
+    getThreadRuntimeContext: options.threadRuntimeContext ?? (() => Effect.succeed(Option.none())),
+    getThreadDetailById: options.threadDetail ?? (() => Effect.succeed(Option.none())),
+  });
   const layer = Layer.effect(
     WorkflowDirectorService.WorkflowDirectorService,
     WorkflowDirectorService.make,
@@ -648,20 +753,7 @@ function harness(options: HarnessOptions = {}) {
             })),
       }),
     ),
-    Layer.provide(
-      Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-        getProjectShellById: () =>
-          Effect.succeed(
-            Option.some({
-              id: projectId,
-              title: "T3 Code",
-              workspaceRoot: selectedWorkspaceRoot,
-            } as never),
-          ),
-        getThreadShellById: options.threadShell ?? (() => Effect.succeed(Option.none())),
-        getThreadDetailById: options.threadDetail ?? (() => Effect.succeed(Option.none())),
-      }),
-    ),
+    Layer.provide(projectionLayer),
     Layer.provide(
       Layer.succeed(ProviderRegistry.ProviderRegistry, {
         ...registry,
@@ -752,10 +844,425 @@ function harness(options: HarnessOptions = {}) {
       commands.push(command);
       return { sequence: 101 };
     });
-  return { commands, dispatch, layer, statusCalls, worktreeCalls };
+  return { commands, dispatch, layer, projectionLayer, statusCalls, worktreeCalls };
 }
 
 describe("WorkflowDirectorService", () => {
+  it.effect(
+    "admits before controlled collaboration dispatch and associates the ingested child",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const workerTicket = fixture.ticketDetails[0]!;
+      let claimed = false;
+      let directorThreadId: string | null = null;
+      return Effect.gen(function* () {
+        const controlledCollaboration = yield* controlledProviderService();
+        const ingestedCommands: OrchestrationCommand[] = [];
+        const test = harness({
+          ...fixture,
+          githubExecute: ({ args }) => {
+            if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+            if (args[0] === "issue" && args[1] === "view") {
+              return Effect.succeed(output(claimed ? "Flow-Fly\n" : ""));
+            }
+            if (args[0] === "issue" && args[1] === "edit") claimed = true;
+            return Effect.succeed(output(""));
+          },
+          threadRuntimeContext: (threadId) =>
+            Effect.succeed(
+              threadId === directorThreadId
+                ? Option.some({ id: threadId, title: "Capability director", session: null })
+                : Option.none(),
+            ),
+        });
+        const joinedLayer = ProviderRuntimeIngestionLive.pipe(
+          Layer.provide(Layer.succeed(ProviderService, controlledCollaboration.service)),
+          Layer.provide(
+            Layer.mock(OrchestrationEngineService)({
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  ingestedCommands.push(command);
+                  return { sequence: ingestedCommands.length };
+                }),
+              streamDomainEvents: Stream.empty,
+            }),
+          ),
+          Layer.provide(test.projectionLayer),
+          Layer.provide(ThreadBackgroundLiveness.layer),
+          Layer.provide(ThreadPlanProgress.layer),
+          Layer.provide(Layer.mock(CheckpointStore.CheckpointStore)({})),
+          Layer.provide(ServerSettingsService.layerTest()),
+          Layer.provideMerge(test.layer),
+          Layer.provideMerge(NodeServices.layer),
+        );
+
+        return yield* Effect.scoped(
+          Effect.gen(function* () {
+            const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+            const ingestion = yield* ProviderRuntimeIngestionService;
+            yield* ingestion.start();
+            const started = yield* service.start(
+              { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+              test.dispatch,
+            );
+            directorThreadId = started.director.threadId;
+            const invocation: McpInvocationContext.McpInvocationScope = {
+              environmentId,
+              threadId: started.director.threadId,
+              providerInstanceId: instanceId,
+              providerSessionId: "provider-session-director",
+              capabilities: new Set(["preview"]),
+              issuedAt: 1,
+            };
+            const prepared = yield* workflowDirectorHandlers
+              .workflow_prepare_worker({
+                ticketNumber: workerTicket.number,
+                ownership: "workflow worker lifecycle",
+                writePaths: ["apps/server/src/workflow"],
+              })
+              .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+            Object.assign(
+              workerTicket,
+              reinterpretTicket(workerTicket, [fixture.source, fixture.breakdownRecord], {
+                assignees: ["Flow-Fly"],
+              }),
+            );
+
+            const sql = yield* SqlClient.SqlClient;
+            const durableDispatch = yield* sql<{
+              readonly admissionId: string;
+              readonly claimStatus: string;
+              readonly dispatchId: string;
+            }>`
+            SELECT a.admission_id AS "admissionId", a.claim_status AS "claimStatus",
+              d.dispatch_id AS "dispatchId"
+            FROM workflow_director_admissions a
+            JOIN workflow_worker_dispatches d ON d.admission_id = a.admission_id
+            WHERE d.dispatch_id = ${prepared.dispatchId}
+          `;
+            expect(durableDispatch).toEqual([
+              expect.objectContaining({
+                claimStatus: "confirmed",
+                dispatchId: prepared.dispatchId,
+              }),
+            ]);
+
+            yield* controlledCollaboration.emitAndWaitForEnqueue([
+              {
+                type: "task.started",
+                eventId: EventId.make("joined-worker-started"),
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: instanceId,
+                threadId: started.director.threadId,
+                createdAt: "2026-09-06T11:00:00.000Z",
+                payload: {
+                  taskId: RuntimeTaskId.make("joined-provider-child"),
+                  description: "Implement ticket from prepared admission",
+                  title: "joined-worker",
+                  role: "worker",
+                  model: "gpt-5.6-sol",
+                  effort: "high",
+                  parentAgentId: "provider-director",
+                  agentPath: "/root/joined-worker",
+                  timelineBypass: true,
+                },
+              },
+            ]);
+            yield* ingestion.drain;
+
+            const associated = yield* workflowDirectorHandlers
+              .workflow_associate_worker({
+                associationToken: prepared.associationToken,
+                providerThreadId: "joined-provider-child",
+              })
+              .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+            expect(associated).toMatchObject({
+              dispatchId: prepared.dispatchId,
+              association: "associated",
+              providerThreadId: "joined-provider-child",
+              providerStatus: "running",
+              observedProfile: { match: "match" },
+            });
+            const status = yield* service.status({
+              projectId,
+              repository,
+              ticketNumber: workerTicket.number,
+            });
+            expect(status.workers).toEqual([
+              expect.objectContaining({
+                dispatchId: prepared.dispatchId,
+                providerThreadId: "joined-provider-child",
+                association: "associated",
+              }),
+            ]);
+            expect(ingestedCommands).toEqual(
+              expect.arrayContaining([expect.objectContaining({ type: "thread.activity.append" })]),
+            );
+          }),
+        ).pipe(Effect.provide(joinedLayer));
+      });
+    },
+  );
+
+  it.effect(
+    "prepares admission before native child association and keeps it through reconnect",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const workerTicket = fixture.ticketDetails[0]!;
+      let claimed = false;
+      const test = harness({
+        ...fixture,
+        githubExecute: ({ args }) => {
+          if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+          if (args[0] === "issue" && args[1] === "view") {
+            return Effect.succeed(output(claimed ? "Flow-Fly\n" : ""));
+          }
+          if (args[0] === "issue" && args[1] === "edit") claimed = true;
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const prepared = yield* workflowDirectorHandlers
+          .workflow_prepare_worker({
+            ticketNumber: workerTicket.number,
+            ownership: "workflow service and migration",
+            writePaths: ["apps/server/src/workflow", "apps/server/src/persistence/Migrations"],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+        expect(prepared).toMatchObject({
+          disposition: "prepared",
+          admission: { ticketNumber: workerTicket.number, claimStatus: "confirmed" },
+          requestedProfile: { model: "gpt-5.6-sol", effort: "high" },
+        });
+        Object.assign(
+          workerTicket,
+          reinterpretTicket(workerTicket, [fixture.source, fixture.breakdownRecord], {
+            assignees: ["Flow-Fly"],
+          }),
+        );
+        const repeated = yield* service.prepareWorker(
+          environmentId,
+          started.director.threadId,
+          instanceId,
+          {
+            ticketNumber: workerTicket.number,
+            ownership: "workflow service and migration",
+            writePaths: ["apps/server/src/workflow"],
+          },
+        );
+        expect(repeated).toMatchObject({
+          disposition: "existing-unconfirmed",
+          dispatchId: prepared.dispatchId,
+          associationToken: prepared.associationToken,
+        });
+
+        yield* recordWorkflowWorkerObservation({
+          type: "task.started",
+          eventId: EventId.make("worker-started"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-06T11:00:00.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("provider-child-1"),
+            description: "worker-one",
+            title: "worker-one",
+            role: "worker",
+            model: "gpt-5.6-sol",
+            effort: "high",
+            parentAgentId: "provider-director",
+            agentPath: "/root/worker-one",
+            timelineBypass: true,
+          },
+        });
+        const associated = yield* workflowDirectorHandlers
+          .workflow_associate_worker({
+            associationToken: prepared.associationToken,
+            providerThreadId: "provider-child-1",
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(associated).toMatchObject({
+          ticketNumber: workerTicket.number,
+          providerThreadId: "provider-child-1",
+          association: "associated",
+          providerStatus: "running",
+          observedProfile: { match: "match" },
+        });
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("worker-profile-updated"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-06T11:00:30.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("provider-child-1"),
+            model: "gpt-5.6-luna",
+            effort: "low",
+            timelineBypass: true,
+          },
+        });
+
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("unknown-child-idle"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-06T11:01:00.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("provider-child-unknown"),
+            status: "idle",
+            model: "gpt-5.6-luna",
+            effort: "low",
+            parentAgentId: "provider-child-1",
+            agentPath: "/root/worker-one/helper",
+            timelineBypass: true,
+          },
+        });
+
+        const reconnected = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(reconnected.workers).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              dispatchId: prepared.dispatchId,
+              providerThreadId: "provider-child-1",
+              association: "associated",
+              providerStatus: "running",
+              observedProfile: expect.objectContaining({ match: "mismatch" }),
+              handoff: null,
+            }),
+            expect.objectContaining({
+              dispatchId: null,
+              providerThreadId: "provider-child-unknown",
+              parentProviderThreadId: "provider-child-1",
+              association: "unassociated",
+              providerStatus: "idle",
+            }),
+          ]),
+        );
+        const fromTicket = yield* service.status({
+          projectId,
+          repository,
+          ticketNumber: workerTicket.number,
+        });
+        expect(fromTicket.directorId).toBe(started.director.directorId);
+
+        const handoff = yield* service.reportWorkerHandoff(
+          environmentId,
+          started.director.threadId,
+          instanceId,
+          {
+            providerThreadId: "provider-child-1",
+            outcome: "succeeded",
+            summary: "Implemented and checked the worker slice.",
+            commits: ["abc123"],
+            checks: ["focused test passed"],
+          },
+        );
+        expect(handoff.handoff).toEqual({
+          outcome: "succeeded",
+          summary: "Implemented and checked the worker slice.",
+          commits: ["abc123"],
+          checks: ["focused test passed"],
+        });
+        const repeatAfterHandoff = yield* service.prepareWorker(
+          environmentId,
+          started.director.threadId,
+          instanceId,
+          {
+            ticketNumber: workerTicket.number,
+            ownership: "workflow service and migration",
+            writePaths: ["apps/server/src/workflow"],
+          },
+        );
+        expect(repeatAfterHandoff).toMatchObject({
+          disposition: "existing-unconfirmed",
+          dispatchId: prepared.dispatchId,
+          associationToken: prepared.associationToken,
+        });
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("rejects overlapping write ownership before admitting another ticket", () => {
+    const fixture = interpretedCapabilityFixture(2);
+    const test = harness(fixture);
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const first = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "workflow server",
+          writePaths: ["apps/server/src/workflow/"],
+        },
+      );
+      yield* recordWorkflowWorkerObservation({
+        type: "task.started",
+        eventId: EventId.make("overlap-worker-started"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:00:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("overlap-worker"),
+          description: "overlap worker",
+          timelineBypass: true,
+        },
+      });
+      yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+        associationToken: first.associationToken,
+        providerThreadId: "overlap-worker",
+      });
+      yield* service.reportWorkerHandoff(environmentId, started.director.threadId, instanceId, {
+        providerThreadId: "overlap-worker",
+        outcome: "succeeded",
+        summary: "Worker reported a result before provider settlement.",
+        commits: ["abc123"],
+        checks: ["focused test passed"],
+      });
+      const overlap = yield* service
+        .prepareWorker(environmentId, started.director.threadId, instanceId, {
+          ticketNumber: fixture.ticketDetails[1]!.number,
+          ownership: "director service",
+          writePaths: ["apps/server/src/workflow/WorkflowDirectorService.ts"],
+        })
+        .pipe(Effect.flip);
+      expect(overlap).toMatchObject({
+        _tag: "WorkflowDirectorError",
+        failure: "not-ready",
+        message: "Worker write ownership overlaps unsettled work.",
+      });
+      const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+      expect(status.admissionCount).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("accepts a selected fork when GitHub CLI defaults to the upstream repository", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

@@ -31,7 +31,7 @@ import {
 
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { useProject, useServerConfigs } from "~/state/entities";
+import { useProject, useServerConfigs, useThreadDetail } from "~/state/entities";
 import { workflowEnvironment } from "~/state/workflow";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
@@ -117,6 +117,7 @@ function WorkflowDetails(props: {
   projectId: ProjectId;
   planningThreadId?: ThreadId;
   rootNumber: number;
+  capabilityNumber?: number;
   issue: WorkflowIssueSummary;
   refreshRequest: number;
 }) {
@@ -164,18 +165,55 @@ function WorkflowDetails(props: {
         record.state === "current" &&
         record.authority === "verified",
     ) === true;
+  const directorCapabilityNumber = hasBreakdownApproval
+    ? props.issue.number
+    : props.capabilityNumber;
+  const directorTicketNumber =
+    !directorCapabilityNumber && (props.issue.kind === "ticket" || props.issue.kind === "task")
+      ? props.issue.number
+      : undefined;
   const directorQuery = useEnvironmentQuery(
-    hasBreakdownApproval
+    directorCapabilityNumber || directorTicketNumber
       ? workflowEnvironment.directorStatus({
           environmentId: props.environmentId,
           input: {
             projectId: props.projectId,
             repository: props.issue.repository,
-            capabilityNumber: props.issue.number,
+            ...(directorCapabilityNumber
+              ? { capabilityNumber: directorCapabilityNumber }
+              : { ticketNumber: directorTicketNumber! }),
           },
         })
       : null,
   );
+  const directorThread = useThreadDetail(
+    directorQuery.data
+      ? scopeThreadRef(directorQuery.data.environmentId, directorQuery.data.threadId)
+      : null,
+  );
+  const lastDirectorActivity = directorThread?.activities.at(-1);
+  const lastDirectorPayload =
+    typeof lastDirectorActivity?.payload === "object" && lastDirectorActivity.payload !== null
+      ? lastDirectorActivity.payload
+      : null;
+  const workerActivityRevision =
+    lastDirectorActivity &&
+    (lastDirectorActivity.kind === "task.started" ||
+      lastDirectorActivity.kind === "task.updated" ||
+      lastDirectorActivity.kind === "task.completed") &&
+    lastDirectorPayload &&
+    "timelineBypass" in lastDirectorPayload &&
+    lastDirectorPayload.timelineBypass === true
+      ? lastDirectorActivity.id
+      : null;
+  const lastWorkerActivityRevision = useRef<string | null>(null);
+  const refreshDirectorQuery = directorQuery.refresh;
+  useEffect(() => {
+    if (workerActivityRevision === null) return;
+    if (lastWorkerActivityRevision.current === workerActivityRevision) return;
+    lastWorkerActivityRevision.current = workerActivityRevision;
+    refreshDirectorQuery();
+  }, [refreshDirectorQuery, workerActivityRevision]);
   const recoveryQuery = useEnvironmentQuery(
     !hasBreakdownApproval &&
       (props.issue.kind === "decision" ||
@@ -200,7 +238,8 @@ function WorkflowDetails(props: {
     if (lastRefreshRequest.current === refreshRequest) return;
     lastRefreshRequest.current = refreshRequest;
     refreshQuery();
-  }, [refreshQuery, refreshRequest]);
+    refreshDirectorQuery();
+  }, [refreshDirectorQuery, refreshQuery, refreshRequest]);
   if (query.isPending && !query.data)
     return <p className="p-3 text-muted-foreground text-xs">Loading issue details…</p>;
   if (query.error)
@@ -477,6 +516,81 @@ function WorkflowDetails(props: {
             observed {director.observedProfile.model ?? "unknown"}/
             {director.observedProfile.effort ?? "unknown"} ({director.observedProfile.match})
           </p>
+          {director.workers.length > 0 ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Worker history</h4>
+              <p className="mt-1 text-muted-foreground text-xs">
+                Write ownership remains reserved until verified settlement. Later overlapping
+                tickets stay held even when a worker is idle or has reported a handoff.
+              </p>
+              <ul className="mt-1 space-y-2">
+                {director.workers.map((worker) => (
+                  <li
+                    className="rounded-sm bg-muted/50 p-1.5 text-xs"
+                    key={worker.dispatchId ?? `unassociated:${worker.providerThreadId}`}
+                  >
+                    <p>
+                      {worker.ticketNumber
+                        ? `Ticket #${worker.ticketNumber}`
+                        : "Unassociated child"}
+                      {worker.title ? ` · ${worker.title}` : ""} · {worker.association}
+                    </p>
+                    {worker.providerThreadId ? (
+                      <p className="mt-0.5 break-all text-muted-foreground">
+                        Provider child {worker.providerThreadId}
+                      </p>
+                    ) : null}
+                    <p className="mt-0.5 text-muted-foreground">
+                      Provider {worker.providerStatus} · requested{" "}
+                      {worker.requestedProfile?.model ?? "unknown"}/
+                      {worker.requestedProfile?.effort ?? "unknown"} · observed{" "}
+                      {worker.observedProfile.model ?? "unknown"}/
+                      {worker.observedProfile.effort ?? "unknown"} ({worker.observedProfile.match})
+                    </p>
+                    {worker.ownership ? (
+                      <p className="mt-0.5 text-muted-foreground">
+                        Owns {worker.ownership}
+                        {worker.writePaths.length > 0 ? `: ${worker.writePaths.join(", ")}` : ""}
+                      </p>
+                    ) : null}
+                    {worker.handoff ? (
+                      <div className="mt-0.5 text-muted-foreground">
+                        <p>
+                          Handoff {worker.handoff.outcome}: {worker.handoff.summary}
+                        </p>
+                        {worker.handoff.commits.length > 0 ? (
+                          <p>
+                            Commits{" "}
+                            {worker.handoff.commits.map((commit, index) => (
+                              <span key={commit}>
+                                {index > 0 ? ", " : null}
+                                <a
+                                  className="text-info hover:underline"
+                                  href={`https://github.com/${director.repository}/commit/${encodeURIComponent(commit)}`}
+                                  target="_blank"
+                                  rel="noreferrer noopener"
+                                >
+                                  {commit}
+                                </a>
+                              </span>
+                            ))}
+                          </p>
+                        ) : null}
+                        {worker.handoff.checks.length > 0 ? (
+                          <p>Checks {worker.handoff.checks.join(", ")}</p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <p className="mt-0.5 text-muted-foreground">
+                        No implementation handoff reported. Idle activity does not settle this
+                        worker.
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {startMessage ? (
             <p className="mt-1 text-destructive text-xs" role="alert">
               {startMessage}
@@ -876,6 +990,9 @@ export function WorkflowFocusedMap(props: {
     }
     return path;
   })();
+  const selectedCapabilityNumber = breadcrumbNodes.findLast(
+    (node) => node.issue.kind === "capability",
+  )?.issue.number;
   useEffect(() => {
     const missing = map.nodes.filter((node) => !(node.id in view.positions));
     if (missing.length === 0) return;
@@ -1436,6 +1553,7 @@ export function WorkflowFocusedMap(props: {
             projectId={props.projectId}
             {...(props.planningThreadId ? { planningThreadId: props.planningThreadId } : {})}
             rootNumber={props.root.number}
+            {...(selectedCapabilityNumber ? { capabilityNumber: selectedCapabilityNumber } : {})}
             issue={selected}
             refreshRequest={refreshRequest}
           />

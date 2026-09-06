@@ -36,6 +36,7 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
@@ -385,8 +386,111 @@ describe("ProviderRuntimeIngestion", () => {
       sqlCount: sqlCounter.count,
       setProviderSession: provider.setSession,
       drain,
+      recordWorkflowDirector: (threadId: ThreadId) =>
+        testRuntime.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`
+              INSERT INTO workflow_directors (
+                director_id, batch_id, environment_id, project_id, repository, root_number,
+                capability_number, thread_id, command_id, message_id, worktree_path,
+                worktree_branch, status, requested_model, requested_instance_id,
+                requested_effort, observed_match, initial_turn_disposition, created_at, updated_at
+              ) VALUES (
+                'director-1', 'batch-1', 'environment-1', 'project-1', 'Flow-Fly/t3code', 10,
+                17, ${threadId}, 'command-1', 'message-1', '/tmp/worktree',
+                't3code/workflow-17', 'active', 'gpt-6-astra', 'codex',
+                'high', 'unknown', 'accepted', ${createdAt}, ${createdAt}
+              )
+            `;
+          }),
+        ),
+      readWorkflowWorkerObservations: () =>
+        testRuntime.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            return yield* sql<{
+              readonly providerThreadId: string;
+              readonly parentProviderThreadId: string | null;
+              readonly providerStatus: string;
+              readonly observedModel: string | null;
+            }>`
+              SELECT provider_thread_id AS "providerThreadId",
+                parent_provider_thread_id AS "parentProviderThreadId",
+                provider_status AS "providerStatus", observed_model AS "observedModel"
+              FROM workflow_worker_observations ORDER BY provider_thread_id
+            `;
+          }),
+        ),
     };
   }
+
+  it("durably observes director child lifecycle through provider ingestion and drain", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    await harness.recordWorkflowDirector(threadId);
+    await harness.emitAndDrain([
+      {
+        type: "task.started",
+        eventId: asEventId("worker-started"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:00.000Z",
+        payload: {
+          taskId: "provider-child-1",
+          description: "worker-one",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          parentAgentId: "provider-director",
+          timelineBypass: true,
+        },
+      },
+      {
+        type: "task.updated",
+        eventId: asEventId("worker-profile"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:01.000Z",
+        payload: {
+          taskId: "provider-child-1",
+          model: "gpt-5.6-luna",
+          effort: "low",
+          timelineBypass: true,
+        },
+      },
+      {
+        type: "task.updated",
+        eventId: asEventId("nested-worker-idle"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:02.000Z",
+        payload: {
+          taskId: "provider-child-2",
+          status: "idle",
+          parentAgentId: "provider-child-1",
+          timelineBypass: true,
+        },
+      },
+    ]);
+
+    expect(await harness.readWorkflowWorkerObservations()).toEqual([
+      {
+        providerThreadId: "provider-child-1",
+        parentProviderThreadId: "provider-director",
+        providerStatus: "running",
+        observedModel: "gpt-5.6-luna",
+      },
+      {
+        providerThreadId: "provider-child-2",
+        parentProviderThreadId: "provider-child-1",
+        providerStatus: "idle",
+        observedModel: null,
+      },
+    ]);
+  });
 
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();
