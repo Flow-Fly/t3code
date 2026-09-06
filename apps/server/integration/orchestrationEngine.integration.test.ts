@@ -37,7 +37,10 @@ import {
   type OrchestrationIntegrationHarness,
 } from "./OrchestrationEngineHarness.integration.ts";
 import { checkpointRefForThreadTurn } from "../src/checkpointing/Utils.ts";
-import { dispatchCreatedThreadTurnStart } from "../src/orchestration/dispatchCreatedThreadTurnStart.ts";
+import {
+  dispatchCreatedThreadTurnStart,
+  reconcileCreatedThreadTurnStartFailure,
+} from "../src/orchestration/dispatchCreatedThreadTurnStart.ts";
 import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
 import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
 import * as ProviderRegistry from "../src/provider/Services/ProviderRegistry.ts";
@@ -197,7 +200,7 @@ const startTurn = (input: {
     createdAt: input.createdAt ?? nowIso(),
   });
 
-it.live("serializes workflow starts into one durable provider first turn", () =>
+it.live("starts workflow work once and reconciles real bootstrap failures", () =>
   withHarness((harness) =>
     Effect.gen(function* () {
       const modelSelection = {
@@ -254,7 +257,8 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
       });
       const root = workflowIssue(10, "container", null, ["workflow:container"]);
       const map = workflowIssue(12, "map", 10, ["wayfinder:map"]);
-      const decision = workflowIssue(15, "decision", 12, ["wayfinder:research"]);
+      const decisionFor = (number: number) =>
+        workflowIssue(number, "decision", 12, ["wayfinder:research"]);
       const provider = {
         instanceId: modelSelection.instanceId,
         driver: CODEX_PROVIDER,
@@ -298,6 +302,8 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
             else {
               const addAt = args.indexOf("--add-assignee");
               if (addAt >= 0) assignees.add(args[addAt + 1]!);
+              const removeAt = args.indexOf("--remove-assignee");
+              if (removeAt >= 0) assignees.delete(args[removeAt + 1]!);
             }
             return {
               stdout,
@@ -314,12 +320,16 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
       const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
         issueDetail: ({ number }) =>
           Effect.succeed({
-            ...(number === 10 ? root : decision),
+            ...(number === 10 ? root : number === 12 ? map : decisionFor(number)),
             body: "Decision context",
             blockedBy: [],
           }),
-        locate: () =>
-          Effect.succeed({ issue: decision, ancestry: [root, map], ancestryComplete: true }),
+        locate: ({ number }) =>
+          Effect.succeed({
+            issue: decisionFor(number),
+            ancestry: [root, map],
+            ancestryComplete: true,
+          }),
       });
       const startLayer = WorkflowStartService.layer.pipe(
         Layer.provide(workflowLayer),
@@ -338,33 +348,104 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
         Layer.provide(makeSqlitePersistenceLive(harness.dbPath)),
         Layer.provide(NodeServices.layer),
       );
-      let dispatchCount = 0;
-      const dispatch: Parameters<
-        WorkflowStartService.WorkflowStartService["Service"]["start"]
-      >[1] = (command) => {
-        dispatchCount += 1;
-        return dispatchCreatedThreadTurnStart({
-          command: command as typeof command & {
-            readonly bootstrap: {
-              readonly createThread: NonNullable<
-                NonNullable<typeof command.bootstrap>["createThread"]
-              >;
-            };
-          },
-          createCommandId: Effect.succeed(CommandId.make("workflow-start-thread")),
-          dispatch: (bootstrapCommand) =>
-            harness.engine.dispatch(bootstrapCommand).pipe(
-              Effect.mapError(
-                (cause) =>
+      const makeDispatch = (
+        label: string,
+        mode: "success" | "reject-before-turn" | "lose-accepted-acknowledgement",
+      ) => {
+        let dispatchCount = 0;
+        let threadId: ThreadId | null = null;
+        const dispatch: Parameters<
+          WorkflowStartService.WorkflowStartService["Service"]["start"]
+        >[1] = (command) => {
+          dispatchCount += 1;
+          threadId = command.threadId;
+          return dispatchCreatedThreadTurnStart({
+            command: command as typeof command & {
+              readonly bootstrap: {
+                readonly createThread: NonNullable<
+                  NonNullable<typeof command.bootstrap>["createThread"]
+                >;
+              };
+            },
+            createCommandId: Effect.succeed(CommandId.make(`${label}-create`)),
+            dispatch: (bootstrapCommand) => {
+              if (bootstrapCommand.type === "thread.turn.start" && mode === "reject-before-turn") {
+                return Effect.fail(
                   new OrchestrationDispatchCommandError({
-                    message: "Workflow bootstrap dispatch failed.",
-                    cause,
+                    message: "The turn command was rejected before persistence.",
                   }),
-              ),
+                );
+              }
+              const dispatched = harness.engine.dispatch(bootstrapCommand).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationDispatchCommandError({
+                      message: "Workflow bootstrap dispatch failed.",
+                      cause,
+                    }),
+                ),
+              );
+              return bootstrapCommand.type === "thread.turn.start" &&
+                mode === "lose-accepted-acknowledgement"
+                ? dispatched.pipe(
+                    Effect.flatMap(() =>
+                      Effect.fail(
+                        new OrchestrationDispatchCommandError({
+                          message: "The accepted turn acknowledgement was lost.",
+                        }),
+                      ),
+                    ),
+                  )
+                : dispatched;
+            },
+            drainThreadDeletionThrough: () => Effect.void,
+          }).pipe(
+            Effect.catch((error) =>
+              reconcileCreatedThreadTurnStartFailure({
+                error,
+                readTurnAcceptance: harness.commandReceiptRepository
+                  .getByCommandId({ commandId: command.commandId })
+                  .pipe(
+                    Effect.map((receipt) =>
+                      Option.isSome(receipt) && receipt.value.status === "accepted"
+                        ? "accepted"
+                        : "not-accepted",
+                    ),
+                    Effect.mapError(
+                      (cause) =>
+                        new OrchestrationDispatchCommandError({
+                          message: "The first-turn receipt could not be read.",
+                          cause,
+                        }),
+                    ),
+                  ),
+                cleanupCreatedThread: harness.engine
+                  .dispatch({
+                    type: "thread.delete",
+                    commandId: CommandId.make(`${label}-delete`),
+                    threadId: command.threadId,
+                  })
+                  .pipe(
+                    Effect.as(true),
+                    Effect.mapError(
+                      (cause) =>
+                        new OrchestrationDispatchCommandError({
+                          message: "The empty bootstrap thread could not be deleted.",
+                          cause,
+                        }),
+                    ),
+                  ),
+              }),
             ),
-          drainThreadDeletionThrough: () => Effect.void,
-        });
+          );
+        };
+        return {
+          dispatch,
+          getDispatchCount: () => dispatchCount,
+          getThreadId: () => threadId,
+        };
       };
+      const successfulDispatch = makeDispatch("workflow-success", "success");
       const results = yield* Effect.gen(function* () {
         const start = yield* WorkflowStartService.WorkflowStartService;
         return yield* Effect.all(
@@ -377,7 +458,7 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
                 issueNumber: 15,
                 modelSelection,
               },
-              dispatch,
+              successfulDispatch.dispatch,
             ),
             start.start(
               {
@@ -387,7 +468,7 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
                 issueNumber: 15,
                 modelSelection,
               },
-              dispatch,
+              successfulDispatch.dispatch,
             ),
           ],
           { concurrency: "unbounded" },
@@ -407,13 +488,80 @@ it.live("serializes workflow starts into one durable provider first turn", () =>
       assert.match(thread?.messages[0]?.text ?? "", /Map: Flow-Fly\/t3code#12/u);
       assert.deepEqual(results.map((result) => result.disposition).sort(), ["existing", "started"]);
       assert.equal(new Set(results.map((result) => result.attemptId)).size, 1);
-      assert.equal(dispatchCount, 1);
+      assert.equal(successfulDispatch.getDispatchCount(), 1);
       assert.equal(harness.adapterHarness!.getStartCount(), 1);
       assert.deepEqual(harness.adapterHarness!.getTurnInputs()[0]?.skills, [
         { name: "wayfinder", path: "/skills/wayfinder/SKILL.md" },
         { name: "research", path: "/skills/research/SKILL.md" },
       ]);
       assert.deepEqual(harness.adapterHarness!.getTurnInputs()[0]?.modelSelection, modelSelection);
+
+      assignees.clear();
+      const rejectedDispatch = makeDispatch("workflow-rejected", "reject-before-turn");
+      const rejectedInput = {
+        projectId: PROJECT_ID,
+        repository,
+        rootNumber: 10,
+        issueNumber: 16,
+        modelSelection,
+      };
+      const rejectedError = yield* Effect.gen(function* () {
+        const start = yield* WorkflowStartService.WorkflowStartService;
+        return yield* Effect.flip(start.start(rejectedInput, rejectedDispatch.dispatch));
+      }).pipe(Effect.provide(startLayer));
+      const rejectedThreadId = rejectedDispatch.getThreadId();
+      assert.equal(rejectedError.failure, "dispatch-failed");
+      assert.match(rejectedError.message, /claim added by this attempt was released/u);
+      assert.equal(assignees.size, 0);
+      assert.equal(harness.adapterHarness!.getStartCount(), 1);
+      yield* harness.waitForDomainEvent(
+        (event) => event.type === "thread.deleted" && event.aggregateId === rejectedThreadId,
+      );
+
+      assignees.clear();
+      yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("workflow-uncertain-started", "2026-05-01T00:00:03.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("workflow-uncertain-completed", "2026-05-01T00:00:04.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+      });
+      const uncertainDispatch = makeDispatch("workflow-uncertain", "lose-accepted-acknowledgement");
+      const uncertainInput = { ...rejectedInput, issueNumber: 17 };
+      const [uncertainError, repeatedUncertain] = yield* Effect.gen(function* () {
+        const start = yield* WorkflowStartService.WorkflowStartService;
+        const error = yield* Effect.flip(start.start(uncertainInput, uncertainDispatch.dispatch));
+        const repeated = yield* start.start(uncertainInput, uncertainDispatch.dispatch);
+        return [error, repeated] as const;
+      }).pipe(Effect.provide(startLayer));
+      const uncertainThreadId = uncertainDispatch.getThreadId();
+      assert(uncertainThreadId !== null);
+      yield* harness.waitForReceipt(
+        (receipt): receipt is TurnProcessingQuiescedReceipt =>
+          receipt.type === "turn.processing.quiesced" && receipt.threadId === uncertainThreadId,
+      );
+      assert.equal(uncertainError.failure, "dispatch-failed");
+      assert.match(uncertainError.message, /uncertain/u);
+      assert.equal(repeatedUncertain.status, "held");
+      assert.equal(uncertainDispatch.getDispatchCount(), 1);
+      assert.deepEqual(assignees, new Set(["Flow-Fly"]));
+      assert.equal(harness.adapterHarness!.getStartCount(), 2);
+      assert.equal(
+        (yield* harness.snapshotQuery.getSnapshot()).threads.some(
+          (candidate) => candidate.id === uncertainThreadId,
+        ),
+        true,
+      );
     }),
   ),
 );
@@ -455,22 +603,29 @@ it.live("runs a single turn end-to-end and persists checkpoint state in sqlite +
         messageId: "msg-user-single",
         text: "Say hello",
       });
-      const finalizedReceipt = yield* harness.waitForReceipt(
-        (receipt): receipt is CheckpointDiffFinalizedReceipt =>
-          receipt.type === "checkpoint.diff.finalized" &&
-          receipt.threadId === THREAD_ID &&
-          receipt.checkpointTurnCount === 1,
+      // Finalization precedes quiescence. Concurrent waits prove that one matcher can retain an
+      // earlier nonmatch for the other instead of consuming its evidence destructively.
+      const [, finalizedReceipt] = yield* Effect.all(
+        [
+          harness.waitForReceipt(
+            (receipt): receipt is TurnProcessingQuiescedReceipt =>
+              receipt.type === "turn.processing.quiesced" &&
+              receipt.threadId === THREAD_ID &&
+              receipt.checkpointTurnCount === 1,
+          ),
+          harness.waitForReceipt(
+            (receipt): receipt is CheckpointDiffFinalizedReceipt =>
+              receipt.type === "checkpoint.diff.finalized" &&
+              receipt.threadId === THREAD_ID &&
+              receipt.checkpointTurnCount === 1,
+          ),
+        ],
+        { concurrency: "unbounded" },
       );
       if (finalizedReceipt.type !== "checkpoint.diff.finalized") {
         throw new Error("Expected checkpoint.diff.finalized receipt.");
       }
       assert.equal(finalizedReceipt.status, "ready");
-      yield* harness.waitForReceipt(
-        (receipt): receipt is TurnProcessingQuiescedReceipt =>
-          receipt.type === "turn.processing.quiesced" &&
-          receipt.threadId === THREAD_ID &&
-          receipt.checkpointTurnCount === 1,
-      );
 
       const thread = yield* harness.waitForThread(
         THREAD_ID,

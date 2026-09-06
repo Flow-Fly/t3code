@@ -18,8 +18,10 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
@@ -34,6 +36,7 @@ import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRunti
 import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
 import { ProjectionCheckpointRepository } from "../src/persistence/Services/ProjectionCheckpoints.ts";
 import { ProjectionPendingApprovalRepository } from "../src/persistence/Services/ProjectionPendingApprovals.ts";
+import { OrchestrationCommandReceiptRepository } from "../src/persistence/Services/OrchestrationCommandReceipts.ts";
 import { makeAdapterRegistryMock } from "../src/provider/testUtils/providerAdapterRegistryMock.ts";
 import { ProviderAdapterRegistry } from "../src/provider/Services/ProviderAdapterRegistry.ts";
 import { makeProviderRegistryLayer } from "../src/provider/testUtils/providerRegistryMock.ts";
@@ -190,6 +193,7 @@ export interface OrchestrationIntegrationHarness {
   readonly providerService: ProviderService["Service"];
   readonly checkpointStore: CheckpointStore.CheckpointStore["Service"];
   readonly checkpointRepository: ProjectionCheckpointRepository["Service"];
+  readonly commandReceiptRepository: OrchestrationCommandReceiptRepository["Service"];
   readonly pendingApprovalRepository: ProjectionPendingApprovalRepository["Service"];
   readonly waitForThread: (
     threadId: string,
@@ -313,6 +317,7 @@ export const makeOrchestrationIntegrationHarness = (
     const runtimeServicesLayer = Layer.mergeAll(
       projectionSnapshotQueryLayer,
       orchestrationLayer.pipe(Layer.provide(projectionSnapshotQueryLayer)),
+      OrchestrationCommandReceiptRepositoryLive,
       ProjectionCheckpointRepositoryLive,
       ProjectionPendingApprovalRepositoryLive,
       checkpointStoreLayer,
@@ -448,6 +453,10 @@ export const makeOrchestrationIntegrationHarness = (
       "load ProjectionCheckpointRepository service",
       () => runtime.runPromise(Effect.service(ProjectionCheckpointRepository)),
     ).pipe(Effect.orDie);
+    const commandReceiptRepository = yield* tryRuntimePromise(
+      "load OrchestrationCommandReceiptRepository service",
+      () => runtime.runPromise(Effect.service(OrchestrationCommandReceiptRepository)),
+    ).pipe(Effect.orDie);
     const pendingApprovalRepository = yield* tryRuntimePromise(
       "load ProjectionPendingApprovalRepository service",
       () => runtime.runPromise(Effect.service(ProjectionPendingApprovalRepository)),
@@ -457,6 +466,8 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
+    const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
+    const receiptWaitLock = yield* Semaphore.make(1);
     const receiptQueue = yield* tryRuntimePromise("subscribe to runtime receipts", () =>
       runtime.runPromise(
         Stream.toQueue(runtimeReceiptBus.streamEventsForTest, { capacity: "unbounded" }).pipe(
@@ -537,6 +548,18 @@ export const makeOrchestrationIntegrationHarness = (
         never
       >;
 
+    const takeMatchingReceipt = Effect.fn("OrchestrationEngineHarness.takeMatchingReceipt")(
+      function* (predicate: (receipt: OrchestrationRuntimeReceipt) => boolean) {
+        const existing = (yield* Ref.get(receiptHistory)).find(predicate);
+        if (existing) return existing;
+        while (true) {
+          const receipt = yield* Queue.take(receiptQueue).pipe(Effect.orDie);
+          yield* Ref.update(receiptHistory, (receipts) => [...receipts, receipt]);
+          if (predicate(receipt)) return receipt;
+        }
+      },
+    );
+
     function waitForReceipt(
       predicate: (receipt: OrchestrationRuntimeReceipt) => boolean,
       timeoutMs?: number,
@@ -549,17 +572,14 @@ export const makeOrchestrationIntegrationHarness = (
       predicate: (receipt: OrchestrationRuntimeReceipt) => boolean,
       timeoutMs?: number,
     ) {
-      return Effect.gen(function* () {
-        while (true) {
-          const receipt = yield* Queue.take(receiptQueue).pipe(Effect.orDie);
-          if (predicate(receipt)) return receipt;
-        }
-      }).pipe(
-        Effect.timeoutOrElse({
-          duration: `${timeoutMs ?? 40_000} millis`,
-          orElse: () => Effect.die(new WaitForTimeoutError({ description: "runtime receipt" })),
-        }),
-      );
+      return receiptWaitLock
+        .withPermits(1)(takeMatchingReceipt(predicate))
+        .pipe(
+          Effect.timeoutOrElse({
+            duration: `${timeoutMs ?? 40_000} millis`,
+            orElse: () => Effect.die(new WaitForTimeoutError({ description: "runtime receipt" })),
+          }),
+        );
     }
 
     let disposed = false;
@@ -597,6 +617,7 @@ export const makeOrchestrationIntegrationHarness = (
       providerService,
       checkpointStore,
       checkpointRepository,
+      commandReceiptRepository,
       pendingApprovalRepository,
       waitForThread,
       waitForDomainEvent,

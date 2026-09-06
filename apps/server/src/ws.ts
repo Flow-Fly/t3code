@@ -87,10 +87,14 @@ import {
   cleanupFailedUploadedAttachments,
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
-import { dispatchCreatedThreadTurnStart } from "./orchestration/dispatchCreatedThreadTurnStart.ts";
+import {
+  dispatchCreatedThreadTurnStart,
+  reconcileCreatedThreadTurnStartFailure,
+} from "./orchestration/dispatchCreatedThreadTurnStart.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
+import { OrchestrationCommandReceiptRepository } from "./persistence/Services/OrchestrationCommandReceipts.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -476,6 +480,7 @@ const makeWsRpcLayer = (
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+      const commandReceipts = yield* OrchestrationCommandReceiptRepository;
       const threadDeletionReactor = yield* ThreadDeletionReactor;
       const analytics = yield* AnalyticsService.AnalyticsService;
       // Every command dispatched on this connection carries the connecting
@@ -1197,27 +1202,32 @@ const makeWsRpcLayer = (
               if (Cause.hasInterruptsOnly(cause)) {
                 return Effect.fail(dispatchError);
               }
-              return Effect.uninterruptible(cleanupCreatedThread()).pipe(
-                Effect.matchCauseEffect({
-                  onFailure: (cleanupCause) =>
+              return reconcileCreatedThreadTurnStartFailure({
+                error: dispatchError,
+                readTurnAcceptance: commandReceipts
+                  .getByCommandId({ commandId: finalTurnStartCommand.commandId })
+                  .pipe(
+                    Effect.map((receipt) =>
+                      Option.isSome(receipt) && receipt.value.status === "accepted"
+                        ? "accepted"
+                        : "not-accepted",
+                    ),
+                    Effect.mapError((cause) =>
+                      toDispatchCommandError(cause, "Failed to read the first-turn receipt."),
+                    ),
+                  ),
+                cleanupCreatedThread: cleanupCreatedThread().pipe(
+                  Effect.tapCause((cleanupCause) =>
                     Effect.logWarning("bootstrap thread cleanup failed", {
                       threadId: command.threadId,
                       detail: Cause.pretty(cleanupCause),
-                    }).pipe(Effect.flatMap(() => Effect.fail(dispatchError))),
-                  onSuccess: (threadDeleted) =>
-                    Effect.fail(
-                      threadDeleted
-                        ? new OrchestrationDispatchCommandError({
-                            message: dispatchError.message,
-                            ...(dispatchError.cause !== undefined
-                              ? { cause: dispatchError.cause }
-                              : {}),
-                            bootstrapThreadDisposition: "deleted",
-                          })
-                        : dispatchError,
-                    ),
-                }),
-              );
+                    }),
+                  ),
+                  Effect.mapError((cause) =>
+                    toDispatchCommandError(cause, "Failed to clean up the bootstrap thread."),
+                  ),
+                ),
+              });
             }),
           );
         });

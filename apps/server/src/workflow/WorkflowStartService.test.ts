@@ -127,18 +127,21 @@ function harness(
     readonly probeFailure?: boolean | undefined;
     readonly selectedIssue?: WorkflowIssueSummary | undefined;
     readonly ancestry?: ReadonlyArray<WorkflowIssueSummary> | undefined;
+    readonly initialAssignees?: ReadonlyArray<string> | undefined;
+    readonly competingAssigneeAfterClaim?: string | undefined;
   } = {},
 ) {
   const commands = new Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>();
   const githubCalls = new Array<ReadonlyArray<string>>();
-  const assignees = new Set<string>();
+  const assignees = new Set(options.initialAssignees ?? []);
   let sequence = 100;
   let probeCount = 0;
 
   const selectedIssue = options.selectedIssue ?? decision;
   const ancestry = options.ancestry ?? [root, map];
   const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
-    issueDetail: ({ number }) => Effect.succeed(detail(number === 10 ? root : selectedIssue)),
+    issueDetail: ({ number }) =>
+      Effect.succeed(detail(number === 10 ? root : number === 12 ? map : selectedIssue)),
     locate: () =>
       Effect.succeed({
         issue: selectedIssue,
@@ -153,7 +156,12 @@ function harness(
         if (args[0] === "api") return output("Flow-Fly\n");
         if (args.includes("--json")) return output([...assignees].join("\n"));
         const addAt = args.indexOf("--add-assignee");
-        if (addAt >= 0) assignees.add(args[addAt + 1]!);
+        if (addAt >= 0) {
+          assignees.add(args[addAt + 1]!);
+          if (options.competingAssigneeAfterClaim) {
+            assignees.add(options.competingAssigneeAfterClaim);
+          }
+        }
         const removeAt = args.indexOf("--remove-assignee");
         if (removeAt >= 0) assignees.delete(args[removeAt + 1]!);
         return output("");
@@ -315,6 +323,47 @@ describe("WorkflowStartService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("starts from a nested map focused within the selected workflow branch", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const result = yield* service.start({ ...test.input, rootNumber: 12 }, test.dispatch);
+
+      expect(result).toMatchObject({ disposition: "started", rootNumber: 12 });
+      expect(test.commands[0]?.message.text).toContain("Map: Flow-Fly/t3code#12");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds new work already assigned to the authenticated account", () => {
+    const test = harness({ initialAssignees: ["Flow-Fly"] });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(service.start(test.input, test.dispatch));
+      const repeated = yield* service.start(test.input, test.dispatch);
+
+      expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "claim-failed" });
+      expect(repeated).toMatchObject({ disposition: "held", status: "held" });
+      expect(repeated.message).toContain("already assigned");
+      expect(test.commands).toHaveLength(0);
+      expect(test.githubCalls.some((args) => args.includes("--add-assignee"))).toBe(false);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds a competing post-claim assignment and releases only its own claim", () => {
+    const test = harness({ competingAssigneeAfterClaim: "another-owner" });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(service.start(test.input, test.dispatch));
+      const repeated = yield* service.start(test.input, test.dispatch);
+
+      expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "claim-failed" });
+      expect(repeated).toMatchObject({ disposition: "held", status: "held" });
+      expect(repeated.message).toContain("competing assignment");
+      expect(test.assignees).toEqual(new Set(["another-owner"]));
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("rejects a reasoning effort the selected model does not support", () => {
     const codex = provider();
     const test = harness({
@@ -386,6 +435,7 @@ describe("WorkflowStartService", () => {
       dispatchFailure: new OrchestrationDispatchCommandError({
         message: "provider rejected turn",
         bootstrapThreadDisposition: "deleted",
+        bootstrapTurnDisposition: "not-accepted",
       }),
     });
     return Effect.gen(function* () {
@@ -402,18 +452,18 @@ describe("WorkflowStartService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
-  it.effect("preserves a pre-existing assignment after bootstrap deletion", () => {
+  it.effect("retains its claim when deletion does not prove the first turn was unaccepted", () => {
     const test = harness({
       dispatchFailure: new OrchestrationDispatchCommandError({
         message: "provider rejected turn",
         bootstrapThreadDisposition: "deleted",
       }),
     });
-    test.assignees.add("Flow-Fly");
     return Effect.gen(function* () {
       const service = yield* WorkflowStartService.WorkflowStartService;
-      yield* Effect.flip(service.start(test.input, test.dispatch));
+      const error = yield* Effect.flip(service.start(test.input, test.dispatch));
 
+      expect(error.message).toContain("uncertain");
       expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
       expect(test.githubCalls.some((args) => args.includes("--remove-assignee"))).toBe(false);
     }).pipe(Effect.provide(test.layer));

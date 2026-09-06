@@ -1306,7 +1306,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }),
       );
 
-      it.effect("deduplicates cwd probes and clears snapshots when an instance rebuilds", () =>
+      it.effect("deduplicates cached probes but refreshes machine state for strict probes", () =>
         Effect.gen(function* () {
           const driver = ProviderDriverKind.make("codex");
           const instanceId = ProviderInstanceId.make("codex");
@@ -1319,7 +1319,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             auth: { status: "authenticated" },
             checkedAt: "2026-06-10T00:00:00.000Z",
             version: "1.0.0",
-            models: [],
+            models: [
+              {
+                slug: "old-model",
+                name: "Old model",
+                isCustom: false,
+                capabilities: { optionDescriptors: [] },
+              },
+            ],
             slashCommands: [{ name: "global" }],
             skills: [{ name: "global", path: "/global/SKILL.md", enabled: true }],
           } as const satisfies ServerProvider;
@@ -1336,12 +1343,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             slashCommands: [],
           } as const satisfies ServerProvider;
           const snapshotCalls = yield* Ref.make(0);
+          const machineRefreshCalls = yield* Ref.make(0);
+          const machineSnapshotRef = yield* Ref.make<ServerProvider>(machineProvider);
           const returnPendingSnapshot = yield* Ref.make(true);
           const probeStarted = yield* Deferred.make<void>();
           const releaseProbe = yield* Deferred.make<void>();
           const makeInstance = (
             provider: ServerProvider,
             snapshotForCwd: NonNullable<ProviderInstance["snapshotForCwd"]>,
+            refresh = Effect.succeed(provider),
           ): ProviderInstance => ({
             instanceId,
             driverKind: driver,
@@ -1360,7 +1370,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   }),
                 ),
               getSnapshot: Effect.succeed(provider),
-              refresh: Effect.succeed(provider),
+              refresh,
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
@@ -1368,14 +1378,19 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             adapter: {} as ProviderInstance["adapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           });
-          const firstInstance = makeInstance(machineProvider, () =>
-            Effect.gen(function* () {
-              yield* Ref.update(snapshotCalls, (count) => count + 1);
-              if (yield* Ref.get(returnPendingSnapshot)) return pendingScopedProvider;
-              yield* Deferred.succeed(probeStarted, undefined);
-              yield* Deferred.await(releaseProbe);
-              return scopedProvider;
-            }),
+          const firstInstance = makeInstance(
+            machineProvider,
+            () =>
+              Effect.gen(function* () {
+                yield* Ref.update(snapshotCalls, (count) => count + 1);
+                if (yield* Ref.get(returnPendingSnapshot)) return pendingScopedProvider;
+                yield* Deferred.succeed(probeStarted, undefined);
+                yield* Deferred.await(releaseProbe);
+                return scopedProvider;
+              }),
+            Ref.update(machineRefreshCalls, (count) => count + 1).pipe(
+              Effect.andThen(Ref.get(machineSnapshotRef)),
+            ),
           );
           const rebuiltProvider = {
             ...machineProvider,
@@ -1452,9 +1467,24 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             assert.strictEqual(yield* Ref.get(snapshotCalls), 2);
             assert.deepStrictEqual(
               yield* registry.probeWorkspaceSnapshot({ instanceId, cwd: "/workspace" }),
-              scopedProvider,
+              { ...machineProvider, skills: scopedProvider.skills },
             );
             assert.strictEqual(yield* Ref.get(snapshotCalls), 3);
+            assert.strictEqual(yield* Ref.get(machineRefreshCalls), 1);
+
+            const loggedOutProvider = {
+              ...machineProvider,
+              checkedAt: "2026-06-10T00:01:30.000Z",
+              auth: { status: "unauthenticated" as const },
+              models: [],
+            } satisfies ServerProvider;
+            yield* Ref.set(machineSnapshotRef, loggedOutProvider);
+            assert.deepStrictEqual(
+              yield* registry.probeWorkspaceSnapshot({ instanceId, cwd: "/workspace" }),
+              { ...loggedOutProvider, skills: scopedProvider.skills },
+            );
+            assert.strictEqual(yield* Ref.get(snapshotCalls), 4);
+            assert.strictEqual(yield* Ref.get(machineRefreshCalls), 2);
 
             yield* Ref.set(instancesRef, [rebuiltInstance]);
             yield* PubSub.publish(registryChanges, undefined);

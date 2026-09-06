@@ -276,8 +276,10 @@ export const make = Effect.gen(function* () {
       id: issue.id,
       number: issue.number,
     });
-    const locatedRoot = located.ancestry[0] ?? located.issue;
-    if (!located.ancestryComplete || locatedRoot.id !== root.id) {
+    if (
+      !located.ancestryComplete ||
+      !located.ancestry.some((ancestor) => ancestor.id === root.id)
+    ) {
       return yield* startError(
         "unsupported-issue",
         "The selected decision does not belong to this workflow root.",
@@ -397,6 +399,22 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+    const holdAttempt = Effect.fn("WorkflowStartService.holdAttempt")(function* (detail: string) {
+      yield* sql`
+        UPDATE workflow_start_attempts SET status = 'held', detail = ${detail},
+          updated_at = ${createdAt}
+        WHERE attempt_id = ${attemptId}
+      `.pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "The held workflow attempt could not be saved.",
+            String(error),
+          ),
+        ),
+      );
+    });
+
     const identity = yield* executeClaim(project.workspaceRoot, ["api", "user", "--jq", ".login"]);
     const login = identity.stdout.trim();
     if (!login) {
@@ -429,6 +447,11 @@ export const make = Effect.gen(function* () {
       .split("\n")
       .map((value) => value.trim())
       .filter(Boolean);
+    if (beforeAssignees.length > 0) {
+      const detail = `This decision is already assigned to ${beforeAssignees.join(", ")}. Use an explicit handoff or takeover before starting it here.`;
+      yield* holdAttempt(detail);
+      return yield* startError("claim-failed", detail);
+    }
     yield* executeClaim(project.workspaceRoot, [
       "issue",
       "edit",
@@ -460,26 +483,6 @@ export const make = Effect.gen(function* () {
       .split("\n")
       .map((value) => value.trim())
       .filter(Boolean);
-    if (!afterAssignees.includes(login)) {
-      yield* sql`
-        UPDATE workflow_start_attempts SET status = 'held',
-          detail = 'GitHub did not confirm the assignment. Reconcile the claim before retrying.',
-          updated_at = ${createdAt}
-        WHERE attempt_id = ${attemptId}
-      `.pipe(
-        Effect.mapError((error) =>
-          startError(
-            "persistence-failed",
-            "The uncertain claim could not be recorded.",
-            String(error),
-          ),
-        ),
-      );
-      return yield* startError(
-        "claim-failed",
-        "GitHub did not confirm the assignment. Reconcile the claim before retrying.",
-      );
-    }
     const claimOwned = !beforeAssignees.includes(login);
     const releaseOwnedClaim = () =>
       claimOwned
@@ -493,9 +496,27 @@ export const make = Effect.gen(function* () {
             login,
           ]).pipe(
             Effect.as(true),
-            Effect.catch(() => Effect.succeed(false)),
+            Effect.orElseSucceed(() => false),
           )
         : Effect.succeed(false);
+    if (!afterAssignees.includes(login)) {
+      yield* holdAttempt(
+        "GitHub did not confirm the assignment. Reconcile the claim before retrying.",
+      );
+      return yield* startError(
+        "claim-failed",
+        "GitHub did not confirm the assignment. Reconcile the claim before retrying.",
+      );
+    }
+    const competingAssignees = afterAssignees.filter((assignee) => assignee !== login);
+    if (competingAssignees.length > 0) {
+      const claimReleased = yield* releaseOwnedClaim();
+      const detail = claimReleased
+        ? `A competing assignment to ${competingAssignees.join(", ")} appeared while claiming. This attempt is held and its own claim was released.`
+        : `A competing assignment to ${competingAssignees.join(", ")} appeared while claiming. This attempt is held, but its own claim could not be released.`;
+      yield* holdAttempt(detail);
+      return yield* startError("claim-failed", detail);
+    }
 
     const instructions = workflowDecisionInstructions({
       repository: input.repository,
@@ -547,16 +568,18 @@ export const make = Effect.gen(function* () {
 
     const dispatched = yield* dispatch(command).pipe(
       Effect.catch((error) => {
+        const turnWasNotAccepted = error.bootstrapTurnDisposition === "not-accepted";
         const threadWasDeleted = error.bootstrapThreadDisposition === "deleted";
-        const releaseClaim =
-          threadWasDeleted && claimOwned ? releaseOwnedClaim() : Effect.succeed(false);
+        const releaseClaim = turnWasNotAccepted ? releaseOwnedClaim() : Effect.succeed(false);
 
         return releaseClaim.pipe(
           Effect.flatMap((claimReleased) => {
-            const detail = threadWasDeleted
+            const detail = turnWasNotAccepted
               ? claimOwned && !claimReleased
-                ? "The bootstrap thread was deleted, but the claim could not be released. Reconcile the assignment before retrying."
-                : "The bootstrap thread was deleted before a turn started. The claim added by this attempt was released."
+                ? "No first turn was accepted, but the claim could not be released. Reconcile the assignment before retrying."
+                : threadWasDeleted
+                  ? "The bootstrap thread was deleted before a turn started. The claim added by this attempt was released."
+                  : "No first turn was accepted. The claim added by this attempt was released."
               : "The first submission is uncertain. Reconcile the durable command before retrying.";
             return sql`
               UPDATE workflow_start_attempts SET status = 'held', detail = ${detail},
@@ -574,7 +597,7 @@ export const make = Effect.gen(function* () {
                 Effect.fail(
                   startError(
                     "dispatch-failed",
-                    threadWasDeleted
+                    turnWasNotAccepted
                       ? detail
                       : "The first submission is uncertain and will not be sent again automatically.",
                     String(error),

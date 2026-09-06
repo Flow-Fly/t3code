@@ -834,7 +834,21 @@ export const ProviderRegistryLive = Layer.effect(
     }) {
       const instance = yield* instanceRegistry.getInstance(input.instanceId);
       if (!instance?.snapshotForCwd) return undefined;
-      const scopedSnapshot = yield* instance.snapshotForCwd(input.cwd);
+      const [machineSnapshot, workspaceSnapshot] = yield* Effect.all(
+        [instance.snapshot.refresh, instance.snapshotForCwd(input.cwd)],
+        { concurrency: 1 },
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.fail(
+            new ProviderDriverError({
+              driver: instance.driverKind,
+              instanceId: input.instanceId,
+              detail: "Fresh provider workspace discovery failed.",
+              cause,
+            }),
+          ),
+        ),
+      );
       const currentInstance = yield* instanceRegistry.getInstance(input.instanceId);
       if (currentInstance !== instance) {
         return yield* new ProviderDriverError({
@@ -843,7 +857,10 @@ export const ProviderRegistryLive = Layer.effect(
           detail: "Provider instance changed during workspace discovery.",
         });
       }
-      if (scopedSnapshot.status === "error") return scopedSnapshot;
+      const scopedSnapshot =
+        workspaceSnapshot.status === "error"
+          ? workspaceSnapshot
+          : { ...machineSnapshot, skills: workspaceSnapshot.skills };
       const [previousProviders, nextProviders] = yield* Ref.modify(providersRef, (providers) => {
         const next = providers.map((provider) =>
           provider.instanceId === input.instanceId

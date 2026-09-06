@@ -71,9 +71,11 @@ it.effect("decodes a dispatch error after its bootstrap thread was deleted", () 
       _tag: "OrchestrationDispatchCommandError",
       message: "Failed to create worktree.",
       bootstrapThreadDisposition: "deleted",
+      bootstrapTurnDisposition: "not-accepted",
     });
 
     assert.strictEqual(error.bootstrapThreadDisposition, "deleted");
+    assert.strictEqual(error.bootstrapTurnDisposition, "not-accepted");
   }),
 );
 

@@ -70,4 +70,18 @@ describe("resolveWorkflowStartSelection", () => {
       message: "The project default must use an enabled Codex provider.",
     });
   });
+
+  it("rejects an unsupported explicit effort without replacing it with the provider default", () => {
+    const codex = provider();
+    expect(
+      resolveWorkflowStartSelection([codex], {
+        instanceId: codex.instanceId,
+        model: "gpt-6-astra",
+        options: [{ id: "reasoningEffort", value: "ultra" }],
+      }),
+    ).toEqual({
+      selection: null,
+      message: "Reasoning effort 'ultra' is unavailable for the project default Codex model.",
+    });
+  });
 });

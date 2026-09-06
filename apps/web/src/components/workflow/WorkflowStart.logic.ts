@@ -42,6 +42,20 @@ export function resolveWorkflowStartSelection(
       message: "The project default Codex model is unavailable.",
     };
   }
+  const explicitEffort = getModelSelectionStringOptionValue(projectDefault, "reasoningEffort");
+  const effortDescriptor = model.capabilities.optionDescriptors?.find(
+    (descriptor) => descriptor.id === "reasoningEffort",
+  );
+  if (
+    explicitEffort &&
+    (effortDescriptor?.type !== "select" ||
+      !effortDescriptor.options.some((option) => option.id === explicitEffort))
+  ) {
+    return {
+      selection: null,
+      message: `Reasoning effort '${explicitEffort}' is unavailable for the project default Codex model.`,
+    };
+  }
   const options = buildProviderOptionSelectionsFromDescriptors(
     getProviderOptionDescriptors({
       caps: model.capabilities,
