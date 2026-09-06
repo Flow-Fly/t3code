@@ -620,6 +620,91 @@ describe("WorkflowStartService", () => {
     },
   );
 
+  it.effect("requires the complete root fog section to unambiguously clear unknowns", () =>
+    Effect.gen(function* () {
+      for (const remainingFog of [
+        "None resolved yet.",
+        "None.\n- Unresolved question",
+        "None, except the deployment prerequisite.",
+      ]) {
+        const unresolvedMap = {
+          ...detail(map, [], false),
+          body: `## Remaining fog\n\n${remainingFog}\n`,
+        };
+        const test = harness({
+          planningThreadState: "completed",
+          details: new Map([[map.number, unresolvedMap]]),
+          children: new Map([
+            [
+              map.number,
+              {
+                parentNumber: map.number,
+                children: [closedDecision(decision.number, "resolved")],
+                frontier: { status: "empty", message: "All decisions closed.", readyIssueIds: [] },
+              },
+            ],
+          ]),
+        });
+
+        const error = yield* Effect.flip(
+          WorkflowStartService.WorkflowStartService.pipe(
+            Effect.flatMap((service) =>
+              service.start(
+                {
+                  ...test.input,
+                  issueNumber: map.number,
+                  phase: "specification",
+                  planningThreadId: ThreadId.make("planning-thread"),
+                },
+                test.dispatch,
+              ),
+            ),
+            Effect.provide(test.layer),
+          ),
+        );
+
+        expect(error).toMatchObject({ failure: "not-ready" });
+        expect("detail" in error ? error.detail : "").toContain(remainingFog);
+        expect(test.commands).toHaveLength(0);
+      }
+    }),
+  );
+
+  it.effect("accepts an unambiguous no-remaining-unknowns section", () => {
+    const clearedMap = {
+      ...detail(map, [], false),
+      body: "## Remaining unknowns\n\nNo remaining unknowns.\n",
+    };
+    const test = harness({
+      planningThreadState: "completed",
+      details: new Map([[map.number, clearedMap]]),
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [closedDecision(decision.number, "resolved")],
+            frontier: { status: "empty", message: "All decisions closed.", readyIssueIds: [] },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const result = yield* (yield* WorkflowStartService.WorkflowStartService).start(
+        {
+          ...test.input,
+          issueNumber: map.number,
+          phase: "specification",
+          planningThreadId: ThreadId.make("planning-thread"),
+        },
+        test.dispatch,
+      );
+
+      expect(result).toMatchObject({ disposition: "started", phase: "specification" });
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("holds capability creation while an in-scope decision remains unresolved", () => {
     const unresolvedDecision = openDecision(decision.number);
     const test = harness({
@@ -754,6 +839,61 @@ describe("WorkflowStartService", () => {
 
       expect(error).toMatchObject({ failure: "not-ready" });
       expect(error.detail).toContain("storage boundary");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("rejects misleading clearance text in a nested map", () => {
+    const nestedMap = {
+      ...summary(13, "map", map.number, ["wayfinder:map"]),
+      childCount: 0,
+    };
+    const test = harness({
+      planningThreadState: "completed",
+      details: new Map([
+        [map.number, detail(map, [], false)],
+        [
+          nestedMap.number,
+          {
+            ...detail(nestedMap, [], false),
+            body: "## Remaining fog\n\nNone.\n- Resolve deployment ownership.\n",
+          },
+        ],
+      ]),
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [nestedMap],
+            frontier: { status: "available", message: "Nested map.", readyIssueIds: [] },
+          },
+        ],
+        [
+          nestedMap.number,
+          {
+            parentNumber: nestedMap.number,
+            children: [],
+            frontier: { status: "empty", message: "No visible children.", readyIssueIds: [] },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        (yield* WorkflowStartService.WorkflowStartService).start(
+          {
+            ...test.input,
+            issueNumber: map.number,
+            phase: "specification",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.detail).toContain("Resolve deployment ownership");
       expect(test.commands).toHaveLength(0);
     }).pipe(Effect.provide(test.layer));
   });

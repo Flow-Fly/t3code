@@ -84,7 +84,7 @@ function markdownSection(body: string, name: string): string | undefined {
 
 function explicitlyClearedFog(body: string): boolean {
   const remaining = markdownSection(body, "(?:Remaining fog|Remaining unknowns)");
-  return Boolean(remaining && /^(?:none|no remaining (?:fog|unknowns?))\b/iu.test(remaining));
+  return Boolean(remaining && /^(?:none|no remaining (?:fog|unknowns?))\.?$/iu.test(remaining));
 }
 
 function sourceMapReferences(body: string) {
