@@ -146,6 +146,13 @@ function normalizedUnitTitle(title: string): string {
   return title.replace(/\s+/gu, " ").trim().toLocaleLowerCase();
 }
 
+function readinessDetail(issue: WorkflowIssueSummary): string {
+  return (
+    issue.readiness?.reasons.map((reason) => reason.message).join(" ") ||
+    "Refresh Workflow to load current readiness evidence."
+  );
+}
+
 function sourceIssueReferences(body: string) {
   const section = /(?:^|\n)#{2,6}\s+Source map\s*\n([\s\S]*?)(?=\n#{1,6}\s|$)/iu.exec(body)?.[1];
   if (!section || /^\s*none(?:\s*\(standalone\))?\.?\s*$/iu.test(section)) return [];
@@ -176,6 +183,16 @@ function admissionFromRow(row: AdmissionRow): WorkflowDirectorAdmission {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function ownedClaimLogins(rows: ReadonlyArray<AdmissionRow>): ReadonlyMap<number, string> {
+  return new Map(
+    rows.flatMap((row) =>
+      row.claimLogin && row.claimStatus !== "conflict"
+        ? ([[row.ticketNumber, row.claimLogin]] as const)
+        : [],
+    ),
+  );
 }
 
 export function workflowDirectorInstructions(input: {
@@ -645,13 +662,60 @@ export const make = Effect.gen(function* () {
     }
   });
 
+  const executeGitHub = Effect.fn("WorkflowDirectorService.executeGitHub")(function* (
+    cwd: string,
+    args: ReadonlyArray<string>,
+  ) {
+    return yield* github
+      .execute({ cwd, args, maxOutputBytes: 100_000 })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError("claim-failed", "GitHub ownership could not be verified.", error.message),
+        ),
+      );
+  });
+
+  const currentClaimIsOwned = Effect.fn("WorkflowDirectorService.currentClaimIsOwned")(function* (
+    cwd: string,
+    repository: string,
+    ticketNumber: number,
+    claimLogin: string,
+  ) {
+    const identity = yield* executeGitHub(cwd, ["api", "user", "--jq", ".login"]).pipe(
+      Effect.result,
+    );
+    if (
+      identity._tag === "Failure" ||
+      identity.success.stdout.trim().toLocaleLowerCase() !== claimLogin.toLocaleLowerCase()
+    ) {
+      return false;
+    }
+    const assignees = yield* executeGitHub(cwd, [
+      "issue",
+      "view",
+      String(ticketNumber),
+      "--repo",
+      repository,
+      "--json",
+      "assignees",
+      "--jq",
+      ".assignees[].login",
+    ]).pipe(Effect.result);
+    if (assignees._tag === "Failure") return false;
+    const current = assignees.success.stdout
+      .split("\n")
+      .map((value) => value.trim().toLocaleLowerCase())
+      .filter(Boolean);
+    return current.length === 1 && current[0] === claimLogin.toLocaleLowerCase();
+  });
+
   const prepareCapability = Effect.fn("WorkflowDirectorService.prepareCapability")(function* (
     input: Pick<
       WorkflowDirectorStartInput,
       "projectId" | "repository" | "capabilityNumber" | "modelSelection"
     >,
     cwd: string,
-    options?: { readonly allowClaimed?: boolean },
+    options?: { readonly ownedClaims?: ReadonlyMap<number, string> },
   ) {
     const capability = yield* workflow.issueDetail({
       projectId: input.projectId,
@@ -681,16 +745,46 @@ export const make = Effect.gen(function* () {
       }),
     );
     yield* verifyPublishedBreakdown(breakdownApproval, tickets);
+    yield* verifyRepository(cwd, input.repository);
+    const persistedClaimLogins = new Set(options?.ownedClaims?.values() ?? []);
+    const capabilityClaim =
+      persistedClaimLogins.size === 1 ? persistedClaimLogins.values().next().value : undefined;
     if (
-      options?.allowClaimed !== true &&
-      !tickets.some((ticket) => ticket.readiness?.status === "ready")
+      capability.readiness?.status !== "ready" &&
+      !(
+        capability.readiness?.status === "claimed" &&
+        capabilityClaim &&
+        (yield* currentClaimIsOwned(cwd, input.repository, capability.number, capabilityClaim))
+      )
     ) {
+      return yield* directorError(
+        "not-ready",
+        "This capability is not ready for implementation.",
+        readinessDetail(capability),
+      );
+    }
+    let hasReadyTicket = false;
+    for (const ticket of tickets) {
+      if (ticket.readiness?.status === "ready") {
+        hasReadyTicket = true;
+        break;
+      }
+      const claimLogin = options?.ownedClaims?.get(ticket.number);
+      if (
+        ticket.readiness?.status === "claimed" &&
+        claimLogin &&
+        (yield* currentClaimIsOwned(cwd, input.repository, ticket.number, claimLogin))
+      ) {
+        hasReadyTicket = true;
+        break;
+      }
+    }
+    if (!hasReadyTicket) {
       return yield* directorError(
         "not-ready",
         "No published delivery ticket is currently ready or owned by this capability.",
       );
     }
-    yield* verifyRepository(cwd, input.repository);
     const provider = yield* providerPreflight(cwd, input.modelSelection);
     return { capability, specificationApproval, breakdownApproval, tickets, ...provider };
   });
@@ -967,6 +1061,7 @@ export const make = Effect.gen(function* () {
       input: WorkflowDirectorStartInput,
       projectWorkspaceRoot: string,
       dispatch: Dispatch,
+      options?: { readonly ownedClaims?: ReadonlyMap<number, string> },
     ) {
       const updatedAt = DateTime.formatIso(yield* DateTime.now);
       const worktree = yield* ensureWorktree(row, projectWorkspaceRoot).pipe(Effect.result);
@@ -989,7 +1084,9 @@ export const make = Effect.gen(function* () {
           director: yield* statusFromRow({ ...row, status: "held", detail, updatedAt }),
         } satisfies WorkflowDirectorStartResult;
       }
-      const preparedResult = yield* prepareCapability(input, row.worktreePath).pipe(Effect.result);
+      const preparedResult = yield* prepareCapability(input, row.worktreePath, options).pipe(
+        Effect.result,
+      );
       if (preparedResult._tag === "Failure") {
         const detail = preparedResult.failure.message;
         yield* sql`
@@ -1173,12 +1270,14 @@ export const make = Effect.gen(function* () {
           rootNumber: existing.rootNumber,
           capabilityNumber: existing.capabilityNumber,
         };
-        yield* prepareCapability(retryInput, project.workspaceRoot);
+        const ownedClaims = ownedClaimLogins(yield* admissions(existing.directorId));
+        yield* prepareCapability(retryInput, project.workspaceRoot, { ownedClaims });
         return yield* continueInitialDirector(
           existing,
           retryInput,
           project.workspaceRoot,
           dispatch,
+          { ownedClaims },
         );
       }
       const director = yield* statusFromRow(existing);
@@ -1320,6 +1419,7 @@ export const make = Effect.gen(function* () {
       );
     }
     const project = yield* selectedProject(ProjectId.make(row.projectId));
+    const ownedClaims = ownedClaimLogins(yield* admissions(row.directorId));
     yield* prepareCapability(
       {
         projectId: ProjectId.make(row.projectId),
@@ -1328,7 +1428,7 @@ export const make = Effect.gen(function* () {
         modelSelection: input.modelSelection,
       },
       row.worktreePath,
-      { allowClaimed: true },
+      { ownedClaims },
     );
     yield* ensureWorktree(row, project.workspaceRoot);
     if (Option.isNone(shell) || !latestTurn) {
@@ -1417,18 +1517,35 @@ export const make = Effect.gen(function* () {
     return yield* statusFromRow(row);
   });
 
-  const executeGitHub = Effect.fn("WorkflowDirectorService.executeGitHub")(function* (
-    cwd: string,
-    args: ReadonlyArray<string>,
-  ) {
-    return yield* github
-      .execute({ cwd, args, maxOutputBytes: 100_000 })
-      .pipe(
-        Effect.mapError((error) =>
-          directorError("claim-failed", "GitHub ownership could not be verified.", error.message),
-        ),
+  const requireDeliveryReadiness = Effect.fn("WorkflowDirectorService.requireDeliveryReadiness")(
+    function* (
+      row: DirectorRow,
+      issue: WorkflowIssueSummary,
+      ownedAdmission: AdmissionRow | undefined,
+      allowOwnedClaim: boolean,
+    ) {
+      if (issue.readiness?.status === "ready") return;
+      if (
+        issue.readiness?.status === "claimed" &&
+        allowOwnedClaim &&
+        ownedAdmission?.claimLogin &&
+        ownedAdmission.claimStatus !== "conflict" &&
+        (yield* currentClaimIsOwned(
+          row.worktreePath,
+          row.repository,
+          issue.number,
+          ownedAdmission.claimLogin,
+        ))
+      ) {
+        return;
+      }
+      return yield* directorError(
+        "not-ready",
+        "This delivery unit is not ready to admit.",
+        readinessDetail(issue),
       );
-  });
+    },
+  );
 
   const reconcileExistingClaim = Effect.fn("WorkflowDirectorService.reconcileExistingClaim")(
     function* (row: DirectorRow, ticketNumber: number, existing: AdmissionRow) {
@@ -1530,7 +1647,7 @@ export const make = Effect.gen(function* () {
         },
       },
       row.worktreePath,
-      { allowClaimed: true },
+      { ownedClaims: ownedClaimLogins(existingRows) },
     );
     const ticket = yield* workflow.issueDetail({
       projectId: ProjectId.make(row.projectId),
@@ -1546,14 +1663,8 @@ export const make = Effect.gen(function* () {
         "This ticket is not a published delivery slice of the selected capability.",
       );
     }
-    if (!existing && ticket.readiness?.status !== "ready") {
-      return yield* directorError(
-        "not-ready",
-        "This delivery unit is not ready to admit.",
-        ticket.readiness?.reasons.map((reason) => reason.message).join(" "),
-      );
-    }
     let slotTicketNumber: number;
+    let parent: WorkflowIssueSummary | undefined;
     if (ticket.kind === "ticket") {
       if (input.parentTicketNumber && input.parentTicketNumber !== ticket.number) {
         return yield* directorError(
@@ -1569,7 +1680,7 @@ export const make = Effect.gen(function* () {
         id: ticket.id,
         number: ticket.number,
       });
-      const parent = located.ancestry.find(
+      const parentIdentity = located.ancestry.find(
         (ancestor) =>
           ancestor.number === input.parentTicketNumber &&
           ancestor.kind === "ticket" &&
@@ -1577,7 +1688,11 @@ export const make = Effect.gen(function* () {
             (candidate) => candidate.id === ancestor.id && candidate.number === ancestor.number,
           ),
       );
-      if (!located.ancestryComplete || !parent) {
+      parent = capabilityState.tickets.find(
+        (candidate) =>
+          candidate.id === parentIdentity?.id && candidate.number === parentIdentity?.number,
+      );
+      if (!located.ancestryComplete || !parentIdentity || !parent) {
         return yield* directorError(
           "not-ready",
           "The nested task does not belong to the supplied delivery slice.",
@@ -1589,6 +1704,20 @@ export const make = Effect.gen(function* () {
         "not-ready",
         "Only delivery tickets, or their verified nested tasks, can be admitted.",
       );
+    }
+    yield* requireDeliveryReadiness(
+      row,
+      ticket,
+      existing,
+      Boolean(existing) && input.purpose !== "implement",
+    );
+    if (parent) {
+      const parentAdmission = existingRows.find(
+        (admission) =>
+          admission.repository.toLocaleLowerCase() === input.repository.toLocaleLowerCase() &&
+          admission.ticketNumber === parent!.number,
+      );
+      yield* requireDeliveryReadiness(row, parent, parentAdmission, Boolean(parentAdmission));
     }
     if (existing) {
       const reconciled = yield* reconcileExistingClaim(row, ticket.number, existing);

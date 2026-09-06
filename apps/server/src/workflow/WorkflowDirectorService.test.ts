@@ -28,7 +28,11 @@ import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistry
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
-import { interpretWorkflowEvidence, type WorkflowEvidenceComment } from "./WorkflowEvidence.ts";
+import {
+  interpretWorkflowEvidence,
+  type WorkflowBlockerEvidence,
+  type WorkflowEvidenceComment,
+} from "./WorkflowEvidence.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
 const projectId = ProjectId.make("project-1");
@@ -433,7 +437,113 @@ function interpretedCapabilityFixture(
       ...interpreted,
     };
   });
-  return { capability: capabilityDetail, ticketDetails, breakdown: approvedBreakdown };
+  return {
+    capability: capabilityDetail,
+    ticketDetails,
+    breakdown: approvedBreakdown,
+    source,
+    breakdownRecord,
+  };
+}
+
+function reinterpretTicket(
+  ticket: WorkflowIssueDetail,
+  approvalComments: ReadonlyArray<WorkflowEvidenceComment>,
+  options: {
+    readonly assignees?: ReadonlyArray<string>;
+    readonly blockers?: ReadonlyArray<WorkflowBlockerEvidence>;
+  } = {},
+) {
+  return interpretWorkflowEvidence({
+    issue: {
+      id: ticket.id,
+      url: ticket.url,
+      number: ticket.number,
+      title: ticket.title,
+      kind: ticket.kind,
+      state: ticket.state,
+      stateReason: ticket.stateReason,
+      labels: ticket.labels,
+      assignees: options.assignees ?? [],
+      body: ticket.body,
+      comments: [],
+      reopenedAt: [],
+    },
+    approvalComments,
+    ...(options.blockers ? { blockers: options.blockers } : {}),
+  });
+}
+
+function rawIssueSummary(issue: WorkflowIssueSummary): WorkflowIssueSummary {
+  return {
+    id: issue.id,
+    repository: issue.repository,
+    number: issue.number,
+    title: issue.title,
+    url: issue.url,
+    kind: issue.kind,
+    state: issue.state,
+    stateReason: issue.stateReason,
+    updatedAt: issue.updatedAt,
+    childCount: issue.childCount,
+    parentNumber: issue.parentNumber,
+    labels: issue.labels,
+  };
+}
+
+function capabilityWithManualPrerequisite(
+  fixture: ReturnType<typeof interpretedCapabilityFixture>,
+  condition: string,
+  cleared: boolean,
+) {
+  const body = `${fixture.capability.body.trim()}\n\n## Manual prerequisites\n\n${condition}\n`;
+  const specification = evidenceComment({
+    id: `specification-${cleared ? "cleared" : "blocked"}`,
+    body: [
+      "<!-- t3-workflow:v1 approval -->",
+      "Kind: specification",
+      "Approved by: Flow-Fly (owner)",
+      `Source: ${fixture.source.url}`,
+      "## Approved content",
+      body,
+    ].join("\n"),
+  });
+  const reassessment = evidenceComment({
+    id: "manual-prerequisite-cleared",
+    createdAt: "2026-09-06T10:00:00.000Z",
+    body: [
+      "## Reassessment",
+      "<!-- t3-workflow:v1 reassessment -->",
+      `Trigger: ${fixture.capability.url}`,
+      "Outcome: cleared",
+      "### Changes",
+      `${condition} — verified`,
+      "### Evidence",
+      "https://github.com/Flow-Fly/t3code/issues/17#issuecomment-proof",
+    ].join("\n"),
+  });
+  const interpreted = interpretWorkflowEvidence({
+    issue: {
+      id: fixture.capability.id,
+      url: fixture.capability.url,
+      number: fixture.capability.number,
+      title: fixture.capability.title,
+      kind: fixture.capability.kind,
+      state: fixture.capability.state,
+      stateReason: fixture.capability.stateReason,
+      labels: fixture.capability.labels,
+      assignees: [],
+      body,
+      comments: [
+        fixture.source,
+        specification,
+        fixture.breakdownRecord,
+        ...(cleared ? [reassessment] : []),
+      ],
+      reopenedAt: [],
+    },
+  });
+  return { ...fixture.capability, body, ...interpreted };
 }
 
 interface HarnessOptions {
@@ -828,6 +938,35 @@ describe("WorkflowDirectorService", () => {
     },
   );
 
+  it.effect("holds a fresh director while a capability prerequisite needs review", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const blockedCapability = capabilityWithManualPrerequisite(
+      fixture,
+      "Production access must be verified",
+      false,
+    );
+    const test = harness({ ...fixture, capability: blockedCapability });
+    return Effect.gen(function* () {
+      expect(blockedCapability.readiness).toMatchObject({
+        status: "needs-review",
+        reasons: expect.arrayContaining([expect.objectContaining({ kind: "manual-condition" })]),
+      });
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const result = yield* service
+        .start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        )
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({ failure: "not-ready" });
+      }
+      expect(test.worktreeCalls).toHaveLength(0);
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("retries proven unattempted worktree setup without replacing the director", () => {
     const fixture = interpretedCapabilityFixture(1);
     const test = harness({ ...fixture, failWorktreeAttempts: 1 });
@@ -841,6 +980,39 @@ describe("WorkflowDirectorService", () => {
       expect(recovered.director.directorId).toBe(held.director.directorId);
       expect(recovered.director.threadId).toBe(held.director.threadId);
       expect(test.worktreeCalls).toHaveLength(2);
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds worktree setup retry until capability reassessment clears", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const condition = "Production access must be verified";
+    const clearedCapability = capabilityWithManualPrerequisite(fixture, condition, true);
+    const worktreeCapability = capabilityWithManualPrerequisite(fixture, condition, false);
+    const test = harness({
+      ...fixture,
+      capability: clearedCapability,
+      worktreeCapability,
+      failWorktreeAttempts: 1,
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const input = { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection };
+      const held = yield* service.start(input, test.dispatch);
+      const blockedRetry = yield* service.start(input, test.dispatch).pipe(Effect.result);
+      expect(blockedRetry._tag).toBe("Failure");
+      if (blockedRetry._tag === "Failure") {
+        expect(blockedRetry.failure).toMatchObject({ failure: "not-ready" });
+      }
+      expect(test.worktreeCalls).toHaveLength(1);
+      expect(test.commands).toHaveLength(0);
+
+      Object.assign(worktreeCapability, clearedCapability);
+      const recovered = yield* service.start(input, test.dispatch);
+      expect(recovered).toMatchObject({
+        disposition: "started",
+        director: { directorId: held.director.directorId, status: "active" },
+      });
       expect(test.commands).toHaveLength(1);
     }).pipe(Effect.provide(test.layer));
   });
@@ -945,6 +1117,68 @@ describe("WorkflowDirectorService", () => {
   });
 
   it.effect(
+    "holds resume on current capability blockers but reconciles an accepted command",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const condition = "Production access must be verified";
+      const clearedCapability = capabilityWithManualPrerequisite(fixture, condition, true);
+      const worktreeCapability = { ...clearedCapability };
+      let shell: Option.Option<unknown> = Option.none();
+      const test = harness({
+        ...fixture,
+        capability: clearedCapability,
+        worktreeCapability,
+        threadShell: () => Effect.succeed(shell as never),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        shell = Option.some({
+          id: started.director.threadId,
+          latestTurn: { turnId: "interrupted-turn", state: "interrupted" },
+          session: { status: "interrupted", activeTurnId: null },
+        });
+        const interrupted = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        const input = {
+          projectId,
+          repository,
+          capabilityNumber: 17,
+          directorId: started.director.directorId,
+          observation: interrupted.observation,
+          modelSelection,
+        };
+
+        Object.assign(
+          worktreeCapability,
+          capabilityWithManualPrerequisite(fixture, condition, false),
+        );
+        const held = yield* service.resume(input, test.dispatch).pipe(Effect.result);
+        expect(held._tag).toBe("Failure");
+        if (held._tag === "Failure") {
+          expect(held.failure).toMatchObject({ failure: "not-ready" });
+        }
+        expect(test.commands).toHaveLength(1);
+
+        Object.assign(worktreeCapability, clearedCapability);
+        const resumed = yield* service.resume(input, test.dispatch);
+        expect(resumed.threadId).toBe(started.director.threadId);
+        expect(test.commands).toHaveLength(2);
+
+        Object.assign(
+          worktreeCapability,
+          capabilityWithManualPrerequisite(fixture, condition, false),
+        );
+        const reconciled = yield* service.resume(input, test.dispatch);
+        expect(reconciled.threadId).toBe(started.director.threadId);
+        expect(test.commands).toHaveLength(2);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
     "rejects unrelated work and treats a pre-existing same-login claim as a conflict",
     () => {
       const fixture = interpretedCapabilityFixture(1);
@@ -986,6 +1220,27 @@ describe("WorkflowDirectorService", () => {
           })
           .pipe(Effect.result);
         expect(rejected._tag).toBe("Failure");
+        Object.assign(
+          fixture.ticketDetails[0]!,
+          reinterpretTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord], {
+            assignees: ["Flow-Fly"],
+          }),
+        );
+        const externalClaim = yield* service
+          .admit({
+            projectId,
+            directorId: started.director.directorId,
+            repository,
+            ticketNumber: fixture.ticketDetails[0]!.number,
+            purpose: "implement",
+            ownership: "worker-one",
+          })
+          .pipe(Effect.result);
+        expect(externalClaim._tag).toBe("Failure");
+        Object.assign(
+          fixture.ticketDetails[0]!,
+          reinterpretTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord]),
+        );
         const admitted = yield* service.admit({
           projectId,
           directorId: started.director.directorId,
@@ -998,7 +1253,29 @@ describe("WorkflowDirectorService", () => {
           claimLogin: "Flow-Fly",
           claimStatus: "conflict",
         });
+        Object.assign(
+          fixture.ticketDetails[0]!,
+          reinterpretTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord], {
+            assignees: ["Flow-Fly"],
+          }),
+        );
+        const conflictedRetry = yield* service
+          .admit({
+            projectId,
+            directorId: started.director.directorId,
+            repository,
+            ticketNumber: fixture.ticketDetails[0]!.number,
+            purpose: "retry",
+            ownership: "worker-one",
+          })
+          .pipe(Effect.result);
+        expect(conflictedRetry._tag).toBe("Failure");
+        expect(assignees).toEqual(["Flow-Fly"]);
         assignees.length = 0;
+        Object.assign(
+          fixture.ticketDetails[0]!,
+          reinterpretTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord]),
+        );
         const reconciled = yield* service.admit({
           projectId,
           directorId: started.director.directorId,
@@ -1012,6 +1289,134 @@ describe("WorkflowDirectorService", () => {
           admission: { claimLogin: "Flow-Fly", claimStatus: "confirmed" },
           admissionCount: 1,
         });
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "preserves a blocked admission and permits review after its owned claim is ready again",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const assignees = new Map<number, string[]>();
+      let claimEdits = 0;
+      const test = harness({
+        ...fixture,
+        githubExecute: ({ args }) => {
+          if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+          const number = Number(args[2]);
+          if (args[0] === "issue" && args[1] === "view") {
+            return Effect.succeed(output((assignees.get(number) ?? []).join("\n")));
+          }
+          if (args[0] === "issue" && args[1] === "edit") {
+            claimEdits += 1;
+            assignees.set(number, ["Flow-Fly"]);
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        const ticket = fixture.ticketDetails[0]!;
+        const admitted = yield* service.admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: ticket.number,
+          purpose: "implement",
+          ownership: "worker-one",
+        });
+        expect(admitted.admission).toMatchObject({
+          claimLogin: "Flow-Fly",
+          claimStatus: "confirmed",
+        });
+
+        const blockerReadiness = interpretWorkflowEvidence({
+          issue: {
+            id: "blocking-dependency",
+            url: `https://github.com/${repository}/issues/500`,
+            number: 500,
+            title: "Blocking dependency",
+            kind: "task",
+            state: "open",
+            stateReason: null,
+            labels: ["wayfinder:task"],
+            assignees: [],
+            body: "## Blocked by\n\nNone",
+            comments: [],
+            reopenedAt: [],
+          },
+        }).readiness;
+        Object.assign(
+          ticket,
+          reinterpretTicket(ticket, [fixture.source, fixture.breakdownRecord], {
+            blockers: [
+              {
+                id: "blocking-dependency",
+                number: 500,
+                title: "Blocking dependency",
+                url: `https://github.com/${repository}/issues/500`,
+                readiness: blockerReadiness,
+              },
+            ],
+          }),
+        );
+        expect(ticket.readiness).toMatchObject({ status: "blocked" });
+        const editsBeforeHold = claimEdits;
+        const held = yield* service
+          .admit({
+            projectId,
+            directorId: started.director.directorId,
+            repository,
+            ticketNumber: ticket.number,
+            purpose: "retry",
+            ownership: "worker-one",
+          })
+          .pipe(Effect.result);
+        expect(held._tag).toBe("Failure");
+        if (held._tag === "Failure") {
+          expect(held.failure).toMatchObject({ failure: "not-ready" });
+        }
+        expect(claimEdits).toBe(editsBeforeHold);
+        const heldStatus = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(heldStatus.admissionCount).toBe(1);
+
+        Object.assign(
+          ticket,
+          reinterpretTicket(ticket, [fixture.source, fixture.breakdownRecord], {
+            assignees: ["Flow-Fly"],
+          }),
+        );
+        expect(ticket.readiness).toMatchObject({
+          status: "claimed",
+          reasons: expect.arrayContaining([expect.objectContaining({ kind: "claimed" })]),
+        });
+        const reviewed = yield* service.admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: ticket.number,
+          purpose: "review",
+          ownership: "reviewer-one",
+        });
+        expect(reviewed).toMatchObject({
+          disposition: "existing",
+          admission: {
+            admissionId: admitted.admission?.admissionId,
+            createdAt: admitted.admission?.createdAt,
+            claimLogin: "Flow-Fly",
+            claimStatus: "confirmed",
+          },
+          admissionCount: 1,
+        });
+        expect(claimEdits).toBe(editsBeforeHold);
       }).pipe(Effect.provide(test.layer));
     },
   );
@@ -1033,7 +1438,10 @@ describe("WorkflowDirectorService", () => {
       locate: ({ number }) =>
         Effect.succeed({
           issue: number === nestedTask.number ? nestedTask : fixture.ticketDetails[0]!,
-          ancestry: [fixture.ticketDetails[0]!, fixture.capability],
+          ancestry: [
+            rawIssueSummary(fixture.ticketDetails[0]!),
+            rawIssueSummary(fixture.capability),
+          ],
           ancestryComplete: true,
         }),
       githubExecute: ({ args }) =>
@@ -1068,29 +1476,58 @@ describe("WorkflowDirectorService", () => {
         purpose: "retry",
         ownership: "worker-one",
       });
-      Object.assign(fixture.ticketDetails[0]!, {
-        readiness: {
-          status: "blocked",
-          reasons: [{ kind: "blocked", message: "A dependency failed." }],
+      const parentTicket = fixture.ticketDetails[0]!;
+      const blockerReadiness = interpretWorkflowEvidence({
+        issue: {
+          id: "parent-blocker",
+          url: `https://github.com/${repository}/issues/500`,
+          number: 500,
+          title: "Parent blocker",
+          kind: "task",
+          state: "open",
+          stateReason: null,
+          labels: ["wayfinder:task"],
+          assignees: [],
+          body: "## Blocked by\n\nNone",
+          comments: [],
+          reopenedAt: [],
         },
-      });
-      const blockedRetry = yield* service.admit({
-        projectId,
-        directorId: started.director.directorId,
-        repository,
-        ticketNumber: fixture.ticketDetails[0]!.number,
-        purpose: "retry",
-        ownership: "worker-one",
-      });
-      const nested = yield* service.admit({
-        projectId,
-        directorId: started.director.directorId,
-        repository,
-        ticketNumber: nestedTask.number,
-        parentTicketNumber: fixture.ticketDetails[0]!.number,
-        purpose: "implement",
-        ownership: "worker-one/nested",
-      });
+      }).readiness;
+      Object.assign(
+        parentTicket,
+        reinterpretTicket(parentTicket, [fixture.source, fixture.breakdownRecord], {
+          blockers: [
+            {
+              id: "parent-blocker",
+              number: 500,
+              title: "Parent blocker",
+              url: `https://github.com/${repository}/issues/500`,
+              readiness: blockerReadiness,
+            },
+          ],
+        }),
+      );
+      const blockedRetry = yield* service
+        .admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: parentTicket.number,
+          purpose: "retry",
+          ownership: "worker-one",
+        })
+        .pipe(Effect.result);
+      const nested = yield* service
+        .admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: nestedTask.number,
+          parentTicketNumber: parentTicket.number,
+          purpose: "implement",
+          ownership: "worker-one/nested",
+        })
+        .pipe(Effect.result);
       const eleventh = yield* service.admit({
         projectId,
         directorId: started.director.directorId,
@@ -1100,8 +1537,8 @@ describe("WorkflowDirectorService", () => {
         ownership: "worker-eleven",
       });
       expect(retry).toMatchObject({ disposition: "existing", admissionCount: 10 });
-      expect(blockedRetry).toMatchObject({ disposition: "existing", admissionCount: 10 });
-      expect(nested).toMatchObject({ disposition: "admitted", admissionCount: 10 });
+      expect(blockedRetry._tag).toBe("Failure");
+      expect(nested._tag).toBe("Failure");
       expect(eleventh).toMatchObject({
         disposition: "limit-reached",
         admission: null,
