@@ -82,6 +82,7 @@ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolve
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkflowService from "./workflow/WorkflowService.ts";
+import * as WorkflowAdoptionService from "./workflow/WorkflowAdoptionService.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
@@ -318,6 +319,9 @@ const PullRequestServiceLive = PullRequestService.layer.pipe(
 );
 
 const WorkflowServiceLive = WorkflowService.layer.pipe(Layer.provide(ProcessRunner.layer));
+const WorkflowAdoptionServiceLive = WorkflowAdoptionService.layer.pipe(
+  Layer.provide(SqlitePersistenceLayerLive),
+);
 
 const GitManagerLayerLive = GitManager.layer.pipe(
   Layer.provideMerge(ProjectSetupScriptRunner.layer),
@@ -554,6 +558,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
   Layer.provide(PullRequestServiceLive),
   Layer.provide(WorkflowServiceLive),
+  Layer.provide(WorkflowAdoptionServiceLive),
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(DesktopAppUpdateLayerLive))),
   Layer.provide(commandReadinessLayer),

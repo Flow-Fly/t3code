@@ -18,6 +18,7 @@ import {
 } from "~/workflowMapStore";
 
 import { WorkflowFocusedMap } from "./WorkflowFocusedMap";
+import { WorkflowAdoptionPanel } from "./WorkflowAdoptionPanel";
 import { foldIdentity, issueIdentity } from "./WorkflowMap.logic";
 import { filterWorkflowRoots, resolveWorkflowRepository } from "./WorkflowPanel.logic";
 
@@ -102,6 +103,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
       : null,
   );
   const [rootSearch, setRootSearch] = useState("");
+  const [adopting, setAdopting] = useState(false);
   const roots = rootsQuery.data?.roots ?? [];
   const visibleRoots = useMemo(() => filterWorkflowRoots(roots, rootSearch), [rootSearch, roots]);
   const context = repository
@@ -281,6 +283,9 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
             #{focusedRoot.number} {focusedRoot.title}
           </button>
           <span className="text-muted-foreground">Top-to-bottom map</span>
+          <Button className="ml-auto" size="xs" variant="outline" onClick={() => setAdopting(true)}>
+            Adopt branch
+          </Button>
         </div>
         <WorkflowFocusedMap
           key={issueIdentity(focusedRoot)}
@@ -290,11 +295,27 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           onRefreshRoot={rootsQuery.refresh}
           onNavigateMatch={navigateToMatch}
         />
+        {adopting ? (
+          <WorkflowAdoptionPanel
+            key={`${props.environmentId}:${props.projectId}:${focusedRoot.repository}:${focusedRoot.number}`}
+            environmentId={props.environmentId}
+            projectId={props.projectId}
+            repository={focusedRoot.repository}
+            rootNumber={focusedRoot.number}
+            onClose={() => setAdopting(false)}
+            onChanged={() => {
+              rootsQuery.refresh();
+            }}
+          />
+        ) : null}
       </>
     );
 
   return (
-    <section className="@container/workflow flex min-h-0 flex-1 flex-col" aria-label="Workflow">
+    <section
+      className="@container/workflow relative flex min-h-0 flex-1 flex-col"
+      aria-label="Workflow"
+    >
       {header}
       {content}
     </section>

@@ -255,6 +255,113 @@ export type WorkflowLocateInput = typeof WorkflowLocateInput.Type;
 export const WorkflowLocateResult = WorkflowSearchMatch;
 export type WorkflowLocateResult = typeof WorkflowLocateResult.Type;
 
+export const WorkflowAdoptionRelationship = Schema.Struct({
+  issueNumber: PositiveInt,
+  relationship: Schema.Literals(["source", "specification"]),
+  source: TrimmedNonEmptyString,
+});
+export type WorkflowAdoptionRelationship = typeof WorkflowAdoptionRelationship.Type;
+
+export const WorkflowAdoptionItem = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  number: PositiveInt,
+  title: TrimmedNonEmptyString,
+  url: TrimmedNonEmptyString,
+  updatedAt: TrimmedNonEmptyString,
+  sourceBody: Schema.String,
+  currentKind: Schema.NullOr(WorkflowIssueKind),
+  proposedKind: WorkflowIssueKind,
+  currentParentNumber: Schema.NullOr(PositiveInt),
+  proposedParentNumber: Schema.NullOr(PositiveInt),
+  labels: Schema.Array(TrimmedNonEmptyString),
+  relationships: Schema.Array(WorkflowAdoptionRelationship),
+  changes: Schema.Array(TrimmedNonEmptyString),
+  included: Schema.Boolean,
+  parentChangeConfirmed: Schema.Boolean,
+});
+export type WorkflowAdoptionItem = typeof WorkflowAdoptionItem.Type;
+
+export const WorkflowAdoptionPreviewInput = Schema.Struct({
+  ...WorkflowRootsInput.fields,
+  rootNumber: PositiveInt,
+});
+export type WorkflowAdoptionPreviewInput = typeof WorkflowAdoptionPreviewInput.Type;
+
+export const WorkflowAdoptionPreview = Schema.Struct({
+  previewId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  items: Schema.Array(WorkflowAdoptionItem),
+});
+export type WorkflowAdoptionPreview = typeof WorkflowAdoptionPreview.Type;
+
+export const WorkflowAdoptionApplyInput = Schema.Struct({
+  projectId: ProjectId,
+  previewId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  items: Schema.Array(WorkflowAdoptionItem),
+});
+export type WorkflowAdoptionApplyInput = typeof WorkflowAdoptionApplyInput.Type;
+
+export const WorkflowAdoptionOperation = Schema.Struct({
+  issueNumber: PositiveInt,
+  kind: Schema.Literals(["add-label", "remove-label", "change-parent"]),
+  status: Schema.Literals(["applied", "already-current", "failed", "undo-skipped", "undone"]),
+  description: TrimmedNonEmptyString,
+  owned: Schema.Boolean,
+  detail: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type WorkflowAdoptionOperation = typeof WorkflowAdoptionOperation.Type;
+
+export const WorkflowAdoptionRecord = Schema.Struct({
+  adoptionId: TrimmedNonEmptyString,
+  previewId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  createdAt: TrimmedNonEmptyString,
+  status: Schema.Literals(["applied", "partial", "undone", "undo-partial"]),
+  operations: Schema.Array(WorkflowAdoptionOperation),
+});
+export type WorkflowAdoptionRecord = typeof WorkflowAdoptionRecord.Type;
+
+export const WorkflowAdoptionHistoryInput = Schema.Struct({
+  ...WorkflowRootsInput.fields,
+  rootNumber: PositiveInt,
+});
+export type WorkflowAdoptionHistoryInput = typeof WorkflowAdoptionHistoryInput.Type;
+
+export const WorkflowAdoptionHistoryResult = Schema.Struct({
+  records: Schema.Array(WorkflowAdoptionRecord),
+});
+export type WorkflowAdoptionHistoryResult = typeof WorkflowAdoptionHistoryResult.Type;
+
+export const WorkflowAdoptionUndoInput = Schema.Struct({
+  projectId: ProjectId,
+  adoptionId: TrimmedNonEmptyString,
+});
+export type WorkflowAdoptionUndoInput = typeof WorkflowAdoptionUndoInput.Type;
+
+export const WorkflowAdoptionFailure = Schema.Literals([
+  "preview-not-found",
+  "changed-source",
+  "parent-confirmation-required",
+  "invalid-selection",
+  "adoption-not-found",
+  "persistence-failed",
+]);
+export type WorkflowAdoptionFailure = typeof WorkflowAdoptionFailure.Type;
+
+export class WorkflowAdoptionError extends Schema.TaggedErrorClass<WorkflowAdoptionError>()(
+  "WorkflowAdoptionError",
+  {
+    failure: WorkflowAdoptionFailure,
+    message: TrimmedNonEmptyString,
+    detail: Schema.optional(TrimmedNonEmptyString),
+  },
+) {}
+
 export const WorkflowQueryFailure = Schema.Literals([
   "project-not-found",
   "missing-git-repository",

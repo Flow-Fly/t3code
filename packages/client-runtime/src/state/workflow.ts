@@ -3,11 +3,17 @@ import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
+import { createAtomCommandScheduler, createEnvironmentRpcCommand } from "./runtime.ts";
 
 /** Environment-targeted GitHub browsing. Each query is executed by the selected server. */
 export function createWorkflowEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
+  const commandScheduler = createAtomCommandScheduler();
+  const serialPerEnvironment = {
+    mode: "serial" as const,
+    key: ({ environmentId }: { readonly environmentId: string }) => environmentId,
+  };
   return {
     repositories: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:workflow:repositories",
@@ -38,6 +44,29 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       label: "environment-data:workflow:locate",
       tag: WS_METHODS.workflowLocate,
       staleTimeMs: 30_000,
+    }),
+    adoptionPreview: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:adoption-preview",
+      tag: WS_METHODS.workflowAdoptionPreview,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
+    adoptionApply: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:adoption-apply",
+      tag: WS_METHODS.workflowAdoptionApply,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
+    adoptionHistory: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:workflow:adoption-history",
+      tag: WS_METHODS.workflowAdoptionHistory,
+      staleTimeMs: 0,
+    }),
+    adoptionUndo: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:adoption-undo",
+      tag: WS_METHODS.workflowAdoptionUndo,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
     }),
   };
 }

@@ -131,6 +131,14 @@ import {
 import {
   WorkflowChildrenInput,
   WorkflowChildrenResult,
+  WorkflowAdoptionApplyInput,
+  WorkflowAdoptionError,
+  WorkflowAdoptionHistoryInput,
+  WorkflowAdoptionHistoryResult,
+  WorkflowAdoptionPreview,
+  WorkflowAdoptionPreviewInput,
+  WorkflowAdoptionRecord,
+  WorkflowAdoptionUndoInput,
   WorkflowIssueDetail,
   WorkflowIssueDetailInput,
   WorkflowLocateInput,
@@ -382,6 +390,10 @@ export const WS_METHODS = {
   workflowIssueDetail: "workflow.issueDetail",
   workflowSearch: "workflow.search",
   workflowLocate: "workflow.locate",
+  workflowAdoptionPreview: "workflow.adoption.preview",
+  workflowAdoptionApply: "workflow.adoption.apply",
+  workflowAdoptionHistory: "workflow.adoption.history",
+  workflowAdoptionUndo: "workflow.adoption.undo",
 
   // Source control methods
   sourceControlLookupRepository: "sourceControl.lookupRepository",
@@ -828,6 +840,36 @@ export const WsWorkflowLocateRpc = Rpc.make(WS_METHODS.workflowLocate, {
   payload: WorkflowLocateInput,
   success: WorkflowLocateResult,
   error: WorkflowRpcError,
+});
+
+const WorkflowAdoptionRpcError = Schema.Union([
+  WorkflowQueryError,
+  WorkflowAdoptionError,
+  EnvironmentAuthorizationError,
+]);
+
+export const WsWorkflowAdoptionPreviewRpc = Rpc.make(WS_METHODS.workflowAdoptionPreview, {
+  payload: WorkflowAdoptionPreviewInput,
+  success: WorkflowAdoptionPreview,
+  error: WorkflowAdoptionRpcError,
+});
+
+export const WsWorkflowAdoptionApplyRpc = Rpc.make(WS_METHODS.workflowAdoptionApply, {
+  payload: WorkflowAdoptionApplyInput,
+  success: WorkflowAdoptionRecord,
+  error: WorkflowAdoptionRpcError,
+});
+
+export const WsWorkflowAdoptionHistoryRpc = Rpc.make(WS_METHODS.workflowAdoptionHistory, {
+  payload: WorkflowAdoptionHistoryInput,
+  success: WorkflowAdoptionHistoryResult,
+  error: WorkflowAdoptionRpcError,
+});
+
+export const WsWorkflowAdoptionUndoRpc = Rpc.make(WS_METHODS.workflowAdoptionUndo, {
+  payload: WorkflowAdoptionUndoInput,
+  success: WorkflowAdoptionRecord,
+  error: WorkflowAdoptionRpcError,
 });
 
 export const WsSourceControlLookupRepositoryRpc = Rpc.make(
@@ -1326,6 +1368,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowIssueDetailRpc,
   WsWorkflowSearchRpc,
   WsWorkflowLocateRpc,
+  WsWorkflowAdoptionPreviewRpc,
+  WsWorkflowAdoptionApplyRpc,
+  WsWorkflowAdoptionHistoryRpc,
+  WsWorkflowAdoptionUndoRpc,
   WsSourceControlLookupRepositoryRpc,
   WsSourceControlCloneRepositoryRpc,
   WsSourceControlPublishRepositoryRpc,
