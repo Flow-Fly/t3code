@@ -399,6 +399,114 @@ describe("interpretWorkflowEvidence", () => {
     ]);
   });
 
+  it.each(["***", "---", "___", "* * *", "-  -  -  -", "_ _ _ _"])(
+    "accepts a supersession declaration after the thematic break %j",
+    (thematicBreak) => {
+      const suffix = encodeURIComponent(thematicBreak);
+      const original = resolution(
+        `thematic-original-${suffix}`,
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      );
+      const newer = resolution(
+        `thematic-newer-${suffix}`,
+        [
+          "[Commit](https://github.com/Flow-Fly/t3code/commit/def)",
+          "> Historical example only.",
+          thematicBreak,
+          `Supersedes: ${original.url}`,
+        ].join("\n"),
+        "2026-09-06T00:00:00Z",
+      );
+      const result = interpretWorkflowEvidence({
+        issue: issue({
+          state: "closed",
+          stateReason: "completed",
+          comments: [original, newer],
+        }),
+      });
+
+      expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+        [original.id, "superseded"],
+        [newer.id, "current"],
+      ]);
+    },
+  );
+
+  it.each(["**", "- -", "_ _", "*-*"])(
+    "keeps a supersession declaration quoted after the non-thematic line %j",
+    (line) => {
+      const suffix = encodeURIComponent(line);
+      const original = resolution(
+        `non-thematic-original-${suffix}`,
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+      );
+      const newer = resolution(
+        `non-thematic-newer-${suffix}`,
+        [
+          "[Commit](https://github.com/Flow-Fly/t3code/commit/def)",
+          "> Historical example only.",
+          line,
+          `Supersedes: ${original.url}`,
+        ].join("\n"),
+        "2026-09-06T00:00:00Z",
+      );
+      const result = interpretWorkflowEvidence({
+        issue: issue({
+          state: "closed",
+          stateReason: "completed",
+          comments: [original, newer],
+        }),
+      });
+
+      expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+        [original.id, "current"],
+        [newer.id, "current"],
+      ]);
+    },
+  );
+
+  it.each(["```", "~~~"])(
+    "ends quote context at an unquoted %s fence while keeping fenced declarations inert",
+    (fence) => {
+      const suffix = encodeURIComponent(fence);
+      const fencedTarget = resolution(
+        `fenced-target-${suffix}`,
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/abc)",
+        "2026-09-05T00:00:00Z",
+      );
+      const declaredTarget = resolution(
+        `declared-target-${suffix}`,
+        "[Commit](https://github.com/Flow-Fly/t3code/commit/def)",
+        "2026-09-05T01:00:00Z",
+      );
+      const newer = resolution(
+        `after-fence-${suffix}`,
+        [
+          "[Commit](https://github.com/Flow-Fly/t3code/commit/ghi)",
+          "> Historical example only.",
+          `${fence}text`,
+          `Supersedes: ${fencedTarget.url}`,
+          fence,
+          `Supersedes: ${declaredTarget.url}`,
+        ].join("\n"),
+        "2026-09-06T00:00:00Z",
+      );
+      const result = interpretWorkflowEvidence({
+        issue: issue({
+          state: "closed",
+          stateReason: "completed",
+          comments: [fencedTarget, declaredTarget, newer],
+        }),
+      });
+
+      expect(result.evidence.records.map((record) => [record.id, record.state])).toEqual([
+        [fencedTarget.id, "current"],
+        [declaredTarget.id, "superseded"],
+        [newer.id, "current"],
+      ]);
+    },
+  );
+
   it.each(["cancelled", "out-of-scope"] as const)(
     "does not accept unavailable %s evidence as an outcome",
     (outcome) => {

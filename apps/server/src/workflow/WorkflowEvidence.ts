@@ -140,6 +140,12 @@ function prerequisiteConditions(body: string): ReadonlyArray<string> {
   return [...new Set(conditions)];
 }
 
+function endsQuotedParagraph(line: string): boolean {
+  if (!line.trim()) return true;
+  if (/^ {0,3}#{1,6}(?:[ \t]+|$)/u.test(line)) return true;
+  return /^ {0,3}([*_-])(?:[ \t]*\1){2,}[ \t]*$/u.test(line);
+}
+
 function recordDeclarationLines(body: string): ReadonlyArray<string> {
   const lines: string[] = [];
   let fence: { character: string; length: number } | null = null;
@@ -148,8 +154,12 @@ function recordDeclarationLines(body: string): ReadonlyArray<string> {
     const fenceMatch = /^\s*(`{3,}|~{3,})/u.exec(line)?.[1];
     if (fenceMatch) {
       const character = fenceMatch[0]!;
-      if (!fence) fence = { character, length: fenceMatch.length };
-      else if (fence.character === character && fenceMatch.length >= fence.length) fence = null;
+      if (!fence) {
+        fence = { character, length: fenceMatch.length };
+        quotedParagraph = false;
+      } else if (fence.character === character && fenceMatch.length >= fence.length) {
+        fence = null;
+      }
       continue;
     }
     if (fence) continue;
@@ -158,7 +168,7 @@ function recordDeclarationLines(body: string): ReadonlyArray<string> {
       quotedParagraph = Boolean(quotedLine[1]?.trim());
       continue;
     }
-    const paragraphBoundary = !line.trim() || /^ {0,3}#{1,6}(?:[ \t]+|$)/u.test(line);
+    const paragraphBoundary = endsQuotedParagraph(line);
     if (quotedParagraph && !paragraphBoundary) continue;
     if (paragraphBoundary) quotedParagraph = false;
     if (/^(?: {4}|\t|\s*["'])/u.test(line)) continue;
