@@ -746,17 +746,7 @@ export const make = Effect.gen(function* () {
     );
     yield* verifyPublishedBreakdown(breakdownApproval, tickets);
     yield* verifyRepository(cwd, input.repository);
-    const persistedClaimLogins = new Set(options?.ownedClaims?.values() ?? []);
-    const capabilityClaim =
-      persistedClaimLogins.size === 1 ? persistedClaimLogins.values().next().value : undefined;
-    if (
-      capability.readiness?.status !== "ready" &&
-      !(
-        capability.readiness?.status === "claimed" &&
-        capabilityClaim &&
-        (yield* currentClaimIsOwned(cwd, input.repository, capability.number, capabilityClaim))
-      )
-    ) {
+    if (capability.readiness?.status !== "ready") {
       return yield* directorError(
         "not-ready",
         "This capability is not ready for implementation.",

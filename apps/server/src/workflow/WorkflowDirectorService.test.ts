@@ -442,8 +442,31 @@ function interpretedCapabilityFixture(
     ticketDetails,
     breakdown: approvedBreakdown,
     source,
+    specification,
     breakdownRecord,
   };
+}
+
+function reinterpretCapability(
+  fixture: ReturnType<typeof interpretedCapabilityFixture>,
+  assignees: ReadonlyArray<string>,
+) {
+  return interpretWorkflowEvidence({
+    issue: {
+      id: fixture.capability.id,
+      url: fixture.capability.url,
+      number: fixture.capability.number,
+      title: fixture.capability.title,
+      kind: fixture.capability.kind,
+      state: fixture.capability.state,
+      stateReason: fixture.capability.stateReason,
+      labels: fixture.capability.labels,
+      assignees,
+      body: fixture.capability.body,
+      comments: [fixture.source, fixture.specification, fixture.breakdownRecord],
+      reopenedAt: [],
+    },
+  });
 }
 
 function reinterpretTicket(
@@ -1289,6 +1312,97 @@ describe("WorkflowDirectorService", () => {
           admission: { claimLogin: "Flow-Fly", claimStatus: "confirmed" },
           admissionCount: 1,
         });
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "holds an external same-login capability claim without consuming the existing ticket slot",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const assignees = new Map<number, string[]>();
+      let claimEdits = 0;
+      const test = harness({
+        ...fixture,
+        githubExecute: ({ args }) => {
+          if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+          const number = Number(args[2]);
+          if (args[0] === "issue" && args[1] === "view") {
+            return Effect.succeed(output((assignees.get(number) ?? []).join("\n")));
+          }
+          if (args[0] === "issue" && args[1] === "edit") {
+            claimEdits += 1;
+            assignees.set(number, ["Flow-Fly"]);
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        const ticket = fixture.ticketDetails[0]!;
+        const admitted = yield* service.admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: ticket.number,
+          purpose: "implement",
+          ownership: "worker-one",
+        });
+        expect(admitted.admission).toMatchObject({
+          claimLogin: "Flow-Fly",
+          claimStatus: "confirmed",
+        });
+        const editsAfterAdmission = claimEdits;
+
+        assignees.set(fixture.capability.number, ["Flow-Fly"]);
+        Object.assign(fixture.capability, reinterpretCapability(fixture, ["Flow-Fly"]));
+        expect(fixture.capability.readiness).toMatchObject({ status: "claimed" });
+        const held = yield* service
+          .admit({
+            projectId,
+            directorId: started.director.directorId,
+            repository,
+            ticketNumber: ticket.number,
+            purpose: "retry",
+            ownership: "worker-one",
+          })
+          .pipe(Effect.result);
+        expect(held._tag).toBe("Failure");
+        if (held._tag === "Failure") {
+          expect(held.failure).toMatchObject({ failure: "not-ready" });
+        }
+        expect(claimEdits).toBe(editsAfterAdmission);
+        expect(test.commands).toHaveLength(1);
+        expect(
+          (yield* service.status({ projectId, repository, capabilityNumber: 17 })).admissionCount,
+        ).toBe(1);
+
+        assignees.delete(fixture.capability.number);
+        Object.assign(fixture.capability, reinterpretCapability(fixture, []));
+        expect(fixture.capability.readiness).toMatchObject({ status: "ready" });
+        const resumed = yield* service.admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: ticket.number,
+          purpose: "retry",
+          ownership: "worker-one",
+        });
+        expect(resumed).toMatchObject({
+          disposition: "existing",
+          admission: {
+            admissionId: admitted.admission?.admissionId,
+            createdAt: admitted.admission?.createdAt,
+            claimLogin: "Flow-Fly",
+            claimStatus: "confirmed",
+          },
+          admissionCount: 1,
+        });
+        expect(claimEdits).toBe(editsAfterAdmission);
       }).pipe(Effect.provide(test.layer));
     },
   );
