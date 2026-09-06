@@ -26,6 +26,7 @@ import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { ProviderDriverError } from "../provider/Errors.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import { interpretWorkflowEvidence } from "./WorkflowEvidence.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 import * as WorkflowStartService from "./WorkflowStartService.ts";
 
@@ -67,8 +68,47 @@ const root = summary(10, "container", null, ["workflow:container"]);
 const map = summary(12, "map", 10, ["wayfinder:map"]);
 const decision = summary(15, "decision", 12, ["wayfinder:research"]);
 
-function detail(issue: WorkflowIssueSummary): WorkflowIssueDetail {
-  return { ...issue, body: "Decision context", blockedBy: [] };
+function detail(
+  issue: WorkflowIssueSummary,
+  assignees: ReadonlyArray<string>,
+  blocked: boolean,
+): WorkflowIssueDetail {
+  const blockedBy = blocked
+    ? [
+        {
+          ...summary(14, "decision", 12, ["wayfinder:research"]),
+          readiness: {
+            status: "blocked" as const,
+            reasons: [
+              {
+                kind: "open-blocker" as const,
+                message: "A prerequisite remains open.",
+                source: `https://github.com/${repository}/issues/14`,
+              },
+            ],
+          },
+        },
+      ]
+    : [];
+  const body = "Decision context";
+  const readiness = interpretWorkflowEvidence({
+    issue: {
+      id: issue.id,
+      url: issue.url,
+      number: issue.number,
+      title: issue.title,
+      kind: issue.kind,
+      state: issue.state,
+      stateReason: issue.stateReason,
+      labels: issue.labels,
+      assignees,
+      body,
+      comments: [],
+      reopenedAt: [],
+    },
+    blockers: blockedBy,
+  }).readiness;
+  return { ...issue, body, blockedBy, readiness };
 }
 
 function output(stdout: string) {
@@ -134,6 +174,7 @@ function harness(
     readonly competingAssigneeAfterClaim?: string | undefined;
     readonly identityFailureCount?: number | undefined;
     readonly threadState?: "running" | "interrupted" | "completed" | "error" | undefined;
+    readonly blocked?: boolean | undefined;
   } = {},
 ) {
   const commands = new Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>();
@@ -150,7 +191,13 @@ function harness(
   const ancestry = options.ancestry ?? [root, map];
   const workflowLayer = Layer.mock(WorkflowService.WorkflowService)({
     issueDetail: ({ number }) =>
-      Effect.succeed(detail(number === 10 ? root : number === 12 ? map : selectedIssue)),
+      Effect.succeed(
+        detail(
+          number === 10 ? root : number === 12 ? map : selectedIssue,
+          number === selectedIssue.number ? [...assignees] : [],
+          options.blocked === true && number === selectedIssue.number,
+        ),
+      ),
     locate: () =>
       Effect.succeed({
         issue: selectedIssue,
@@ -403,16 +450,21 @@ describe("WorkflowStartService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
-  it.effect("holds new work already assigned to the authenticated account", () => {
+  it.effect("rejects ordinary Start for work already assigned to the authenticated account", () => {
     const test = harness({ initialAssignees: ["Flow-Fly"] });
     return Effect.gen(function* () {
       const service = yield* WorkflowStartService.WorkflowStartService;
       const error = yield* Effect.flip(service.start(test.input, test.dispatch));
-      const repeated = yield* service.start(test.input, test.dispatch);
+      const repeated = yield* Effect.flip(service.start(test.input, test.dispatch));
+      const recovery = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
 
-      expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "claim-failed" });
-      expect(repeated).toMatchObject({ disposition: "held", status: "held" });
-      expect(repeated.message).toContain("already assigned");
+      expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "not-ready" });
+      expect(repeated).toMatchObject({ _tag: "WorkflowStartError", failure: "not-ready" });
+      expect(recovery.currentAttempt).toBeNull();
       expect(test.commands).toHaveLength(0);
       expect(test.githubCalls.some((args) => args.includes("--add-assignee"))).toBe(false);
     }).pipe(Effect.provide(test.layer));
@@ -650,7 +702,85 @@ describe("WorkflowStartService", () => {
       });
       expect(test.commands[1]).not.toHaveProperty("bootstrap");
       expect(test.commands[1]?.message.text).toContain("Resume the interrupted work");
-      expect(test.probeCount()).toBe(3);
+      expect(test.probeCount()).toBe(2);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("requires takeover before a new resume when the accepted assignment changes", () => {
+    const test = harness({ threadState: "interrupted" });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const started = yield* service.start(test.input, test.dispatch);
+      test.addAssignee("outside-owner");
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(state.actions).toContain("open");
+      expect(state.actions).toContain("takeover");
+      expect(state.actions).not.toContain("resume");
+      expect(state.actions).not.toContain("start-fresh");
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: started.attemptId,
+            action: "resume",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "claim-failed" });
+      expect(error.message).toContain("explicit takeover");
+      expect(test.assignees).toEqual(new Set(["Flow-Fly", "outside-owner"]));
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("opens an accepted resume retry after the assignment changes", () => {
+    const test = harness({ threadState: "interrupted" });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const started = yield* service.start(test.input, test.dispatch);
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+      yield* service.recover(
+        {
+          ...test.input,
+          attemptId: started.attemptId,
+          action: "resume",
+          observation: state.observation,
+        },
+        test.dispatch,
+      );
+      test.addAssignee("outside-owner");
+      const changed = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      const repeated = yield* service.recover(
+        {
+          ...test.input,
+          attemptId: started.attemptId,
+          action: "resume",
+          observation: changed.observation,
+        },
+        test.dispatch,
+      );
+
+      expect(repeated.action).toBe("resumed");
+      expect(repeated.message).toContain("existing accepted resume turn");
+      expect(test.commands).toHaveLength(2);
+      expect(test.probeCount()).toBe(2);
     }).pipe(Effect.provide(test.layer));
   });
 
@@ -766,6 +896,34 @@ describe("WorkflowStartService", () => {
     },
   );
 
+  it.effect("starts fresh from accepted work while retaining its expected claim", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const started = yield* service.start(test.input, test.dispatch);
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      const fresh = yield* service.recover(
+        {
+          ...test.input,
+          attemptId: started.attemptId,
+          action: "start-fresh",
+          observation: state.observation,
+        },
+        test.dispatch,
+      );
+
+      expect(fresh.action).toBe("started-fresh");
+      expect(fresh.threadId).not.toBe(started.threadId);
+      expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+      expect(test.commands).toHaveLength(2);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("preserves the current attempt when saving its replacement fails", () => {
     const test = harness();
     return Effect.gen(function* () {
@@ -874,9 +1032,10 @@ describe("WorkflowStartService", () => {
   });
 
   it.effect("takes over an unchanged outside assignment and preserves the held attempt", () => {
-    const test = harness({ initialAssignees: ["outside-owner"] });
+    const test = harness();
     return Effect.gen(function* () {
       const service = yield* WorkflowStartService.WorkflowStartService;
+      test.setAssigneeOnNextProbe("outside-owner");
       yield* Effect.flip(service.start(test.input, test.dispatch));
       const state = yield* service.recovery({
         projectId,
@@ -904,6 +1063,64 @@ describe("WorkflowStartService", () => {
       expect(history.attempts).toHaveLength(2);
       expect(history.currentAttempt?.threadId).toBe(result.threadId);
       expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("takes over an external claim without creating a local attempt first", () => {
+    const test = harness({ initialAssignees: ["outside-owner"] });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(state.currentAttempt).toBeNull();
+      expect(state.actions).toEqual(["takeover"]);
+      const result = yield* service.recover(
+        {
+          ...test.input,
+          action: "takeover",
+          observation: state.observation,
+        },
+        test.dispatch,
+      );
+
+      expect(result.action).toBe("taken-over");
+      expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("keeps claimed work blocked when a prerequisite remains open", () => {
+    const test = harness({ initialAssignees: ["outside-owner"], blocked: true });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            action: "takeover",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.detail).toContain("Prerequisite #14");
+      expect(test.assignees).toEqual(new Set(["outside-owner"]));
+      expect(test.commands).toHaveLength(0);
+      expect(
+        test.githubCalls.filter((args) => args.includes("issue") && args.includes("edit")),
+      ).toHaveLength(0);
     }).pipe(Effect.provide(test.layer));
   });
 

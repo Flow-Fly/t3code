@@ -417,8 +417,24 @@ export const make = Effect.gen(function* () {
     ].join("|");
     const actions = new Array<WorkflowRecoveryResult["actions"][number]>();
     let message = "No execution attempt is linked to this issue in this environment.";
+    const recoverableClaimLogins = new Set(
+      reconciled.flatMap(({ row, evidence }) =>
+        row.claimLogin !== null &&
+        (evidence === "accepted" || (evidence === "rejected" && row.claimOwned === 1))
+          ? [row.claimLogin]
+          : [],
+      ),
+    );
+    const acceptedClaimMatches =
+      currentAttempt?.evidence === "accepted" &&
+      currentAttempt.claimLogin !== null &&
+      assignees.length === 1 &&
+      assignees[0] === currentAttempt.claimLogin;
+    const freshClaimMatches =
+      assignees.length === 0 ||
+      (assignees.length === 1 && recoverableClaimLogins.has(assignees[0]!));
     if (currentAttempt?.evidence === "accepted") {
-      actions.push("start-fresh");
+      if (freshClaimMatches) actions.push("start-fresh");
       const shell = yield* projection
         .getThreadShellById(currentAttempt.threadId)
         .pipe(
@@ -433,6 +449,7 @@ export const make = Effect.gen(function* () {
       if (Option.isSome(shell)) {
         actions.unshift("open");
         if (
+          acceptedClaimMatches &&
           (shell.value.latestTurn?.state === "interrupted" ||
             shell.value.latestTurn?.state === "error") &&
           shell.value.session?.activeTurnId == null &&
@@ -447,7 +464,7 @@ export const make = Effect.gen(function* () {
           "The initial turn was accepted, but its linked thread is not available in this environment. Start fresh only after reviewing the preserved attempt history.";
       }
     } else if (currentAttempt?.evidence === "rejected") {
-      actions.push("start-fresh");
+      if (freshClaimMatches) actions.push("start-fresh");
       message =
         "The initial turn was confirmed not accepted, so a fresh attempt is safe after current checks.";
     } else if (currentAttempt) {
@@ -471,15 +488,11 @@ export const make = Effect.gen(function* () {
           "Initial submission evidence is unavailable and no linked thread exists. Retry only after the original command outcome can be verified.";
       }
     }
-    const acceptedClaimLogins = new Set(
-      attempts.flatMap((attempt) =>
-        attempt.evidence === "accepted" && attempt.claimLogin !== null ? [attempt.claimLogin] : [],
-      ),
-    );
-    if (
-      assignees.some((assignee) => !acceptedClaimLogins.has(assignee)) &&
-      currentAttempt?.evidence !== "accepted"
-    ) {
+    const hasUnexpectedAssignee =
+      currentAttempt?.evidence === "accepted"
+        ? assignees.length > 0 && !acceptedClaimMatches
+        : assignees.some((assignee) => !recoverableClaimLogins.has(assignee));
+    if (hasUnexpectedAssignee) {
       actions.push("takeover");
       message =
         "GitHub shows an existing assignment. Confirm the handoff outside T3 Code or explicitly take over after checking the other environment.";
@@ -501,6 +514,7 @@ export const make = Effect.gen(function* () {
   const prepareContinuation = Effect.fn("WorkflowStartService.prepareContinuation")(function* (
     input: WorkflowRecoverInput & {
       readonly modelSelection: NonNullable<WorkflowRecoverInput["modelSelection"]>;
+      readonly expectedClaimLogin: string | null;
     },
   ) {
     const project = yield* selectedProject(input.projectId);
@@ -509,12 +523,27 @@ export const make = Effect.gen(function* () {
       repository: input.repository,
       number: input.issueNumber,
     });
-    if (issue.readiness?.status !== "ready") {
+    if (issue.readiness?.status !== "ready" && issue.readiness?.status !== "claimed") {
       return yield* startError(
         "not-ready",
         "This work is no longer ready to continue.",
         issue.readiness?.reasons.map((reason) => reason.message).join(" ") ??
           "Refresh Workflow to load current readiness evidence.",
+      );
+    }
+    const assignees = yield* readAssignees({
+      cwd: project.workspaceRoot,
+      repository: input.repository,
+      issueNumber: input.issueNumber,
+    });
+    if (
+      input.expectedClaimLogin === null ||
+      assignees.length !== 1 ||
+      assignees[0] !== input.expectedClaimLogin
+    ) {
+      return yield* startError(
+        "claim-failed",
+        "The GitHub assignment no longer matches this accepted attempt. Refresh and use explicit takeover after confirming the other environment.",
       );
     }
     const scopedProvider = yield* providerRegistry
@@ -635,7 +664,6 @@ export const make = Effect.gen(function* () {
         "Resume is only available for confirmed interrupted work with no active turn.",
       );
     }
-    const prepared = yield* prepareContinuation(input);
     const previous = yield* sql<{
       readonly resumeId: string;
       readonly commandId: string;
@@ -684,6 +712,10 @@ export const make = Effect.gen(function* () {
         "The resume submission is uncertain and will not be sent again automatically.",
       );
     }
+    const prepared = yield* prepareContinuation({
+      ...input,
+      expectedClaimLogin: current.claimLogin,
+    });
     const createdAt = DateTime.formatIso(yield* DateTime.now);
     const resumeId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
     const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
@@ -796,6 +828,7 @@ export const make = Effect.gen(function* () {
       | undefined;
     let acceptedClaimLogin: string | null = null;
     let confirmedTakeoverAssignees: ReadonlyArray<string> | undefined;
+    let allowsClaimedReadiness = false;
     if (options) {
       const observed = yield* recoveryUnlocked(input);
       if (observed.observation !== options.expectedObservation) {
@@ -815,7 +848,20 @@ export const make = Effect.gen(function* () {
         observed.attempts.find(
           (attempt) => attempt.evidence === "accepted" && attempt.claimLogin !== null,
         )?.claimLogin ?? null;
-      if (options.mode === "takeover") confirmedTakeoverAssignees = observed.assignees;
+      if (options.mode === "takeover") {
+        confirmedTakeoverAssignees = observed.assignees;
+        allowsClaimedReadiness = true;
+      } else {
+        const freshClaimLogin =
+          existingEvidence?.evidence === "accepted" ||
+          (existingEvidence?.evidence === "rejected" && existing?.claimOwned === 1)
+            ? (existing?.claimLogin ?? null)
+            : acceptedClaimLogin;
+        allowsClaimedReadiness =
+          freshClaimLogin !== null &&
+          observed.assignees.length === 1 &&
+          observed.assignees[0] === freshClaimLogin;
+      }
     }
 
     const project = yield* selectedProject(input.projectId);
@@ -884,7 +930,10 @@ export const make = Effect.gen(function* () {
         "The selected decision is not contained by a Wayfinder map.",
       );
     }
-    if (issue.readiness?.status !== "ready") {
+    if (
+      issue.readiness?.status !== "ready" &&
+      !(allowsClaimedReadiness && issue.readiness?.status === "claimed")
+    ) {
       return yield* startError(
         "not-ready",
         "This decision is not ready to start.",

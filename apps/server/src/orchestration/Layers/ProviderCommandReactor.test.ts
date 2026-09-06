@@ -86,6 +86,7 @@ import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
 import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "../../workflow/WorkflowService.ts";
 import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
+import { interpretWorkflowEvidence } from "../../workflow/WorkflowEvidence.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
@@ -567,12 +568,27 @@ describe("ProviderCommandReactor", () => {
     const workflowRoot = workflowSummary(10, "container", null, ["workflow:container"]);
     const workflowMap = workflowSummary(12, "map", 10, ["wayfinder:map"]);
     const workflowDecision = workflowSummary(15, "decision", 12, ["wayfinder:research"]);
-    const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => ({
-      ...issue,
-      body: "Workflow integration fixture",
-      blockedBy: [],
-    });
     const workflowAssignees = new Set<string>();
+    const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => {
+      const body = "Workflow integration fixture";
+      const readiness = interpretWorkflowEvidence({
+        issue: {
+          id: issue.id,
+          url: issue.url,
+          number: issue.number,
+          title: issue.title,
+          kind: issue.kind,
+          state: issue.state,
+          stateReason: issue.stateReason,
+          labels: issue.labels,
+          assignees: issue.id === workflowDecision.id ? [...workflowAssignees] : [],
+          body,
+          comments: [],
+          reopenedAt: [],
+        },
+      }).readiness;
+      return { ...issue, body, blockedBy: [], readiness };
+    };
     const workflowStart = await runtime.runPromise(
       WorkflowStartService.make.pipe(
         Effect.provideService(
