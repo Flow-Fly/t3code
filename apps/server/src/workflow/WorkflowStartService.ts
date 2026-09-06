@@ -1,13 +1,19 @@
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  EnvironmentId,
   MessageId,
   type OrchestrationCommand,
   type OrchestrationDispatchCommandError,
-  type ProjectId,
+  ProjectId,
   ProviderDriverKind,
   ThreadId,
   WorkflowQueryError,
+  type WorkflowRecoverInput,
+  type WorkflowRecoverResult,
+  type WorkflowRecoveryAttempt,
+  type WorkflowRecoveryInput,
+  type WorkflowRecoveryResult,
   WorkflowStartError,
   type WorkflowStartInput,
   type WorkflowStartResult,
@@ -27,6 +33,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
@@ -41,10 +49,17 @@ const AttemptRow = Schema.Struct({
   repository: Schema.String,
   rootNumber: Schema.Number,
   issueNumber: Schema.Number,
+  commandId: Schema.String,
   threadId: Schema.String,
   status: Schema.String,
+  claimLogin: Schema.NullOr(Schema.String),
+  claimOwned: Schema.Number,
+  sequence: Schema.NullOr(Schema.Number),
   createdAt: Schema.String,
+  updatedAt: Schema.String,
   detail: Schema.NullOr(Schema.String),
+  initialTurnDisposition: Schema.NullOr(Schema.String),
+  isCurrent: Schema.Number,
 });
 type AttemptRow = typeof AttemptRow.Type;
 
@@ -114,7 +129,19 @@ export function workflowDecisionInstructions(input: {
 }
 
 function resultFromRow(
-  row: AttemptRow,
+  row: Pick<
+    AttemptRow,
+    | "attemptId"
+    | "environmentId"
+    | "projectId"
+    | "repository"
+    | "rootNumber"
+    | "issueNumber"
+    | "threadId"
+    | "status"
+    | "createdAt"
+    | "detail"
+  >,
   disposition: WorkflowStartResult["disposition"],
 ): WorkflowStartResult {
   const held = row.status !== "submitted";
@@ -145,6 +172,13 @@ export class WorkflowStartService extends Context.Service<
       input: WorkflowStartInput,
       dispatch: Dispatch,
     ) => Effect.Effect<WorkflowStartResult, WorkflowQueryError | WorkflowStartError>;
+    readonly recovery: (
+      input: WorkflowRecoveryInput,
+    ) => Effect.Effect<WorkflowRecoveryResult, WorkflowQueryError | WorkflowStartError>;
+    readonly recover: (
+      input: WorkflowRecoverInput,
+      dispatch: Dispatch,
+    ) => Effect.Effect<WorkflowRecoverResult, WorkflowQueryError | WorkflowStartError>;
   }
 >()("t3/workflow/WorkflowStartService") {}
 
@@ -155,22 +189,25 @@ export const make = Effect.gen(function* () {
   const github = yield* GitHubCli.GitHubCli;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const sql = yield* SqlClient.SqlClient;
+  const commandReceipts = yield* OrchestrationCommandReceiptRepository;
   const crypto = yield* Crypto.Crypto;
   const fileSystem = yield* FileSystem.FileSystem;
   const lock = yield* Semaphore.make(1);
 
-  const loadAttempt = Effect.fn("WorkflowStartService.loadAttempt")(function* (
-    input: WorkflowStartInput,
+  const loadAttempts = Effect.fn("WorkflowStartService.loadAttempts")(function* (
+    input: Pick<WorkflowStartInput, "projectId" | "repository" | "issueNumber">,
   ) {
     const rows = yield* sql<AttemptRow>`
       SELECT attempt_id AS "attemptId", environment_id AS "environmentId",
         project_id AS "projectId", repository, root_number AS "rootNumber",
-        issue_number AS "issueNumber", thread_id AS "threadId", status,
-        created_at AS "createdAt", detail
+        issue_number AS "issueNumber", command_id AS "commandId", thread_id AS "threadId", status,
+        claim_login AS "claimLogin", claim_owned AS "claimOwned", sequence,
+        created_at AS "createdAt", updated_at AS "updatedAt", detail,
+        initial_turn_disposition AS "initialTurnDisposition", is_current AS "isCurrent"
       FROM workflow_start_attempts
       WHERE project_id = ${input.projectId} AND repository = ${input.repository}
         AND issue_number = ${input.issueNumber} AND phase = 'decision'
-      LIMIT 1
+      ORDER BY is_current DESC, created_at DESC
     `.pipe(
       Effect.mapError((error) =>
         startError(
@@ -180,7 +217,64 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    return rows[0];
+    return rows;
+  });
+
+  const readEvidence = Effect.fn("WorkflowStartService.readEvidence")(function* (row: AttemptRow) {
+    const receipt = yield* commandReceipts
+      .getByCommandId({ commandId: CommandId.make(row.commandId) })
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "Workflow command evidence could not be read.",
+            String(error),
+          ),
+        ),
+      );
+    if (Option.isNone(receipt)) {
+      if (row.status === "submitted" && row.sequence !== null) {
+        return { evidence: "accepted" as const, row };
+      }
+      if (
+        row.initialTurnDisposition === "not-attempted" ||
+        row.initialTurnDisposition === "not-accepted"
+      ) {
+        return { evidence: "rejected" as const, row };
+      }
+      return { evidence: "unknown" as const, row };
+    }
+    if (receipt.value.status === "accepted") {
+      let updatedAt = row.updatedAt;
+      if (row.status !== "submitted" || row.detail !== null) {
+        const reconciledAt = DateTime.formatIso(yield* DateTime.now);
+        updatedAt = reconciledAt;
+        yield* sql`
+          UPDATE workflow_start_attempts SET status = 'submitted', sequence = ${receipt.value.resultSequence},
+            detail = NULL, initial_turn_disposition = 'accepted', updated_at = ${reconciledAt}
+          WHERE attempt_id = ${row.attemptId}
+        `.pipe(
+          Effect.mapError((error) =>
+            startError(
+              "persistence-failed",
+              "Accepted workflow evidence could not be saved.",
+              String(error),
+            ),
+          ),
+        );
+      }
+      return {
+        evidence: "accepted" as const,
+        row: { ...row, status: "submitted", detail: null, updatedAt },
+      };
+    }
+    return { evidence: "rejected" as const, row };
+  });
+
+  const loadAttempt = Effect.fn("WorkflowStartService.loadAttempt")(function* (
+    input: WorkflowStartInput,
+  ) {
+    return (yield* loadAttempts(input)).find((row) => row.isCurrent === 1);
   });
 
   const selectedProject = Effect.fn("WorkflowStartService.selectedProject")(function* (
@@ -219,12 +313,510 @@ export const make = Effect.gen(function* () {
       );
   });
 
+  const readAssignees = Effect.fn("WorkflowStartService.readAssignees")(function* (input: {
+    readonly cwd: string;
+    readonly repository: string;
+    readonly issueNumber: number;
+  }) {
+    const result = yield* executeClaim(input.cwd, [
+      "issue",
+      "view",
+      String(input.issueNumber),
+      "--repo",
+      input.repository,
+      "--json",
+      "assignees",
+      "--jq",
+      ".assignees[].login",
+    ]);
+    return result.stdout
+      .split("\n")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .toSorted();
+  });
+
+  const recoveryAttempt = (
+    row: AttemptRow,
+    evidence: WorkflowRecoveryAttempt["evidence"],
+  ): WorkflowRecoveryAttempt => ({
+    attemptId: row.attemptId,
+    environmentId: EnvironmentId.make(row.environmentId),
+    projectId: ProjectId.make(row.projectId),
+    repository: row.repository as WorkflowRecoveryAttempt["repository"],
+    rootNumber: row.rootNumber,
+    issueNumber: row.issueNumber,
+    phase: "decision",
+    threadId: ThreadId.make(row.threadId),
+    status:
+      row.status === "claiming" ||
+      row.status === "submitting" ||
+      row.status === "submitted" ||
+      row.status === "held"
+        ? row.status
+        : "held",
+    evidence,
+    claimLogin: row.claimLogin,
+    isCurrent: row.isCurrent === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    detail: row.detail,
+  });
+
+  const recoveryUnlocked = Effect.fn("WorkflowStartService.recovery")(function* (
+    input: WorkflowRecoveryInput,
+  ) {
+    const project = yield* selectedProject(input.projectId);
+    const environmentId = yield* environment.getEnvironmentId.pipe(
+      Effect.mapError((error) =>
+        startError(
+          "workspace-unavailable",
+          "The environment identity could not be read.",
+          String(error),
+        ),
+      ),
+    );
+    const rows = yield* loadAttempts(input);
+    const reconciled = yield* Effect.forEach(rows, readEvidence);
+    const attempts = reconciled.map(({ row, evidence }) => recoveryAttempt(row, evidence));
+    const currentAttempt = attempts.find((attempt) => attempt.isCurrent) ?? null;
+    const resumeRows = currentAttempt
+      ? yield* sql<{
+          readonly resumeId: string;
+          readonly sourceTurnId: string;
+          readonly status: string;
+          readonly commandId: string;
+        }>`
+          SELECT resume_id AS "resumeId", source_turn_id AS "sourceTurnId",
+            status, command_id AS "commandId"
+          FROM workflow_resume_attempts
+          WHERE workflow_attempt_id = ${currentAttempt.attemptId}
+          ORDER BY created_at DESC
+        `.pipe(
+          Effect.mapError((error) =>
+            startError("persistence-failed", "Resume history could not be read.", String(error)),
+          ),
+        )
+      : [];
+    const assignees = yield* readAssignees({
+      cwd: project.workspaceRoot,
+      repository: input.repository,
+      issueNumber: input.issueNumber,
+    });
+    const observation = [
+      currentAttempt?.attemptId ?? "none",
+      currentAttempt?.status ?? "none",
+      currentAttempt?.evidence ?? "none",
+      assignees.map(encodeURIComponent).join(","),
+      resumeRows
+        .map(
+          (resume) =>
+            `${resume.resumeId}:${resume.sourceTurnId}:${resume.status}:${resume.commandId}`,
+        )
+        .join(","),
+    ].join("|");
+    const actions = new Array<WorkflowRecoveryResult["actions"][number]>();
+    let message = "No execution attempt is linked to this issue in this environment.";
+    if (currentAttempt?.evidence === "accepted") {
+      actions.push("start-fresh");
+      const shell = yield* projection
+        .getThreadShellById(currentAttempt.threadId)
+        .pipe(
+          Effect.mapError((error) =>
+            startError(
+              "persistence-failed",
+              "The linked thread state could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (Option.isSome(shell)) {
+        actions.unshift("open");
+        if (
+          (shell.value.latestTurn?.state === "interrupted" ||
+            shell.value.latestTurn?.state === "error") &&
+          shell.value.session?.activeTurnId == null &&
+          shell.value.session?.status !== "running" &&
+          shell.value.session?.status !== "starting"
+        ) {
+          actions.push("resume");
+        }
+        message = "This environment has accepted work linked to the preserved thread.";
+      } else {
+        message =
+          "The initial turn was accepted, but its linked thread is not available in this environment. Start fresh only after reviewing the preserved attempt history.";
+      }
+    } else if (currentAttempt?.evidence === "rejected") {
+      actions.push("start-fresh");
+      message =
+        "The initial turn was confirmed not accepted, so a fresh attempt is safe after current checks.";
+    } else if (currentAttempt) {
+      const shell = yield* projection
+        .getThreadShellById(currentAttempt.threadId)
+        .pipe(
+          Effect.mapError((error) =>
+            startError(
+              "persistence-failed",
+              "The linked thread state could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (Option.isSome(shell)) {
+        actions.push("open");
+        message =
+          "Initial submission evidence is unavailable. Open the linked thread to inspect it; a new first turn is held.";
+      } else {
+        message =
+          "Initial submission evidence is unavailable and no linked thread exists. Retry only after the original command outcome can be verified.";
+      }
+    }
+    const acceptedClaimLogins = new Set(
+      attempts.flatMap((attempt) =>
+        attempt.evidence === "accepted" && attempt.claimLogin !== null ? [attempt.claimLogin] : [],
+      ),
+    );
+    if (
+      assignees.some((assignee) => !acceptedClaimLogins.has(assignee)) &&
+      currentAttempt?.evidence !== "accepted"
+    ) {
+      actions.push("takeover");
+      message =
+        "GitHub shows an existing assignment. Confirm the handoff outside T3 Code or explicitly take over after checking the other environment.";
+    }
+    return {
+      environmentId,
+      projectId: input.projectId,
+      repository: input.repository,
+      issueNumber: input.issueNumber,
+      attempts,
+      currentAttempt,
+      assignees,
+      observation,
+      actions,
+      message,
+    } satisfies WorkflowRecoveryResult;
+  });
+
+  const prepareContinuation = Effect.fn("WorkflowStartService.prepareContinuation")(function* (
+    input: WorkflowRecoverInput & {
+      readonly modelSelection: NonNullable<WorkflowRecoverInput["modelSelection"]>;
+    },
+  ) {
+    const project = yield* selectedProject(input.projectId);
+    const issue = yield* workflow.issueDetail({
+      projectId: input.projectId,
+      repository: input.repository,
+      number: input.issueNumber,
+    });
+    if (issue.readiness?.status !== "ready") {
+      return yield* startError(
+        "not-ready",
+        "This work is no longer ready to continue.",
+        issue.readiness?.reasons.map((reason) => reason.message).join(" ") ??
+          "Refresh Workflow to load current readiness evidence.",
+      );
+    }
+    const scopedProvider = yield* providerRegistry
+      .probeWorkspaceSnapshot({
+        instanceId: input.modelSelection.instanceId,
+        cwd: project.workspaceRoot,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "provider-unavailable",
+            "Codex workspace discovery failed. Check the provider and retry.",
+            String(error),
+          ),
+        ),
+      );
+    if (
+      !scopedProvider ||
+      scopedProvider.driver !== ProviderDriverKind.make("codex") ||
+      !scopedProvider.enabled ||
+      !scopedProvider.installed ||
+      scopedProvider.auth.status !== "authenticated" ||
+      scopedProvider.status === "error" ||
+      scopedProvider.status === "disabled"
+    ) {
+      return yield* startError(
+        "provider-unavailable",
+        "Choose an enabled, authenticated Codex provider in this environment.",
+      );
+    }
+    const model = scopedProvider.models.find(
+      (candidate) => candidate.slug === input.modelSelection.model,
+    );
+    if (!model) {
+      return yield* startError(
+        "model-unavailable",
+        `Model '${input.modelSelection.model}' is not available from this Codex provider.`,
+      );
+    }
+    const effort = getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort");
+    const effortDescriptor = model.capabilities?.optionDescriptors?.find(
+      (descriptor) => descriptor.id === "reasoningEffort",
+    );
+    if (
+      !effort ||
+      effortDescriptor?.type !== "select" ||
+      !effortDescriptor.options.some((option) => option.id === effort)
+    ) {
+      return yield* startError(
+        "effort-required",
+        "Choose a supported Codex reasoning effort before resuming work.",
+      );
+    }
+    const skillNames = requiredSkillNames(issue.labels);
+    const skills = skillNames.map((name) => {
+      const matches = scopedProvider.skills.filter((skill) => skill.name === name && skill.enabled);
+      return matches.length === 1 ? matches[0] : undefined;
+    });
+    const missingSkill = skillNames.find((_, index) => !skills[index]);
+    if (missingSkill) {
+      return yield* startError(
+        "skill-unavailable",
+        `Enable the '${missingSkill}' skill at one unambiguous path in the target workspace.`,
+      );
+    }
+    return { issue, skills: skills.map((skill) => skill!) };
+  });
+
+  const resumeUnlocked = Effect.fn("WorkflowStartService.resume")(function* (
+    input: WorkflowRecoverInput & {
+      readonly attemptId: string;
+      readonly modelSelection: NonNullable<WorkflowRecoverInput["modelSelection"]>;
+    },
+    dispatch: Dispatch,
+  ) {
+    const current = yield* loadAttempt(input);
+    if (!current || current.attemptId !== input.attemptId) {
+      return yield* startError(
+        "dispatch-failed",
+        "The linked workflow attempt changed. Refresh before resuming.",
+      );
+    }
+    const evidence = yield* readEvidence(current);
+    if (evidence.evidence !== "accepted") {
+      return yield* startError(
+        "dispatch-failed",
+        "Resume requires durable evidence that the initial turn was accepted.",
+      );
+    }
+    const shellOption = yield* projection
+      .getThreadShellById(ThreadId.make(current.threadId))
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "The linked thread state could not be read.",
+            String(error),
+          ),
+        ),
+      );
+    if (Option.isNone(shellOption)) {
+      return yield* startError(
+        "dispatch-failed",
+        "The linked thread is unavailable. Open its history before choosing another action.",
+      );
+    }
+    const shell = shellOption.value;
+    const latestTurn = shell.latestTurn;
+    if (
+      !latestTurn ||
+      (latestTurn.state !== "interrupted" && latestTurn.state !== "error") ||
+      shell.session?.activeTurnId != null ||
+      shell.session?.status === "running" ||
+      shell.session?.status === "starting"
+    ) {
+      return yield* startError(
+        "dispatch-failed",
+        "Resume is only available for confirmed interrupted work with no active turn.",
+      );
+    }
+    const prepared = yield* prepareContinuation(input);
+    const previous = yield* sql<{
+      readonly resumeId: string;
+      readonly commandId: string;
+      readonly status: string;
+      readonly sequence: number | null;
+    }>`
+      SELECT resume_id AS "resumeId", command_id AS "commandId", status, sequence
+      FROM workflow_resume_attempts
+      WHERE workflow_attempt_id = ${current.attemptId} AND source_turn_id = ${latestTurn.turnId}
+      LIMIT 1
+    `.pipe(
+      Effect.mapError((error) =>
+        startError("persistence-failed", "Resume history could not be read.", String(error)),
+      ),
+    );
+    if (previous[0]) {
+      const receipt = yield* commandReceipts
+        .getByCommandId({ commandId: CommandId.make(previous[0].commandId) })
+        .pipe(
+          Effect.mapError((error) =>
+            startError(
+              "persistence-failed",
+              "Resume command evidence could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (
+        (Option.isSome(receipt) && receipt.value.status === "accepted") ||
+        (previous[0].status === "submitted" && previous[0].sequence !== null)
+      ) {
+        return {
+          action: "resumed",
+          attemptId: current.attemptId,
+          environmentId: EnvironmentId.make(current.environmentId),
+          projectId: input.projectId,
+          repository: input.repository,
+          rootNumber: current.rootNumber,
+          issueNumber: current.issueNumber,
+          threadId: ThreadId.make(current.threadId),
+          message: "Opening the existing accepted resume turn.",
+        } satisfies WorkflowRecoverResult;
+      }
+      return yield* startError(
+        "dispatch-failed",
+        "The resume submission is uncertain and will not be sent again automatically.",
+      );
+    }
+    const createdAt = DateTime.formatIso(yield* DateTime.now);
+    const resumeId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    const messageId = MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
+    yield* sql`
+      INSERT INTO workflow_resume_attempts (
+        resume_id, workflow_attempt_id, source_turn_id, command_id, message_id,
+        status, created_at, updated_at
+      ) VALUES (
+        ${resumeId}, ${current.attemptId}, ${latestTurn.turnId}, ${commandId}, ${messageId},
+        'submitting', ${createdAt}, ${createdAt}
+      )
+    `.pipe(
+      Effect.mapError((error) =>
+        startError("persistence-failed", "The resume intent could not be saved.", String(error)),
+      ),
+    );
+    const command = {
+      type: "thread.turn.start" as const,
+      commandId,
+      threadId: ThreadId.make(current.threadId),
+      message: {
+        messageId,
+        role: "user" as const,
+        text: `Resume the interrupted work for ${input.repository}#${input.issueNumber}. Recheck the current issue scope and continue from the preserved thread history.`,
+        attachments: [],
+      },
+      modelSelection: input.modelSelection,
+      skills: prepared.skills.map((skill) => ({ name: skill.name, path: skill.path })),
+      runtimeMode: "approval-required" as const,
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      createdAt,
+    } satisfies Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
+    const dispatched = yield* dispatch(command).pipe(
+      Effect.catch((error) =>
+        commandReceipts.getByCommandId({ commandId }).pipe(
+          Effect.mapError((cause) =>
+            startError(
+              "persistence-failed",
+              "Resume command evidence could not be read.",
+              String(cause),
+            ),
+          ),
+          Effect.flatMap((receipt) => {
+            const accepted = Option.isSome(receipt) && receipt.value.status === "accepted";
+            return sql`
+              UPDATE workflow_resume_attempts SET status = ${accepted ? "submitted" : "held"},
+                sequence = ${accepted ? receipt.value.resultSequence : null},
+                detail = ${accepted ? null : "The resume submission is uncertain and will not be sent again automatically."},
+                updated_at = ${createdAt}
+              WHERE resume_id = ${resumeId}
+            `.pipe(
+              Effect.mapError((cause) =>
+                startError(
+                  "persistence-failed",
+                  "The resume outcome could not be saved.",
+                  String(cause),
+                ),
+              ),
+              Effect.andThen(
+                accepted
+                  ? Effect.succeed({ sequence: receipt.value.resultSequence })
+                  : Effect.fail(
+                      startError(
+                        "dispatch-failed",
+                        "The resume submission is uncertain and will not be sent again automatically.",
+                        String(error),
+                      ),
+                    ),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+    yield* sql`
+      UPDATE workflow_resume_attempts SET status = 'submitted', sequence = ${dispatched.sequence},
+        detail = NULL, updated_at = ${createdAt}
+      WHERE resume_id = ${resumeId}
+    `.pipe(
+      Effect.mapError((error) =>
+        startError("persistence-failed", "The accepted resume could not be saved.", String(error)),
+      ),
+    );
+    return {
+      action: "resumed",
+      attemptId: current.attemptId,
+      environmentId: EnvironmentId.make(current.environmentId),
+      projectId: input.projectId,
+      repository: input.repository,
+      rootNumber: current.rootNumber,
+      issueNumber: current.issueNumber,
+      threadId: ThreadId.make(current.threadId),
+      message: "Interrupted work resumed in the preserved thread.",
+    } satisfies WorkflowRecoverResult;
+  });
+
   const startUnlocked = Effect.fn("WorkflowStartService.start")(function* (
     input: WorkflowStartInput,
     dispatch: Dispatch,
+    options?: {
+      readonly mode: "fresh" | "takeover";
+      readonly expectedObservation: string;
+    },
   ) {
     const existing = yield* loadAttempt(input);
-    if (existing) return resultFromRow(existing, "existing");
+    if (existing && !options) return resultFromRow(existing, "existing");
+    let existingEvidence:
+      | { readonly evidence: "accepted" | "rejected" | "unknown"; readonly row: AttemptRow }
+      | undefined;
+    let acceptedClaimLogin: string | null = null;
+    let confirmedTakeoverAssignees: ReadonlyArray<string> | undefined;
+    if (options) {
+      const observed = yield* recoveryUnlocked(input);
+      if (observed.observation !== options.expectedObservation) {
+        return yield* startError(
+          "claim-failed",
+          "The workflow claim or attempt changed. Refresh before confirming this action again.",
+        );
+      }
+      if (!observed.actions.includes(options.mode === "fresh" ? "start-fresh" : "takeover")) {
+        return yield* startError(
+          "claim-failed",
+          `The ${options.mode} action is no longer available after refreshing workflow state.`,
+        );
+      }
+      if (existing) existingEvidence = yield* readEvidence(existing);
+      acceptedClaimLogin =
+        observed.attempts.find(
+          (attempt) => attempt.evidence === "accepted" && attempt.claimLogin !== null,
+        )?.claimLogin ?? null;
+      if (options.mode === "takeover") confirmedTakeoverAssignees = observed.assignees;
+    }
 
     const project = yield* selectedProject(input.projectId);
     const workspace = yield* fileSystem
@@ -383,21 +975,37 @@ export const make = Effect.gen(function* () {
     const threadId = ThreadId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
     const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
     const messageId = MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
-    yield* sql`
-      INSERT INTO workflow_start_attempts (
-        attempt_id, environment_id, project_id, repository, root_number,
-        issue_number, phase, thread_id, command_id, message_id, status,
-        created_at, updated_at
-      ) VALUES (
-        ${attemptId}, ${environmentId}, ${input.projectId}, ${input.repository}, ${input.rootNumber},
-        ${input.issueNumber}, 'decision', ${threadId}, ${commandId}, ${messageId}, 'claiming',
-        ${createdAt}, ${createdAt}
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          if (existing) {
+            yield* sql`
+            UPDATE workflow_start_attempts SET is_current = 0, updated_at = ${createdAt}
+            WHERE attempt_id = ${existing.attemptId} AND is_current = 1
+          `;
+          }
+          yield* sql`
+          INSERT INTO workflow_start_attempts (
+            attempt_id, environment_id, project_id, repository, root_number,
+            issue_number, phase, thread_id, command_id, message_id, status,
+            initial_turn_disposition, created_at, updated_at
+          ) VALUES (
+            ${attemptId}, ${environmentId}, ${input.projectId}, ${input.repository}, ${input.rootNumber},
+            ${input.issueNumber}, 'decision', ${threadId}, ${commandId}, ${messageId}, 'claiming',
+            'not-attempted', ${createdAt}, ${createdAt}
+          )
+        `;
+        }),
       )
-    `.pipe(
-      Effect.mapError((error) =>
-        startError("persistence-failed", "The workflow attempt could not be saved.", String(error)),
-      ),
-    );
+      .pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "The workflow attempt could not be saved while preserving its predecessor.",
+            String(error),
+          ),
+        ),
+      );
 
     const holdAttempt = Effect.fn("WorkflowStartService.holdAttempt")(function* (detail: string) {
       yield* sql`
@@ -432,35 +1040,77 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const assigneeArgs = [
-      "issue",
-      "view",
-      String(input.issueNumber),
-      "--repo",
-      input.repository,
-      "--json",
-      "assignees",
-      "--jq",
-      ".assignees[].login",
-    ] as const;
-    const beforeAssignees = (yield* executeClaim(project.workspaceRoot, assigneeArgs)).stdout
-      .split("\n")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    if (beforeAssignees.length > 0) {
+    const observedAssignees = yield* readAssignees({
+      cwd: project.workspaceRoot,
+      repository: input.repository,
+      issueNumber: input.issueNumber,
+    });
+    if (
+      confirmedTakeoverAssignees &&
+      (confirmedTakeoverAssignees.length !== observedAssignees.length ||
+        confirmedTakeoverAssignees.some((assignee, index) => observedAssignees[index] !== assignee))
+    ) {
+      const detail =
+        "The GitHub assignment changed during takeover preflight. Refresh before confirming takeover again.";
+      yield* holdAttempt(detail);
+      return yield* startError("claim-failed", detail);
+    }
+    const releasesRejectedClaim =
+      options?.mode === "fresh" &&
+      existingEvidence?.evidence === "rejected" &&
+      existing?.claimOwned === 1 &&
+      existing.claimLogin === login &&
+      observedAssignees.includes(login);
+    if (releasesRejectedClaim) {
+      yield* executeClaim(project.workspaceRoot, [
+        "issue",
+        "edit",
+        String(input.issueNumber),
+        "--repo",
+        input.repository,
+        "--remove-assignee",
+        login,
+      ]);
+    }
+    const beforeAssignees = releasesRejectedClaim
+      ? observedAssignees.filter((assignee) => assignee !== login)
+      : observedAssignees;
+    const reusesAcceptedClaim =
+      options?.mode === "fresh" &&
+      ((existingEvidence?.evidence === "accepted" && existing?.claimLogin === login) ||
+        acceptedClaimLogin === login) &&
+      beforeAssignees.includes(login);
+    if (options?.mode === "takeover") {
+      for (const assignee of beforeAssignees) {
+        yield* executeClaim(project.workspaceRoot, [
+          "issue",
+          "edit",
+          String(input.issueNumber),
+          "--repo",
+          input.repository,
+          "--remove-assignee",
+          assignee,
+        ]);
+      }
+    } else if (beforeAssignees.length > 0 && !reusesAcceptedClaim) {
       const detail = `This decision is already assigned to ${beforeAssignees.join(", ")}. Use an explicit handoff or takeover before starting it here.`;
       yield* holdAttempt(detail);
       return yield* startError("claim-failed", detail);
     }
-    yield* executeClaim(project.workspaceRoot, [
-      "issue",
-      "edit",
-      String(input.issueNumber),
-      "--repo",
-      input.repository,
-      "--add-assignee",
-      login,
-    ]).pipe(
+    const shouldAddClaim = !reusesAcceptedClaim;
+    yield* (
+      shouldAddClaim
+        ? executeClaim(project.workspaceRoot, [
+            "issue",
+            "edit",
+            String(input.issueNumber),
+            "--repo",
+            input.repository,
+            "--add-assignee",
+            login,
+          ]).pipe(Effect.asVoid)
+        : Effect.void
+    ).pipe(
       Effect.catch((error) =>
         sql`
           UPDATE workflow_start_attempts SET status = 'held',
@@ -479,11 +1129,12 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const afterAssignees = (yield* executeClaim(project.workspaceRoot, assigneeArgs)).stdout
-      .split("\n")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const claimOwned = !beforeAssignees.includes(login);
+    const afterAssignees = yield* readAssignees({
+      cwd: project.workspaceRoot,
+      repository: input.repository,
+      issueNumber: input.issueNumber,
+    });
+    const claimOwned = shouldAddClaim;
     const releaseOwnedClaim = () =>
       claimOwned
         ? executeClaim(project.workspaceRoot, [
@@ -529,7 +1180,8 @@ export const make = Effect.gen(function* () {
     });
     yield* sql`
       UPDATE workflow_start_attempts SET status = 'submitting', claim_login = ${login},
-        claim_owned = ${claimOwned ? 1 : 0}, updated_at = ${createdAt}
+        claim_owned = ${claimOwned ? 1 : 0}, initial_turn_disposition = 'unknown',
+        updated_at = ${createdAt}
       WHERE attempt_id = ${attemptId}
     `.pipe(
       Effect.mapError((error) =>
@@ -583,6 +1235,7 @@ export const make = Effect.gen(function* () {
               : "The first submission is uncertain. Reconcile the durable command before retrying.";
             return sql`
               UPDATE workflow_start_attempts SET status = 'held', detail = ${detail},
+                initial_turn_disposition = ${turnWasNotAccepted ? "not-accepted" : "unknown"},
                 updated_at = ${createdAt}
               WHERE attempt_id = ${attemptId}
             `.pipe(
@@ -611,7 +1264,7 @@ export const make = Effect.gen(function* () {
     );
     yield* sql`
       UPDATE workflow_start_attempts SET status = 'submitted', sequence = ${dispatched.sequence},
-        detail = NULL, updated_at = ${createdAt}
+        detail = NULL, initial_turn_disposition = 'accepted', updated_at = ${createdAt}
       WHERE attempt_id = ${attemptId}
     `.pipe(
       Effect.mapError((error) =>
@@ -639,9 +1292,88 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const recoverUnlocked = Effect.fn("WorkflowStartService.recover")(function* (
+    input: WorkflowRecoverInput,
+    dispatch: Dispatch,
+  ) {
+    const state = yield* recoveryUnlocked(input);
+    const sameResumeAttempt =
+      input.action === "resume" &&
+      input.attemptId !== undefined &&
+      state.currentAttempt?.attemptId === input.attemptId;
+    if (!input.observation || (state.observation !== input.observation && !sameResumeAttempt)) {
+      return yield* startError(
+        "claim-failed",
+        "The workflow claim or attempt changed. Refresh before confirming this action again.",
+      );
+    }
+    const current = state.currentAttempt;
+    if (input.action === "open") {
+      if (!current || (input.attemptId && input.attemptId !== current.attemptId)) {
+        return yield* startError(
+          "dispatch-failed",
+          "The linked workflow attempt changed. Refresh before opening it.",
+        );
+      }
+      return {
+        action: "open",
+        attemptId: current.attemptId,
+        environmentId: current.environmentId,
+        projectId: current.projectId,
+        repository: current.repository,
+        rootNumber: current.rootNumber,
+        issueNumber: current.issueNumber,
+        threadId: current.threadId,
+        message: "Opening the linked workflow thread.",
+      } satisfies WorkflowRecoverResult;
+    }
+    if (!input.modelSelection) {
+      return yield* startError(
+        "model-unavailable",
+        "Choose the target Codex model and reasoning effort for this action.",
+      );
+    }
+    if (input.action === "resume") {
+      if (!input.attemptId) {
+        return yield* startError("dispatch-failed", "Choose the linked attempt to resume.");
+      }
+      return yield* resumeUnlocked(
+        { ...input, attemptId: input.attemptId, modelSelection: input.modelSelection },
+        dispatch,
+      );
+    }
+    const mode = input.action === "start-fresh" ? "fresh" : input.action;
+    const started = yield* startUnlocked(
+      {
+        projectId: input.projectId,
+        repository: input.repository,
+        rootNumber: input.rootNumber,
+        issueNumber: input.issueNumber,
+        modelSelection: input.modelSelection,
+      },
+      dispatch,
+      { mode, expectedObservation: input.observation },
+    );
+    return {
+      action: input.action === "start-fresh" ? "started-fresh" : "taken-over",
+      attemptId: started.attemptId,
+      environmentId: started.environmentId,
+      projectId: started.projectId,
+      repository: started.repository,
+      rootNumber: started.rootNumber,
+      issueNumber: started.issueNumber,
+      threadId: started.threadId,
+      message: started.message,
+    } satisfies WorkflowRecoverResult;
+  });
+
   return WorkflowStartService.of({
     start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
+    recovery: (input) => lock.withPermits(1)(recoveryUnlocked(input)),
+    recover: (input, dispatch) => lock.withPermits(1)(recoverUnlocked(input, dispatch)),
   });
 });
 
-export const layer = Layer.effect(WorkflowStartService, make);
+export const layer = Layer.effect(WorkflowStartService, make).pipe(
+  Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+);

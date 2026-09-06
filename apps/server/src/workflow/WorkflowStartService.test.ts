@@ -4,6 +4,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadId,
   type OrchestrationCommand,
   type ServerProvider,
   type WorkflowIssueDetail,
@@ -14,11 +15,13 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { ProviderDriverError } from "../provider/Errors.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
@@ -129,6 +132,8 @@ function harness(
     readonly ancestry?: ReadonlyArray<WorkflowIssueSummary> | undefined;
     readonly initialAssignees?: ReadonlyArray<string> | undefined;
     readonly competingAssigneeAfterClaim?: string | undefined;
+    readonly identityFailureCount?: number | undefined;
+    readonly threadState?: "running" | "interrupted" | "completed" | "error" | undefined;
   } = {},
 ) {
   const commands = new Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>();
@@ -136,6 +141,10 @@ function harness(
   const assignees = new Set(options.initialAssignees ?? []);
   let sequence = 100;
   let probeCount = 0;
+  let dispatchFailure = options.dispatchFailure;
+  let identityFailuresRemaining = options.identityFailureCount ?? 0;
+  let assigneeOnNextProbe: string | undefined;
+  const acceptedCommands = new Set<string>();
 
   const selectedIssue = options.selectedIssue ?? decision;
   const ancestry = options.ancestry ?? [root, map];
@@ -151,20 +160,32 @@ function harness(
   });
   const githubLayer = Layer.mock(GitHubCli.GitHubCli)({
     execute: ({ args }) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         githubCalls.push(args);
-        if (args[0] === "api") return output("Flow-Fly\n");
-        if (args.includes("--json")) return output([...assignees].join("\n"));
-        const addAt = args.indexOf("--add-assignee");
-        if (addAt >= 0) {
-          assignees.add(args[addAt + 1]!);
-          if (options.competingAssigneeAfterClaim) {
-            assignees.add(options.competingAssigneeAfterClaim);
-          }
+        if (args[0] === "api" && identityFailuresRemaining > 0) {
+          identityFailuresRemaining -= 1;
+          return Effect.fail(
+            new GitHubCli.GitHubCliCommandError({
+              command: "gh",
+              cwd: workspaceRoot,
+              cause: "controlled identity failure",
+            }),
+          );
         }
-        const removeAt = args.indexOf("--remove-assignee");
-        if (removeAt >= 0) assignees.delete(args[removeAt + 1]!);
-        return output("");
+        return Effect.sync(() => {
+          if (args[0] === "api") return output("Flow-Fly\n");
+          if (args.includes("--json")) return output([...assignees].join("\n"));
+          const addAt = args.indexOf("--add-assignee");
+          if (addAt >= 0) {
+            assignees.add(args[addAt + 1]!);
+            if (options.competingAssigneeAfterClaim) {
+              assignees.add(options.competingAssigneeAfterClaim);
+            }
+          }
+          const removeAt = args.indexOf("--remove-assignee");
+          if (removeAt >= 0) assignees.delete(args[removeAt + 1]!);
+          return output("");
+        });
       }),
   });
   const selectedProvider = Object.hasOwn(options, "provider") ? options.provider : provider();
@@ -174,6 +195,10 @@ function harness(
     probeWorkspaceSnapshot: () =>
       Effect.suspend(() => {
         probeCount += 1;
+        if (assigneeOnNextProbe) {
+          assignees.add(assigneeOnNextProbe);
+          assigneeOnNextProbe = undefined;
+        }
         return options.probeFailure
           ? Effect.fail(
               new ProviderDriverError({
@@ -195,23 +220,59 @@ function harness(
       Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
         getProjectShellById: () =>
           Effect.succeed(Option.some({ id: projectId, title: "T3 Code", workspaceRoot } as never)),
+        getThreadShellById: (threadId) =>
+          Effect.succeed(
+            options.threadState
+              ? Option.some({
+                  id: threadId,
+                  latestTurn: {
+                    turnId: "turn-1",
+                    state: options.threadState,
+                    requestedAt: "2026-09-06T10:00:00.000Z",
+                    startedAt: "2026-09-06T10:00:00.000Z",
+                    completedAt: null,
+                    assistantMessageId: null,
+                  },
+                  session: null,
+                } as never)
+              : Option.none(),
+          ),
       }),
     ),
     Layer.provide(providerLayer),
     Layer.provide(githubLayer),
     Layer.provide(
+      Layer.mock(OrchestrationCommandReceiptRepository)({
+        upsert: () => Effect.void,
+        getByCommandId: ({ commandId }) =>
+          Effect.succeed(
+            acceptedCommands.has(commandId)
+              ? Option.some({
+                  commandId,
+                  aggregateKind: "thread" as const,
+                  aggregateId: ThreadId.make("accepted-thread"),
+                  acceptedAt: "2026-09-06T10:00:00.000Z",
+                  resultSequence: 101,
+                  status: "accepted" as const,
+                  error: null,
+                })
+              : Option.none(),
+          ),
+      }),
+    ),
+    Layer.provide(
       Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(environmentId),
       }),
     ),
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provide(NodeServices.layer),
   );
 
   const dispatch = (command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>) =>
     Effect.suspend(() => {
       commands.push(command);
-      if (options.dispatchFailure) return Effect.fail(options.dispatchFailure);
+      if (dispatchFailure) return Effect.fail(dispatchFailure);
       sequence += 1;
       return Effect.succeed({ sequence });
     });
@@ -220,12 +281,20 @@ function harness(
 
   return {
     assignees,
+    acceptCommand: (commandId: string) => acceptedCommands.add(commandId),
+    addAssignee: (login: string) => assignees.add(login),
     commands,
     dispatch,
     githubCalls,
     input,
     layer: serviceLayer,
     probeCount: () => probeCount,
+    setAssigneeOnNextProbe: (login: string) => {
+      assigneeOnNextProbe = login;
+    },
+    setDispatchFailure: (failure: OrchestrationDispatchCommandError | undefined) => {
+      dispatchFailure = failure;
+    },
   };
 }
 
@@ -349,6 +418,77 @@ describe("WorkflowStartService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("recovers a new attempt that failed before its initial turn was submitted", () => {
+    const test = harness({ identityFailureCount: 1 });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(service.start(test.input, test.dispatch));
+      const recovery = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "claim-failed" });
+      expect(recovery.currentAttempt).toMatchObject({
+        status: "claiming",
+        evidence: "rejected",
+      });
+      expect(recovery.actions).toEqual(["start-fresh"]);
+      expect(recovery.message).toContain("confirmed not accepted");
+
+      const recovered = yield* service.recover(
+        {
+          ...test.input,
+          attemptId: recovery.currentAttempt?.attemptId,
+          action: "start-fresh",
+          observation: recovery.observation,
+        },
+        test.dispatch,
+      );
+      const history = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(recovered.action).toBe("started-fresh");
+      expect(test.commands).toHaveLength(1);
+      expect(history.attempts).toHaveLength(2);
+      expect(history.currentAttempt).toMatchObject({
+        attemptId: recovered.attemptId,
+        evidence: "accepted",
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds a legacy attempt with no receipt and no linked thread", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO workflow_start_attempts (
+          attempt_id, environment_id, project_id, repository, root_number,
+          issue_number, phase, thread_id, command_id, message_id, status,
+          claim_owned, created_at, updated_at, is_current
+        ) VALUES (
+          'legacy-attempt', ${environmentId}, ${projectId}, ${repository}, 10,
+          15, 'decision', 'missing-thread', 'legacy-command', 'legacy-message', 'claiming',
+          0, '2026-09-06T10:00:00.000Z', '2026-09-06T10:00:00.000Z', 1
+        )
+      `;
+      const recovery = yield* (yield* WorkflowStartService.WorkflowStartService).recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(recovery.currentAttempt).toMatchObject({ evidence: "unknown" });
+      expect(recovery.actions).toEqual([]);
+      expect(recovery.message).toContain("no linked thread exists");
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("holds a competing post-claim assignment and releases only its own claim", () => {
     const test = harness({ competingAssigneeAfterClaim: "another-owner" });
     return Effect.gen(function* () {
@@ -430,6 +570,343 @@ describe("WorkflowStartService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("reconciles a durable accepted command after an uncertain response", () => {
+    const test = harness({
+      dispatchFailure: new OrchestrationDispatchCommandError({ message: "response lost" }),
+      threadState: "completed",
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      yield* Effect.flip(service.start(test.input, test.dispatch));
+      test.acceptCommand(test.commands[0]!.commandId);
+
+      const [first, reconnected] = yield* Effect.all(
+        [
+          service.recovery({
+            projectId,
+            repository,
+            issueNumber: decision.number,
+          }),
+          service.recovery({
+            projectId,
+            repository,
+            issueNumber: decision.number,
+          }),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      expect(first.currentAttempt).toMatchObject({
+        attemptId: reconnected.currentAttempt?.attemptId,
+        status: "submitted",
+        evidence: "accepted",
+        threadId: test.commands[0]!.threadId,
+      });
+      expect(first.actions).toContain("open");
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("submits one continuation when two clients resume the same interrupted turn", () => {
+    const test = harness({ threadState: "interrupted" });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const started = yield* service.start(test.input, test.dispatch);
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      const results = yield* Effect.all(
+        [
+          service.recover(
+            {
+              ...test.input,
+              attemptId: started.attemptId,
+              action: "resume",
+              observation: state.observation,
+            },
+            test.dispatch,
+          ),
+          service.recover(
+            {
+              ...test.input,
+              attemptId: started.attemptId,
+              action: "resume",
+              observation: state.observation,
+            },
+            test.dispatch,
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      expect(results.map((result) => result.action)).toEqual(["resumed", "resumed"]);
+      expect(test.commands).toHaveLength(2);
+      expect(test.commands[1]).toMatchObject({
+        threadId: started.threadId,
+        modelSelection,
+      });
+      expect(test.commands[1]).not.toHaveProperty("bootstrap");
+      expect(test.commands[1]?.message.text).toContain("Resume the interrupted work");
+      expect(test.probeCount()).toBe(3);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds an uncertain resume without releasing the accepted attempt claim", () => {
+    const test = harness({ threadState: "interrupted" });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const started = yield* service.start(test.input, test.dispatch);
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+      test.setDispatchFailure(
+        new OrchestrationDispatchCommandError({ message: "resume response lost" }),
+      );
+
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: started.attemptId,
+            action: "resume",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+      const repeated = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: started.attemptId,
+            action: "resume",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error.message).toContain("uncertain");
+      expect(repeated.message).toContain("uncertain");
+      expect(test.commands).toHaveLength(2);
+      expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+      expect(test.githubCalls.filter((args) => args.includes("--remove-assignee"))).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect(
+    "preserves an accepted attempt and its claim when a fresh bootstrap is rejected",
+    () => {
+      const test = harness();
+      return Effect.gen(function* () {
+        const service = yield* WorkflowStartService.WorkflowStartService;
+        const started = yield* service.start(test.input, test.dispatch);
+        const state = yield* service.recovery({
+          projectId,
+          repository,
+          issueNumber: decision.number,
+        });
+        test.setDispatchFailure(
+          new OrchestrationDispatchCommandError({
+            message: "fresh turn rejected",
+            bootstrapTurnDisposition: "not-accepted",
+            bootstrapThreadDisposition: "deleted",
+          }),
+        );
+
+        yield* Effect.flip(
+          service.recover(
+            {
+              ...test.input,
+              attemptId: started.attemptId,
+              action: "start-fresh",
+              observation: state.observation,
+            },
+            test.dispatch,
+          ),
+        );
+        const history = yield* service.recovery({
+          projectId,
+          repository,
+          issueNumber: decision.number,
+        });
+
+        expect(history.attempts).toHaveLength(2);
+        expect(
+          history.attempts.find((attempt) => attempt.attemptId === started.attemptId),
+        ).toMatchObject({
+          isCurrent: false,
+          evidence: "accepted",
+          threadId: started.threadId,
+        });
+        expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+        expect(test.githubCalls.filter((args) => args.includes("--remove-assignee"))).toHaveLength(
+          0,
+        );
+
+        test.setDispatchFailure(undefined);
+        const retried = yield* service.recover(
+          {
+            ...test.input,
+            attemptId: history.currentAttempt?.attemptId,
+            action: "start-fresh",
+            observation: history.observation,
+          },
+          test.dispatch,
+        );
+        expect(retried.action).toBe("started-fresh");
+        expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+        expect(test.githubCalls.filter((args) => args.includes("--add-assignee"))).toHaveLength(1);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("preserves the current attempt when saving its replacement fails", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const sql = yield* SqlClient.SqlClient;
+      const started = yield* service.start(test.input, test.dispatch);
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+      yield* sql`
+        CREATE TRIGGER reject_replacement_attempt
+        BEFORE INSERT ON workflow_start_attempts
+        BEGIN
+          SELECT RAISE(FAIL, 'controlled replacement failure');
+        END
+      `;
+
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: started.attemptId,
+            action: "start-fresh",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+      const history = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(error).toMatchObject({ failure: "persistence-failed" });
+      expect(history.attempts).toHaveLength(1);
+      expect(history.currentAttempt).toMatchObject({
+        attemptId: started.attemptId,
+        isCurrent: true,
+        evidence: "accepted",
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("rejects takeover when the observed assignment changes", () => {
+    const test = harness({ initialAssignees: ["outside-owner"] });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      yield* Effect.flip(service.start(test.input, test.dispatch));
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+      test.addAssignee("new-owner");
+
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: state.currentAttempt?.attemptId,
+            action: "takeover",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error.message).toContain("changed");
+      expect(test.assignees).toEqual(new Set(["outside-owner", "new-owner"]));
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("rejects takeover when an assignment changes during preflight", () => {
+    const test = harness({ initialAssignees: ["outside-owner"] });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      yield* Effect.flip(service.start(test.input, test.dispatch));
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+      test.setAssigneeOnNextProbe("new-owner");
+
+      const error = yield* Effect.flip(
+        service.recover(
+          {
+            ...test.input,
+            attemptId: state.currentAttempt?.attemptId,
+            action: "takeover",
+            observation: state.observation,
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error.message).toContain("changed");
+      expect(test.assignees).toEqual(new Set(["outside-owner", "new-owner"]));
+      expect(test.githubCalls.filter((args) => args.includes("--remove-assignee"))).toHaveLength(0);
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("takes over an unchanged outside assignment and preserves the held attempt", () => {
+    const test = harness({ initialAssignees: ["outside-owner"] });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      yield* Effect.flip(service.start(test.input, test.dispatch));
+      const state = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      const result = yield* service.recover(
+        {
+          ...test.input,
+          attemptId: state.currentAttempt?.attemptId,
+          action: "takeover",
+          observation: state.observation,
+        },
+        test.dispatch,
+      );
+      const history = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
+
+      expect(result.action).toBe("taken-over");
+      expect(test.assignees).toEqual(new Set(["Flow-Fly"]));
+      expect(history.attempts).toHaveLength(2);
+      expect(history.currentAttempt?.threadId).toBe(result.threadId);
+      expect(test.commands).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("releases only its own claim when bootstrap deletion confirms no turn started", () => {
     const test = harness({
       dispatchFailure: new OrchestrationDispatchCommandError({
@@ -442,10 +919,17 @@ describe("WorkflowStartService", () => {
       const service = yield* WorkflowStartService.WorkflowStartService;
       const error = yield* Effect.flip(service.start(test.input, test.dispatch));
       const repeated = yield* service.start(test.input, test.dispatch);
+      const recovery = yield* service.recovery({
+        projectId,
+        repository,
+        issueNumber: decision.number,
+      });
 
       expect(error).toMatchObject({ _tag: "WorkflowStartError", failure: "dispatch-failed" });
       expect(error.message).toContain("claim added by this attempt was released");
       expect(repeated.message).toContain("claim added by this attempt was released");
+      expect(recovery.currentAttempt?.evidence).toBe("rejected");
+      expect(recovery.actions).toEqual(["start-fresh"]);
       expect(test.assignees).toEqual(new Set());
       expect(test.githubCalls.some((args) => args.includes("--remove-assignee"))).toBe(true);
       expect(test.commands).toHaveLength(1);

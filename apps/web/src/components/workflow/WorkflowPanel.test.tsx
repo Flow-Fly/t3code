@@ -17,6 +17,9 @@ const query = vi.hoisted(() => {
     moved: false,
     evidence: false,
     startReady: false,
+    recoveryState: false,
+    externalClaim: false,
+    heldAfterRefresh: false,
     startCalls: new Array<unknown>(),
     navigateCalls: new Array<unknown>(),
     destinationRepository: "Flow-Fly/t3code",
@@ -73,8 +76,27 @@ vi.mock("~/state/entities", () => ({
 }));
 
 vi.mock("~/state/use-atom-command", () => ({
-  useAtomCommand: () => async (request: unknown) => {
+  useAtomCommand: (command: { label: string }) => async (request: unknown) => {
     query.startCalls.push(request);
+    if (command.label === "workflow:start" && query.heldAfterRefresh) {
+      return {
+        _tag: "Success",
+        value: {
+          disposition: "started",
+          status: "held",
+          attemptId: "attempt-held",
+          environmentId: "remote-environment",
+          projectId: "project-draft",
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          issueNumber: 11,
+          phase: "decision",
+          threadId: "workflow-thread-held",
+          createdAt: "2026-09-06T10:00:00.000Z",
+          message: "The initial submission is uncertain.",
+        },
+      };
+    }
     return {
       _tag: "Success",
       value: {
@@ -103,7 +125,9 @@ vi.mock("~/state/workflow", () => ({
     issueDetail: (request: unknown) => query.descriptor("detail", request),
     search: (request: unknown) => query.descriptor("search", request),
     locate: (request: unknown) => query.descriptor("locate", request),
+    recovery: (request: unknown) => query.descriptor("recovery", request),
     start: { label: "workflow:start", run: vi.fn() },
+    recover: { label: "workflow:recover", run: vi.fn() },
   },
 }));
 
@@ -212,13 +236,13 @@ vi.mock("~/state/query", () => ({
                     title:
                       parentNumber === 11 || parentNumber === 20 ? "Nested task" : "Browse work",
                     url: `https://github.com/Flow-Fly/t3code/issues/${parentNumber === 11 || parentNumber === 20 ? 12 : 11}`,
-                    kind: "ticket",
+                    kind: query.startReady ? "decision" : "ticket",
                     state: parentNumber === 11 || parentNumber === 20 ? "closed" : "open",
                     stateReason: parentNumber === 11 || parentNumber === 20 ? "completed" : null,
                     updatedAt: "2026-09-05T00:00:00Z",
                     childCount: parentNumber === 11 || parentNumber === 20 ? 0 : 1,
                     parentNumber: parentNumber ?? 10,
-                    labels: ["workflow:ticket"],
+                    labels: [query.startReady ? "wayfinder:research" : "workflow:ticket"],
                     ...(query.evidence
                       ? {
                           readiness: {
@@ -316,6 +340,60 @@ vi.mock("~/state/query", () => ({
                 }
               : {}),
         },
+      };
+    }
+    if (descriptor.kind === "recovery") {
+      const currentAttempt = query.recoveryState
+        ? {
+            attemptId: query.heldAfterRefresh ? "attempt-held" : "attempt-15",
+            environmentId: "remote-environment",
+            projectId: "project-draft",
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            issueNumber: 11,
+            phase: "decision",
+            threadId: query.heldAfterRefresh ? "workflow-thread-held" : "workflow-thread-15",
+            status: query.heldAfterRefresh ? "held" : "submitted",
+            evidence: query.heldAfterRefresh ? "unknown" : "accepted",
+            claimLogin: "Flow-Fly",
+            isCurrent: true,
+            createdAt: "2026-09-06T10:00:00.000Z",
+            updatedAt: "2026-09-06T10:00:00.000Z",
+            detail: query.heldAfterRefresh ? "The initial submission is uncertain." : null,
+          }
+        : null;
+      return {
+        ...idle,
+        refresh: vi.fn(() => {
+          if (query.heldAfterRefresh) query.recoveryState = true;
+        }),
+        data:
+          query.recoveryState || query.externalClaim
+            ? {
+                environmentId: "remote-environment",
+                projectId: "project-draft",
+                repository: "Flow-Fly/t3code",
+                issueNumber: 11,
+                attempts: currentAttempt ? [currentAttempt] : [],
+                currentAttempt,
+                assignees: query.externalClaim ? ["outside-owner"] : ["Flow-Fly"],
+                observation: query.externalClaim
+                  ? "none|none|none|outside-owner|"
+                  : query.heldAfterRefresh
+                    ? "attempt-held|held|unknown|Flow-Fly|"
+                    : "attempt-15|submitted|accepted|Flow-Fly|",
+                actions: query.externalClaim
+                  ? ["takeover"]
+                  : query.heldAfterRefresh
+                    ? ["open"]
+                    : ["open", "resume", "start-fresh"],
+                message: query.externalClaim
+                  ? "GitHub shows an existing assignment. Confirm the handoff outside T3 Code or explicitly take over after checking the other environment."
+                  : query.heldAfterRefresh
+                    ? "Initial submission evidence is unavailable. Open the linked thread to inspect it; a new first turn is held."
+                    : "This environment has accepted work linked to the preserved thread.",
+              }
+            : null,
       };
     }
     if (descriptor.kind === "search") {
@@ -427,6 +505,9 @@ beforeEach(() => {
   query.moved = false;
   query.evidence = false;
   query.startReady = false;
+  query.recoveryState = false;
+  query.externalClaim = false;
+  query.heldAfterRefresh = false;
   query.startCalls.length = 0;
   query.navigateCalls.length = 0;
   query.destinationRepository = "Flow-Fly/t3code";
@@ -499,6 +580,165 @@ describe("WorkflowPanel browsing", () => {
         activeSurfaceId: "workflow",
         surfaces: [{ id: "workflow", kind: "workflow" }],
       });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("shows recovery target and resumes the preserved thread", async () => {
+    query.startReady = true;
+    query.recoveryState = true;
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={environmentId}
+          environmentLabel="Remote environment"
+          projectId={projectId}
+          projectTitle="Draft project"
+          supported
+        />,
+      );
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const execution = renderer!.root.findByProps({ "aria-label": "Workflow execution" });
+      expect(execution.findAllByType("p")[0]?.children.join("")).toContain(
+        "remote-environment · project project-draft",
+      );
+      const resume = execution
+        .findAllByType("button")
+        .find((button) => button.children.join("") === "Resume");
+      await act(() => resume!.props.onClick());
+
+      expect(query.startCalls.at(-1)).toMatchObject({
+        environmentId,
+        input: {
+          projectId,
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          issueNumber: 11,
+          attemptId: "attempt-15",
+          action: "resume",
+          observation: "attempt-15|submitted|accepted|Flow-Fly|",
+        },
+      });
+      expect(query.navigateCalls.at(-1)).toEqual({
+        to: "/$environmentId/$threadId",
+        params: { environmentId, threadId: "workflow-thread-15" },
+      });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("shows takeover for an external claim without a local attempt", async () => {
+    query.startReady = true;
+    query.externalClaim = true;
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={EnvironmentId.make("remote-environment")}
+          environmentLabel="Remote environment"
+          projectId={ProjectId.make("project-draft")}
+          projectTitle="Draft project"
+          supported
+        />,
+      );
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+
+      const execution = renderer!.root.findByProps({ "aria-label": "Workflow execution" });
+      expect(
+        execution
+          .findAllByType("p")
+          .some((node) => node.children.join("").includes("outside-owner")),
+      ).toBe(true);
+      expect(
+        execution
+          .findAllByType("button")
+          .some((button) => button.children.join("") === "Take over here"),
+      ).toBe(true);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("refreshes recovery after Start returns a held attempt", async () => {
+    query.startReady = true;
+    query.heldAfterRefresh = true;
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={EnvironmentId.make("remote-environment")}
+          environmentLabel="Remote environment"
+          projectId={ProjectId.make("project-draft")}
+          projectTitle="Draft project"
+          supported
+        />,
+      );
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Start workflow decision" })
+          .findByType("button")
+          .props.onClick(),
+      );
+
+      const execution = renderer!.root.findByProps({ "aria-label": "Workflow execution" });
+      expect(
+        execution
+          .findAllByType("button")
+          .some((button) => button.children.join("") === "Open linked work"),
+      ).toBe(true);
+      expect(
+        execution
+          .findAllByType("p")
+          .some((node) => node.children.join("").includes("current held")),
+      ).toBe(true);
     } finally {
       await act(() => renderer?.unmount());
     }

@@ -19,9 +19,13 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  OrchestrationDispatchCommandError,
   ProjectId,
   ThreadId,
   TurnId,
+  type WorkflowIssueDetail,
+  type WorkflowIssueSummary,
+  type OrchestrationCommand,
 } from "@t3tools/contracts";
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import * as Effect from "effect/Effect";
@@ -46,6 +50,7 @@ import {
 } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import * as OrchestrationCommandReceipts from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
@@ -64,8 +69,10 @@ import {
   providerErrorLabelFromInstanceHint,
   ProviderCommandReactorLive,
 } from "./ProviderCommandReactor.ts";
+import { ProviderRuntimeIngestionLive } from "./ProviderRuntimeIngestion.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
@@ -73,6 +80,15 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { ServerActivation } from "../../serverActivation.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import { dispatchCreatedThreadTurnStart } from "../dispatchCreatedThreadTurnStart.ts";
+import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
+import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
+import * as WorkflowService from "../../workflow/WorkflowService.ts";
+import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
+import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
+import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../../vcs/VcsProcess.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -118,7 +134,10 @@ describe("ProviderCommandReactor", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
     | OrchestrationEngineService
     | ProviderCommandReactor
+    | ProviderRuntimeIngestionService
     | ProjectionSnapshotQuery
+    | ProviderRegistry.ProviderRegistry
+    | OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository
     | SqlClient.SqlClient,
     unknown
   > | null = null;
@@ -261,10 +280,11 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
+    const sentTurnId = asTurnId("turn-1");
     const sendTurn = vi.fn((_: unknown) =>
       Effect.succeed({
         threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-1"),
+        turnId: sentTurnId,
       }),
     );
     const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
@@ -343,6 +363,36 @@ describe("ProviderCommandReactor", () => {
     const providerSnapshots = [
       {
         instanceId: modelSelection.instanceId,
+        driver: ProviderDriverKind.make("codex"),
+        status: "ready" as const,
+        enabled: true,
+        installed: true,
+        auth: { status: "authenticated" as const },
+        checkedAt: now,
+        version: "test",
+        models: [
+          {
+            slug: modelSelection.model,
+            name: modelSelection.model,
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning effort",
+                  type: "select" as const,
+                  options: [{ id: "high", label: "High" }],
+                },
+              ],
+            },
+          },
+        ],
+        slashCommands: [],
+        skills: ["wayfinder", "research"].map((name) => ({
+          name,
+          path: `/skills/${name}/SKILL.md`,
+          enabled: true,
+        })),
         ...(input?.requiresNewThreadForModelChange === true
           ? { requiresNewThreadForModelChange: true }
           : {}),
@@ -445,7 +495,7 @@ describe("ProviderCommandReactor", () => {
         } satisfies OrchestrationEngineService["Service"];
       }),
     ).pipe(Layer.provide(orchestrationLayer));
-    const layer = ProviderCommandReactorLive.pipe(
+    const layer = Layer.merge(ProviderCommandReactorLive, ProviderRuntimeIngestionLive).pipe(
       Layer.provideMerge(reactorOrchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
@@ -476,6 +526,11 @@ describe("ProviderCommandReactor", () => {
         }),
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(ThreadBackgroundLiveness.layer),
+      Layer.provideMerge(ThreadPlanProgress.layer),
+      Layer.provideMerge(CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistry.layer))),
+      Layer.provideMerge(VcsProcess.layer),
+      Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
@@ -485,7 +540,140 @@ describe("ProviderCommandReactor", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
+    const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
     const runEffect = <A, E>(effect: Effect.Effect<A, E>) => runtime!.runPromise(effect);
+
+    const workflowRepository = "Flow-Fly/t3code" as const;
+    const workflowSummary = (
+      number: number,
+      kind: WorkflowIssueSummary["kind"],
+      parentNumber: number | null,
+      labels: ReadonlyArray<string>,
+    ): WorkflowIssueSummary => ({
+      id: `workflow-issue-${number}`,
+      repository: workflowRepository,
+      number,
+      title: `Workflow ${kind}`,
+      url: `https://github.com/${workflowRepository}/issues/${number}`,
+      kind,
+      state: "open",
+      stateReason: null,
+      updatedAt: now,
+      childCount: 1,
+      parentNumber,
+      labels: [...labels],
+      readiness: { status: "ready", reasons: [] },
+    });
+    const workflowRoot = workflowSummary(10, "container", null, ["workflow:container"]);
+    const workflowMap = workflowSummary(12, "map", 10, ["wayfinder:map"]);
+    const workflowDecision = workflowSummary(15, "decision", 12, ["wayfinder:research"]);
+    const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => ({
+      ...issue,
+      body: "Workflow integration fixture",
+      blockedBy: [],
+    });
+    const workflowAssignees = new Set<string>();
+    const workflowStart = await runtime.runPromise(
+      WorkflowStartService.make.pipe(
+        Effect.provideService(
+          WorkflowService.WorkflowService,
+          WorkflowService.WorkflowService.of({
+            issueDetail: ({
+              number,
+            }: Parameters<WorkflowService.WorkflowService["Service"]["issueDetail"]>[0]) =>
+              Effect.succeed(
+                workflowDetail(
+                  number === workflowRoot.number
+                    ? workflowRoot
+                    : number === workflowMap.number
+                      ? workflowMap
+                      : workflowDecision,
+                ),
+              ),
+            locate: () =>
+              Effect.succeed({
+                issue: workflowDecision,
+                ancestry: [workflowRoot, workflowMap],
+                ancestryComplete: true,
+              }),
+          } as unknown as WorkflowService.WorkflowService["Service"]),
+        ),
+        Effect.provideService(
+          GitHubCli.GitHubCli,
+          GitHubCli.GitHubCli.of({
+            execute: ({ args }: Parameters<GitHubCli.GitHubCli["Service"]["execute"]>[0]) =>
+              Effect.sync(() => {
+                if (args[0] === "api") {
+                  return {
+                    stdout: "Flow-Fly\n",
+                    stderr: "",
+                    exitCode: 0,
+                    timedOut: false,
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                    stdoutInvalidUtf8: false,
+                    stderrInvalidUtf8: false,
+                  } as never;
+                }
+                if (args.includes("--json")) {
+                  return {
+                    stdout: [...workflowAssignees].join("\n"),
+                    stderr: "",
+                    exitCode: 0,
+                    timedOut: false,
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                    stdoutInvalidUtf8: false,
+                    stderrInvalidUtf8: false,
+                  } as never;
+                }
+                const addAt = args.indexOf("--add-assignee");
+                if (addAt >= 0) workflowAssignees.add(args[addAt + 1]!);
+                const removeAt = args.indexOf("--remove-assignee");
+                if (removeAt >= 0) workflowAssignees.delete(args[removeAt + 1]!);
+                return {
+                  stdout: "",
+                  stderr: "",
+                  exitCode: 0,
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                } as never;
+              }),
+          } as unknown as GitHubCli.GitHubCli["Service"]),
+        ),
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("workflow-environment")),
+          } as ServerEnvironment.ServerEnvironment["Service"]),
+        ),
+        Effect.provide(NodeServices.layer),
+      ),
+    );
+    const dispatchForWorkflow = (command: OrchestrationCommand) =>
+      engine.dispatch(command).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestrationDispatchCommandError({
+              message: "Workflow test dispatch failed.",
+              cause,
+            }),
+        ),
+      );
+    const dispatchWorkflow = (
+      command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
+    ) =>
+      command.bootstrap?.createThread
+        ? dispatchCreatedThreadTurnStart({
+            command: command as never,
+            createCommandId: Effect.succeed(CommandId.make(`workflow:create:${command.commandId}`)),
+            dispatch: dispatchForWorkflow,
+            drainThreadDeletionThrough: () => Effect.void,
+          })
+        : dispatchForWorkflow(command);
 
     await Effect.runPromise(
       engine.dispatch({
@@ -568,14 +756,32 @@ describe("ProviderCommandReactor", () => {
 
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(
-      reactor
-        .start()
-        .pipe(
-          Scope.provide(scope),
-          Effect.provideService(ServerActivation, input?.serverActivation),
-        ),
+      Effect.all([
+        reactor.start().pipe(Effect.provideService(ServerActivation, input?.serverActivation)),
+        ingestion.start(),
+      ]).pipe(Scope.provide(scope)),
     );
-    const drain = () => Effect.runPromise(reactor.drain);
+    const drain = async () => {
+      await Effect.runPromise(reactor.drain);
+      await runtime!.runPromise(ingestion.drain);
+      await Effect.runPromise(reactor.drain);
+    };
+    const emitProviderEvents = (events: ReadonlyArray<ProviderRuntimeEvent>) =>
+      runtime!.runPromise(
+        Effect.forEach(events, (event) => PubSub.publish(runtimeEventPubSub, event), {
+          discard: true,
+        }).pipe(Effect.andThen(ingestion.drain)),
+      );
+    const readWorkflowResumeRows = (attemptId: string) =>
+      runtime!.runPromise(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          return yield* sql<{ readonly commandId: string; readonly status: string }>`
+            SELECT command_id AS "commandId", status FROM workflow_resume_attempts
+            WHERE workflow_attempt_id = ${attemptId}
+          `;
+        }),
+      );
 
     return {
       engine,
@@ -592,9 +798,18 @@ describe("ProviderCommandReactor", () => {
             `;
           }),
         ),
+      readCommandReceipt: (commandId: CommandId) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            const receipts =
+              yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
+            return yield* receipts.getByCommandId({ commandId });
+          }),
+        ),
       tryHandlePromptCommand,
       startSession,
       sendTurn,
+      sentTurnId,
       compactThread,
       interruptTurn,
       respondToRequest,
@@ -610,6 +825,11 @@ describe("ProviderCommandReactor", () => {
       stateDir,
       drain,
       runEffect,
+      emitProviderEvents,
+      readWorkflowResumeRows,
+      workflowStart,
+      dispatchWorkflow,
+      workflowAssignees,
       get titleRegenerationCompletionDispatchAttempts() {
         return titleRegenerationCompletionDispatchAttempts;
       },
@@ -869,6 +1089,112 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
+
+  effectIt.effect(
+    "delivers one provider continuation for simultaneous workflow resume retries",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        NodeFS.mkdirSync("/tmp/provider-project", { recursive: true });
+        const workflowInput = {
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code" as const,
+          rootNumber: 10,
+          issueNumber: 15,
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
+        };
+        const started = yield* harness.workflowStart.start(workflowInput, harness.dispatchWorkflow);
+        yield* Effect.promise(() => harness.drain());
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("workflow-initial-turn-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.threadId,
+              turnId: harness.sentTurnId,
+              createdAt,
+              payload: {},
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("workflow-initial-turn-aborted"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.threadId,
+              turnId: harness.sentTurnId,
+              createdAt,
+              payload: { reason: "Interrupted for recovery." },
+            },
+          ]),
+        );
+        const interruptedThread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (thread) => thread.id === started.threadId,
+        );
+        expect(interruptedThread).toMatchObject({
+          latestTurn: { turnId: harness.sentTurnId, state: "interrupted" },
+          session: { status: "interrupted", activeTurnId: null },
+        });
+        const recovery = yield* harness.workflowStart.recovery({
+          projectId: workflowInput.projectId,
+          repository: workflowInput.repository,
+          issueNumber: workflowInput.issueNumber,
+        });
+        const resumeInput = {
+          ...workflowInput,
+          attemptId: started.attemptId,
+          action: "resume" as const,
+          observation: recovery.observation,
+        };
+        const resumed = yield* Effect.all(
+          [
+            harness.workflowStart.recover(resumeInput, harness.dispatchWorkflow),
+            harness.workflowStart.recover(resumeInput, harness.dispatchWorkflow),
+          ],
+          { concurrency: "unbounded" },
+        );
+        yield* Effect.promise(() => harness.drain());
+        const resumeRows = yield* Effect.promise(() =>
+          harness.readWorkflowResumeRows(started.attemptId),
+        );
+        const receipt = yield* Effect.promise(() =>
+          harness.readCommandReceipt(CommandId.make(resumeRows[0]!.commandId)),
+        );
+        const preserved = yield* harness.workflowStart.recovery({
+          projectId: workflowInput.projectId,
+          repository: workflowInput.repository,
+          issueNumber: workflowInput.issueNumber,
+        });
+
+        expect(resumed.map((result) => result.threadId)).toEqual([
+          started.threadId,
+          started.threadId,
+        ]);
+        expect(resumeRows).toHaveLength(1);
+        expect(resumeRows[0]?.status).toBe("submitted");
+        expect(Option.getOrNull(receipt)).toMatchObject({
+          commandId: resumeRows[0]?.commandId,
+          status: "accepted",
+        });
+        const resumedThread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (thread) => thread.id === started.threadId,
+        );
+        expect(resumedThread?.activities).toEqual([]);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+        expect(preserved.currentAttempt).toMatchObject({
+          attemptId: started.attemptId,
+          threadId: started.threadId,
+          evidence: "accepted",
+        });
+        expect(harness.workflowAssignees).toEqual(new Set(["Flow-Fly"]));
+      }),
+  );
 
   effectIt.effect("retains a turn dispatched immediately after start until activation", () =>
     Effect.gen(function* () {

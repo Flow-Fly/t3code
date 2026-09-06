@@ -2171,6 +2171,16 @@ const makeWsRpcLayer = (
             workflowStart.start(input, dispatchNormalizedCommand),
             { "rpc.aggregate": "workflow" },
           ),
+        [WS_METHODS.workflowRecovery]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowRecovery, workflowStart.recovery(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowRecover]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.workflowRecover,
+            workflowStart.recover(input, dispatchNormalizedCommand),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.workflowAdoptionPreview]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionPreview, workflowAdoption.preview(input), {
             "rpc.aggregate": "workflow",

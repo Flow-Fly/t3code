@@ -145,6 +145,10 @@ import {
   WorkflowIssueDetailInput,
   WorkflowLocateInput,
   WorkflowLocateResult,
+  WorkflowRecoveryInput,
+  WorkflowRecoveryResult,
+  WorkflowRecoverInput,
+  WorkflowRecoverResult,
   WorkflowQueryError,
   WorkflowRepositoriesInput,
   WorkflowRepositoriesResult,
@@ -396,6 +400,8 @@ export const WS_METHODS = {
   workflowSearch: "workflow.search",
   workflowLocate: "workflow.locate",
   workflowStart: "workflow.start",
+  workflowRecovery: "workflow.recovery",
+  workflowRecover: "workflow.recover",
   workflowAdoptionPreview: "workflow.adoption.preview",
   workflowAdoptionApply: "workflow.adoption.apply",
   workflowAdoptionHistory: "workflow.adoption.history",
@@ -852,6 +858,18 @@ export const WsWorkflowLocateRpc = Rpc.make(WS_METHODS.workflowLocate, {
 export const WsWorkflowStartRpc = Rpc.make(WS_METHODS.workflowStart, {
   payload: WorkflowStartInput,
   success: WorkflowStartResult,
+  error: Schema.Union([WorkflowQueryError, WorkflowStartError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorkflowRecoveryRpc = Rpc.make(WS_METHODS.workflowRecovery, {
+  payload: WorkflowRecoveryInput,
+  success: WorkflowRecoveryResult,
+  error: Schema.Union([WorkflowQueryError, WorkflowStartError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorkflowRecoverRpc = Rpc.make(WS_METHODS.workflowRecover, {
+  payload: WorkflowRecoverInput,
+  success: WorkflowRecoverResult,
   error: Schema.Union([WorkflowQueryError, WorkflowStartError, EnvironmentAuthorizationError]),
 });
 
@@ -1388,6 +1406,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowSearchRpc,
   WsWorkflowLocateRpc,
   WsWorkflowStartRpc,
+  WsWorkflowRecoveryRpc,
+  WsWorkflowRecoverRpc,
   WsWorkflowAdoptionPreviewRpc,
   WsWorkflowAdoptionApplyRpc,
   WsWorkflowAdoptionHistoryRpc,

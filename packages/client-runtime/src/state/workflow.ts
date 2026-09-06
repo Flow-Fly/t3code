@@ -51,6 +51,17 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       scheduler: commandScheduler,
       concurrency: serialPerEnvironment,
     }),
+    recovery: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:workflow:recovery",
+      tag: WS_METHODS.workflowRecovery,
+      staleTimeMs: 0,
+    }),
+    recover: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:recover",
+      tag: WS_METHODS.workflowRecover,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     adoptionPreview: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:adoption-preview",
       tag: WS_METHODS.workflowAdoptionPreview,

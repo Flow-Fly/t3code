@@ -291,6 +291,74 @@ export const WorkflowStartResult = Schema.Struct({
 });
 export type WorkflowStartResult = typeof WorkflowStartResult.Type;
 
+export const WorkflowRecoveryInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  issueNumber: PositiveInt,
+});
+export type WorkflowRecoveryInput = typeof WorkflowRecoveryInput.Type;
+
+export const WorkflowRecoveryEvidence = Schema.Literals(["accepted", "rejected", "unknown"]);
+export type WorkflowRecoveryEvidence = typeof WorkflowRecoveryEvidence.Type;
+
+export const WorkflowRecoveryAttempt = Schema.Struct({
+  attemptId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  phase: Schema.Literal("decision"),
+  threadId: ThreadId,
+  status: Schema.Literals(["claiming", "submitting", "submitted", "held"]),
+  evidence: WorkflowRecoveryEvidence,
+  claimLogin: Schema.NullOr(TrimmedNonEmptyString),
+  isCurrent: Schema.Boolean,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  detail: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type WorkflowRecoveryAttempt = typeof WorkflowRecoveryAttempt.Type;
+
+export const WorkflowRecoveryResult = Schema.Struct({
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  issueNumber: PositiveInt,
+  attempts: Schema.Array(WorkflowRecoveryAttempt),
+  currentAttempt: Schema.NullOr(WorkflowRecoveryAttempt),
+  assignees: Schema.Array(TrimmedNonEmptyString),
+  observation: TrimmedNonEmptyString,
+  actions: Schema.Array(Schema.Literals(["open", "resume", "start-fresh", "takeover"])),
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowRecoveryResult = typeof WorkflowRecoveryResult.Type;
+
+export const WorkflowRecoverInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  attemptId: Schema.optional(TrimmedNonEmptyString),
+  action: Schema.Literals(["open", "resume", "start-fresh", "takeover"]),
+  observation: Schema.optional(TrimmedNonEmptyString),
+  modelSelection: Schema.optional(ModelSelection),
+});
+export type WorkflowRecoverInput = typeof WorkflowRecoverInput.Type;
+
+export const WorkflowRecoverResult = Schema.Struct({
+  action: Schema.Literals(["open", "resumed", "started-fresh", "taken-over"]),
+  attemptId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  threadId: ThreadId,
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowRecoverResult = typeof WorkflowRecoverResult.Type;
+
 export const WorkflowStartFailure = Schema.Literals([
   "not-ready",
   "unsupported-issue",

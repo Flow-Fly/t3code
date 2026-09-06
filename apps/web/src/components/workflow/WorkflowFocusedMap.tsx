@@ -3,6 +3,7 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import type {
   EnvironmentId,
   ProjectId,
+  ThreadId,
   WorkflowChildrenResult,
   WorkflowFrontier,
   WorkflowIssueSummary,
@@ -121,6 +122,7 @@ function WorkflowDetails(props: {
   const providers = serverConfigs.get(props.environmentId)?.providers ?? [];
   const startSelection = resolveWorkflowStartSelection(providers, project?.defaultModelSelection);
   const startWorkflow = useAtomCommand(workflowEnvironment.start, { reportFailure: false });
+  const recoverWorkflow = useAtomCommand(workflowEnvironment.recover, { reportFailure: false });
   const [startPending, setStartPending] = useState(false);
   const [startMessage, setStartMessage] = useState<string | null>(null);
   const query = useEnvironmentQuery(
@@ -132,6 +134,18 @@ function WorkflowDetails(props: {
         number: props.issue.number,
       },
     }),
+  );
+  const recoveryQuery = useEnvironmentQuery(
+    props.issue.kind === "decision" || props.issue.labels.includes("wayfinder:task")
+      ? workflowEnvironment.recovery({
+          environmentId: props.environmentId,
+          input: {
+            projectId: props.projectId,
+            repository: props.issue.repository,
+            issueNumber: props.issue.number,
+          },
+        })
+      : null,
   );
   const lastRefreshRequest = useRef(props.refreshRequest);
   const refreshQuery = query.refresh;
@@ -167,6 +181,20 @@ function WorkflowDetails(props: {
   const canStart =
     query.data.readiness?.status === "ready" &&
     (query.data.kind === "decision" || query.data.labels.includes("wayfinder:task"));
+  const recovery = recoveryQuery.data;
+  const hasRecoveryDetails =
+    recovery !== null &&
+    (recovery.currentAttempt !== null ||
+      recovery.assignees.length > 0 ||
+      recovery.actions.length > 0);
+  const openLinkedThread = (environmentId: EnvironmentId, threadId: ThreadId) => {
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    useRightPanelStore.getState().open(threadRef, "workflow");
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: buildThreadRouteParams(threadRef),
+    });
+  };
   const handleStart = async () => {
     if (startPending || !startSelection.selection) return;
     setStartPending(true);
@@ -182,6 +210,7 @@ function WorkflowDetails(props: {
       },
     });
     setStartPending(false);
+    recoveryQuery.refresh();
     if (result._tag === "Failure") {
       const failure = squashAtomCommandFailure(result);
       setStartMessage(
@@ -195,12 +224,47 @@ function WorkflowDetails(props: {
       setStartMessage(result.value.message);
       return;
     }
-    const threadRef = scopeThreadRef(result.value.environmentId, result.value.threadId);
-    useRightPanelStore.getState().open(threadRef, "workflow");
-    void navigate({
-      to: "/$environmentId/$threadId",
-      params: buildThreadRouteParams(threadRef),
+    openLinkedThread(result.value.environmentId, result.value.threadId);
+  };
+  const handleRecovery = async (action: "open" | "resume" | "start-fresh" | "takeover") => {
+    const state = recoveryQuery.data;
+    if (startPending || !state) return;
+    if (action !== "open" && !startSelection.selection) return;
+    if (
+      action === "takeover" &&
+      !window.confirm(
+        `Take over ${selectedIssue.repository}#${selectedIssue.number} in environment ${props.environmentId}? This changes the GitHub assignment, but does not stop work in another environment or create an atomic lock.`,
+      )
+    ) {
+      return;
+    }
+    setStartPending(true);
+    setStartMessage(null);
+    const result = await recoverWorkflow({
+      environmentId: props.environmentId,
+      input: {
+        projectId: props.projectId,
+        repository: selectedIssue.repository,
+        rootNumber: props.rootNumber,
+        issueNumber: selectedIssue.number,
+        action,
+        observation: state.observation,
+        ...(state.currentAttempt ? { attemptId: state.currentAttempt.attemptId } : {}),
+        ...(startSelection.selection ? { modelSelection: startSelection.selection } : {}),
+      },
     });
+    setStartPending(false);
+    recoveryQuery.refresh();
+    if (result._tag === "Failure") {
+      const failure = squashAtomCommandFailure(result);
+      setStartMessage(
+        failure instanceof Error
+          ? failure.message
+          : "Workflow recovery could not continue. Refresh and try again.",
+      );
+      return;
+    }
+    openLinkedThread(result.value.environmentId, result.value.threadId);
   };
   return (
     <article
@@ -229,7 +293,7 @@ function WorkflowDetails(props: {
       <p className="whitespace-pre-wrap text-muted-foreground text-xs leading-relaxed">
         {workflowIssueBrief(query.data) ?? "No description provided."}
       </p>
-      {canStart ? (
+      {canStart && !hasRecoveryDetails ? (
         <section aria-label="Start workflow decision">
           <Button
             size="sm"
@@ -253,6 +317,93 @@ function WorkflowDetails(props: {
               Claims this issue and starts Codex with its required Wayfinder skills.
             </p>
           )}
+        </section>
+      ) : null}
+      {recovery && hasRecoveryDetails ? (
+        <section aria-label="Workflow execution" className="rounded-md border border-border p-2">
+          <h3 className="font-medium text-xs">Linked work</h3>
+          <p className="mt-1 text-muted-foreground text-xs">
+            Environment {props.environmentId} · project {props.projectId}
+          </p>
+          <p className="mt-1 text-xs">{recovery.message}</p>
+          {recovery.attempts.length > 0 ? (
+            <p className="mt-1 text-muted-foreground text-xs">
+              {recovery.attempts.length} preserved attempt
+              {recovery.attempts.length === 1 ? "" : "s"}
+              {recovery.currentAttempt ? ` · current ${recovery.currentAttempt.status}` : null}
+            </p>
+          ) : null}
+          <div className="mt-2 flex flex-wrap gap-1">
+            {recovery.actions.includes("open") ? (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={startPending}
+                onClick={() => void handleRecovery("open")}
+              >
+                Open linked work
+              </Button>
+            ) : null}
+            {recovery.actions.includes("resume") ? (
+              <Button
+                size="xs"
+                disabled={startPending || !startSelection.selection}
+                onClick={() => void handleRecovery("resume")}
+              >
+                Resume
+              </Button>
+            ) : null}
+            {recovery.actions.includes("start-fresh") ? (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={startPending || !startSelection.selection}
+                onClick={() => void handleRecovery("start-fresh")}
+              >
+                Start fresh
+              </Button>
+            ) : null}
+            {recovery.actions.includes("takeover") ? (
+              <Button
+                size="xs"
+                variant="destructive"
+                disabled={startPending || !startSelection.selection}
+                onClick={() => void handleRecovery("takeover")}
+              >
+                Take over here
+              </Button>
+            ) : null}
+          </div>
+          {recovery.assignees.length > 0 && recovery.currentAttempt?.evidence !== "accepted" ? (
+            <p className="mt-2 text-muted-foreground text-xs">
+              Assigned to {recovery.assignees.join(", ")}. Confirm any handoff with the other
+              environment before taking over.
+            </p>
+          ) : null}
+          {(startMessage ?? startSelection.message) ? (
+            <p
+              className={cn(
+                "mt-2 text-xs",
+                startMessage ? "text-destructive" : "text-muted-foreground",
+              )}
+              role={startMessage ? "alert" : undefined}
+            >
+              {startMessage ?? startSelection.message}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+      {recoveryQuery.error ? (
+        <section
+          aria-label="Workflow recovery error"
+          className="rounded-md border border-destructive/40 p-2 text-xs"
+        >
+          <p role="alert" className="text-destructive">
+            Could not load linked work: {recoveryQuery.error}
+          </p>
+          <Button className="mt-2" size="xs" variant="outline" onClick={recoveryQuery.refresh}>
+            Retry
+          </Button>
         </section>
       ) : null}
       {query.data.readiness ? (
