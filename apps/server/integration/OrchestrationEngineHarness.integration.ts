@@ -18,12 +18,11 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
-import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
-import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Tracer from "effect/Tracer";
 
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
@@ -466,8 +465,9 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
-    const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
-    const receiptWaitLock = yield* Semaphore.make(1);
+    const receiptHistory = yield* SubscriptionRef.make<ReadonlyArray<OrchestrationRuntimeReceipt>>(
+      [],
+    );
     const receiptQueue = yield* tryRuntimePromise("subscribe to runtime receipts", () =>
       runtime.runPromise(
         Stream.toQueue(runtimeReceiptBus.streamEventsForTest, { capacity: "unbounded" }).pipe(
@@ -475,6 +475,14 @@ export const makeOrchestrationIntegrationHarness = (
         ),
       ),
     ).pipe(Effect.orDie);
+    yield* Effect.forever(
+      Queue.take(receiptQueue).pipe(
+        Effect.orDie,
+        Effect.flatMap((receipt) =>
+          SubscriptionRef.update(receiptHistory, (receipts) => [...receipts, receipt]),
+        ),
+      ),
+    ).pipe(Effect.forkIn(scope, { startImmediately: true }));
     yield* tryRuntimePromise("start OrchestrationReactor", () =>
       runtime.runPromise(reactor.start().pipe(Scope.provide(scope))),
     ).pipe(Effect.orDie);
@@ -550,13 +558,14 @@ export const makeOrchestrationIntegrationHarness = (
 
     const takeMatchingReceipt = Effect.fn("OrchestrationEngineHarness.takeMatchingReceipt")(
       function* (predicate: (receipt: OrchestrationRuntimeReceipt) => boolean) {
-        const existing = (yield* Ref.get(receiptHistory)).find(predicate);
-        if (existing) return existing;
-        while (true) {
-          const receipt = yield* Queue.take(receiptQueue).pipe(Effect.orDie);
-          yield* Ref.update(receiptHistory, (receipts) => [...receipts, receipt]);
-          if (predicate(receipt)) return receipt;
-        }
+        const receipt = yield* SubscriptionRef.changes(receiptHistory).pipe(
+          Stream.map((receipts) => receipts.find(predicate)),
+          Stream.filter(
+            (candidate): candidate is OrchestrationRuntimeReceipt => candidate !== undefined,
+          ),
+          Stream.runHead,
+        );
+        return Option.getOrThrow(receipt);
       },
     );
 
@@ -572,14 +581,12 @@ export const makeOrchestrationIntegrationHarness = (
       predicate: (receipt: OrchestrationRuntimeReceipt) => boolean,
       timeoutMs?: number,
     ) {
-      return receiptWaitLock
-        .withPermits(1)(takeMatchingReceipt(predicate))
-        .pipe(
-          Effect.timeoutOrElse({
-            duration: `${timeoutMs ?? 40_000} millis`,
-            orElse: () => Effect.die(new WaitForTimeoutError({ description: "runtime receipt" })),
-          }),
-        );
+      return takeMatchingReceipt(predicate).pipe(
+        Effect.timeoutOrElse({
+          duration: `${timeoutMs ?? 40_000} millis`,
+          orElse: () => Effect.die(new WaitForTimeoutError({ description: "runtime receipt" })),
+        }),
+      );
     }
 
     let disposed = false;

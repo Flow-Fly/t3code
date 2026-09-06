@@ -24,6 +24,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -653,6 +654,103 @@ it.live("runs a single turn end-to-end and persists checkpoint state in sqlite +
       assert.equal(gitRefExists(harness.workspaceDir, ref1), true);
       assert.equal(gitShowFileAtRef(harness.workspaceDir, ref0, "README.md"), "v1\n");
       assert.equal(gitShowFileAtRef(harness.workspaceDir, ref1, "README.md"), "v1\n");
+    }),
+  ),
+);
+
+it.live("lets a later receipt waiter trigger work required by an earlier waiter", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* seedProjectAndThread(harness);
+      const dependentThreadId = ThreadId.make("receipt-dependent-thread");
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-create-receipt-dependent"),
+        threadId: dependentThreadId,
+        projectId: PROJECT_ID,
+        title: "Receipt-dependent thread",
+        modelSelection: {
+          instanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+          model: DEFAULT_MODEL_BY_PROVIDER[CODEX_PROVIDER] ?? DEFAULT_MODEL,
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: harness.workspaceDir,
+        createdAt: nowIso(),
+      });
+
+      const dependentReceipt = yield* harness
+        .waitForReceipt(
+          (receipt): receipt is TurnProcessingQuiescedReceipt =>
+            receipt.type === "turn.processing.quiesced" && receipt.threadId === dependentThreadId,
+          5_000,
+        )
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("receipt-trigger-started", "2026-02-24T10:10:00.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("receipt-trigger-completed", "2026-02-24T10:10:00.100Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+      });
+      yield* startTurn({
+        harness,
+        commandId: "cmd-turn-start-receipt-trigger",
+        messageId: "msg-receipt-trigger",
+        text: "Complete the trigger turn",
+      });
+      yield* harness.waitForReceipt(
+        (receipt): receipt is TurnProcessingQuiescedReceipt =>
+          receipt.type === "turn.processing.quiesced" && receipt.threadId === THREAD_ID,
+        5_000,
+      );
+
+      yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("receipt-dependent-started", "2026-02-24T10:11:00.000Z"),
+            threadId: dependentThreadId,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("receipt-dependent-completed", "2026-02-24T10:11:00.100Z"),
+            threadId: dependentThreadId,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-receipt-dependent"),
+        threadId: dependentThreadId,
+        message: {
+          messageId: asMessageId("msg-receipt-dependent"),
+          role: "user",
+          text: "Complete the dependent turn",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: nowIso(),
+      });
+
+      const receipt = yield* Fiber.join(dependentReceipt);
+      assert.equal(receipt.threadId, dependentThreadId);
     }),
   ),
 );
