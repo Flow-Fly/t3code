@@ -32,6 +32,7 @@ import * as WorkflowService from "./WorkflowService.ts";
 import * as WorkflowStartService from "./WorkflowStartService.ts";
 
 const projectId = ProjectId.make("project-1");
+const otherProjectId = ProjectId.make("project-2");
 const environmentId = EnvironmentId.make("environment-1");
 const instanceId = ProviderInstanceId.make("codex-workflow");
 const repository = "Flow-Fly/t3code" as const;
@@ -68,19 +69,30 @@ function summary(
 const root = summary(10, "container", null, ["workflow:container"]);
 const map = summary(12, "map", 10, ["wayfinder:map"]);
 const decision = summary(15, "decision", 12, ["wayfinder:research"]);
-const capabilityBody = [
-  "## Summary",
-  "",
-  "Deliver the approved workflow planning actions.",
-  "",
-  "## Origin",
-  "",
-  "Standalone capability requested directly by the repository owner.",
-].join("\n");
+const capabilityBody =
+  [
+    "## Summary",
+    "",
+    "Deliver the approved workflow planning actions.",
+    "",
+    "## Source map",
+    "",
+    "None (standalone)",
+  ].join("\n") + "\n";
 const capability = {
   ...summary(17, "capability", null, ["workflow:capability"]),
   title: "Plan workflow delivery",
 };
+const mappedCapabilityBody =
+  [
+    "## Summary",
+    "",
+    "Deliver the mapped capability.",
+    "",
+    "## Source map",
+    "",
+    `[Workflow map](${map.url})`,
+  ].join("\n") + "\n";
 
 function detail(
   issue: WorkflowIssueSummary,
@@ -104,7 +116,7 @@ function detail(
         },
       ]
     : [];
-  const body = "Decision context";
+  const body = issue.kind === "map" ? "## Remaining fog\n\nNone.\n" : "Decision context";
   const readiness = interpretWorkflowEvidence({
     issue: {
       id: issue.id,
@@ -123,6 +135,80 @@ function detail(
     blockers: blockedBy,
   }).readiness;
   return { ...issue, body, blockedBy, readiness };
+}
+
+function closedDecision(number: number, outcome: "resolved" | "cancelled" | "out-of-scope") {
+  const issue = {
+    ...summary(number, "decision", map.number, ["wayfinder:research"]),
+    childCount: 0,
+    state: "closed" as const,
+    stateReason: "completed" as const,
+  };
+  const evidenceUrl = `https://github.com/${repository}/issues/${number}#issuecomment-evidence`;
+  const interpreted = interpretWorkflowEvidence({
+    issue: {
+      id: issue.id,
+      url: issue.url,
+      number: issue.number,
+      title: issue.title,
+      kind: issue.kind,
+      state: issue.state,
+      stateReason: issue.stateReason,
+      labels: issue.labels,
+      assignees: [],
+      body: "Decision scope",
+      comments: [
+        {
+          id: `evidence-${number}`,
+          url: evidenceUrl,
+          body: "Owner-confirmed decision evidence.",
+          createdAt: "2026-09-06T08:00:00.000Z",
+          author: "Flow-Fly",
+          authorAssociation: "OWNER",
+        },
+        {
+          id: `resolution-${number}`,
+          url: `${issue.url}#issuecomment-resolution`,
+          body: [
+            "## Resolution",
+            "<!-- t3-workflow:v1 resolution -->",
+            `Outcome: ${outcome}`,
+            "### Summary",
+            outcome === "resolved"
+              ? "The decision is resolved."
+              : outcome === "out-of-scope"
+                ? "Historical work is excluded."
+                : "The decision was cancelled.",
+            "### Evidence",
+            evidenceUrl,
+          ].join("\n"),
+          createdAt: "2026-09-06T09:00:00.000Z",
+          author: "Flow-Fly",
+          authorAssociation: "OWNER",
+        },
+      ],
+      reopenedAt: [],
+    },
+  });
+  return { ...issue, readiness: interpreted.readiness };
+}
+
+function openDecision(number: number) {
+  const issue = {
+    ...summary(number, "decision", map.number, ["wayfinder:research"]),
+    childCount: 0,
+  };
+  return { ...issue, readiness: detail(issue, [], false).readiness! };
+}
+
+function closedUnverifiedDecision(number: number) {
+  const issue = {
+    ...summary(number, "decision", map.number, ["wayfinder:research"]),
+    childCount: 0,
+    state: "closed" as const,
+    stateReason: "completed" as const,
+  };
+  return { ...issue, readiness: detail(issue, [], false).readiness! };
 }
 
 function output(stdout: string) {
@@ -178,8 +264,13 @@ function provider(skills = ["wayfinder", "research", "to-spec", "to-tickets"]): 
 }
 
 function capabilityDetail(
-  options: { readonly approvedContent?: string } = {},
+  options: {
+    readonly approvedContent?: string;
+    readonly body?: string;
+    readonly source?: string;
+  } = {},
 ): WorkflowIssueDetail {
+  const body = options.body ?? capabilityBody;
   const approvalSource = {
     id: "approval-source",
     url: `https://github.com/${repository}/issues/17#issuecomment-1`,
@@ -196,9 +287,9 @@ function capabilityDetail(
       "<!-- t3-workflow:v1 approval -->",
       "Kind: specification",
       "Approved by: Flow-Fly",
-      `Source: ${approvalSource.url}`,
+      `Source: ${options.source ?? approvalSource.url}`,
       "### Approved content",
-      options.approvedContent ?? capabilityBody,
+      options.approvedContent ?? body,
     ].join("\n"),
     createdAt: "2026-09-06T10:00:00.000Z",
     author: "Flow-Fly",
@@ -215,14 +306,14 @@ function capabilityDetail(
       stateReason: capability.stateReason,
       labels: capability.labels,
       assignees: [],
-      body: capabilityBody,
+      body,
       comments: [approvalSource, approval],
       reopenedAt: [],
     },
   });
   return {
     ...capability,
-    body: capabilityBody,
+    body,
     blockedBy: [],
     evidence: interpreted.evidence,
     readiness: interpreted.readiness,
@@ -244,6 +335,7 @@ function harness(
     readonly details?: ReadonlyMap<number, WorkflowIssueDetail> | undefined;
     readonly children?: ReadonlyMap<number, WorkflowChildrenResult> | undefined;
     readonly planningThreadState?: "running" | "interrupted" | "completed" | "error" | undefined;
+    readonly planningSourceMessage?: "user" | "assistant" | "missing" | undefined;
   } = {},
 ) {
   const commands = new Array<Extract<OrchestrationCommand, { type: "thread.turn.start" }>>();
@@ -367,6 +459,29 @@ function harness(
                 } as never)
               : Option.none(),
           ),
+        getThreadDetailById: (threadId) =>
+          Effect.succeed(
+            options.planningThreadState
+              ? Option.some({
+                  id: threadId,
+                  projectId,
+                  messages:
+                    options.planningSourceMessage === "missing"
+                      ? []
+                      : [
+                          {
+                            id: "approval-message",
+                            role: options.planningSourceMessage ?? "user",
+                            text: "I approve this specification.",
+                            turnId: "turn-1",
+                            streaming: false,
+                            createdAt: "2026-09-06T09:00:00.000Z",
+                            updatedAt: "2026-09-06T09:00:00.000Z",
+                          },
+                        ],
+                } as never)
+              : Option.none(),
+          ),
       }),
     ),
     Layer.provide(providerLayer),
@@ -430,18 +545,11 @@ function harness(
 
 describe("WorkflowStartService", () => {
   it.effect(
-    "continues capability specification once in the explicit planning thread and reopens it on repeat",
+    "continues capability specification with resolved decisions and preserves evidence-backed out-of-scope history",
     () => {
       const planningThreadId = ThreadId.make("planning-thread");
-      const resolvedDecision = {
-        ...decision,
-        state: "closed" as const,
-        stateReason: "completed" as const,
-        readiness: {
-          status: "resolved" as const,
-          reasons: [{ kind: "resolution" as const, message: "Resolved with current evidence." }],
-        },
-      };
+      const resolvedDecision = closedDecision(decision.number, "resolved");
+      const excludedDecision = closedDecision(16, "out-of-scope");
       const test = harness({
         planningThreadState: "completed",
         children: new Map([
@@ -449,10 +557,10 @@ describe("WorkflowStartService", () => {
             map.number,
             {
               parentNumber: map.number,
-              children: [resolvedDecision],
+              children: [resolvedDecision, excludedDecision],
               frontier: {
-                status: "complete",
-                message: "All visible work is resolved.",
+                status: "empty-inactive",
+                message: "Historical out-of-scope work remains visible.",
                 readyIssueIds: [],
               },
             },
@@ -505,58 +613,159 @@ describe("WorkflowStartService", () => {
         ]);
         expect(test.commands[0]?.message.text).toContain("Use the to-spec skill explicitly");
         expect(test.commands[0]?.message.text).toContain(map.url);
+        expect(test.commands[0]?.message.text).toContain("Excluded history");
+        expect(test.commands[0]?.message.text).toContain(excludedDecision.url);
         expect(test.githubCalls).toHaveLength(0);
       }).pipe(Effect.provide(test.layer));
     },
   );
 
-  it.effect(
-    "holds capability creation while complete descendant evidence or map fog is unresolved",
-    () => {
-      const test = harness({
-        planningThreadState: "completed",
-        children: new Map([
-          [
-            map.number,
-            {
-              parentNumber: map.number,
-              children: [],
-              frontier: {
-                status: "empty-review",
-                message:
-                  "No immediate work can proceed while this map still records remaining unknowns.",
-                readyIssueIds: [],
+  it.effect("holds capability creation while an in-scope decision remains unresolved", () => {
+    const unresolvedDecision = openDecision(decision.number);
+    const test = harness({
+      planningThreadState: "completed",
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [unresolvedDecision],
+            frontier: {
+              status: "available",
+              message: "One decision remains available.",
+              readyIssueIds: [unresolvedDecision.id],
+            },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const error = yield* Effect.flip(
+        service.start(
+          {
+            ...test.input,
+            issueNumber: map.number,
+            phase: "specification",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.detail).toContain("ready");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("does not exclude cancelled or unverified closed decisions from map completion", () =>
+    Effect.gen(function* () {
+      for (const child of [closedDecision(18, "cancelled"), closedUnverifiedDecision(19)]) {
+        const test = harness({
+          planningThreadState: "completed",
+          children: new Map([
+            [
+              map.number,
+              {
+                parentNumber: map.number,
+                children: [child],
+                frontier: {
+                  status: "empty-inactive",
+                  message: "Closed history remains.",
+                  readyIssueIds: [],
+                },
               },
-            },
-          ],
-        ]),
-      });
-      return Effect.gen(function* () {
-        const service = yield* WorkflowStartService.WorkflowStartService;
+            ],
+          ]),
+        });
         const error = yield* Effect.flip(
-          service.start(
-            {
-              ...test.input,
-              issueNumber: map.number,
-              phase: "specification",
-              planningThreadId: ThreadId.make("planning-thread"),
-            },
-            test.dispatch,
+          WorkflowStartService.WorkflowStartService.pipe(
+            Effect.flatMap((service) =>
+              service.start(
+                {
+                  ...test.input,
+                  issueNumber: map.number,
+                  phase: "specification",
+                  planningThreadId: ThreadId.make("planning-thread"),
+                },
+                test.dispatch,
+              ),
+            ),
+            Effect.provide(test.layer),
           ),
         );
 
         expect(error).toMatchObject({ failure: "not-ready" });
-        expect(error.detail).toContain("remaining unknowns");
+        expect("detail" in error ? error.detail : "").toContain(child.readiness.status);
         expect(test.commands).toHaveLength(0);
-      }).pipe(Effect.provide(test.layer));
-    },
+      }
+    }),
   );
+
+  it.effect("holds capability creation when a nested in-scope map has uncleared fog", () => {
+    const nestedMap = {
+      ...summary(13, "map", map.number, ["wayfinder:map"]),
+      childCount: 0,
+    };
+    const test = harness({
+      planningThreadState: "completed",
+      details: new Map([
+        [map.number, detail(map, [], false)],
+        [
+          nestedMap.number,
+          {
+            ...detail(nestedMap, [], false),
+            body: "## Remaining fog\n\nChoose the supported storage boundary.\n",
+          },
+        ],
+      ]),
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [nestedMap],
+            frontier: { status: "available", message: "Nested map.", readyIssueIds: [] },
+          },
+        ],
+        [
+          nestedMap.number,
+          {
+            parentNumber: nestedMap.number,
+            children: [],
+            frontier: { status: "empty", message: "No visible children.", readyIssueIds: [] },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        (yield* WorkflowStartService.WorkflowStartService).start(
+          {
+            ...test.input,
+            issueNumber: map.number,
+            phase: "specification",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect(error.detail).toContain("storage boundary");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
 
   it.effect(
     "starts a standalone capability ticket proposal only from current verified specification approval and preserves publication authority",
     () => {
       const planningThreadId = ThreadId.make("planning-thread");
-      const approved = capabilityDetail();
+      const approved = capabilityDetail({
+        source:
+          "T3 thread `planning-thread` (Workflow planning), user message `approval-message`, created 2026-09-06T09:00:00.000Z.",
+      });
       const test = harness({
         selectedIssue: capability,
         ancestry: [],
@@ -595,6 +804,182 @@ describe("WorkflowStartService", () => {
     },
   );
 
+  it.effect("returns a mapped capability to its durable specification thread", () => {
+    const specificationThreadId = ThreadId.make("specification-thread");
+    const otherOpenThreadId = ThreadId.make("other-open-thread");
+    const approved = capabilityDetail({
+      body: mappedCapabilityBody,
+      source:
+        "T3 thread `other-open-thread` (Approval review), user message `approval-message`, created 2026-09-06T09:00:00.000Z.",
+    });
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([
+        [map.number, detail(map, [], false)],
+        [capability.number, approved],
+      ]),
+      children: new Map([
+        [
+          map.number,
+          {
+            parentNumber: map.number,
+            children: [closedDecision(decision.number, "resolved")],
+            frontier: { status: "complete", message: "Resolved.", readyIssueIds: [] },
+          },
+        ],
+      ]),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      yield* service.start(
+        {
+          ...test.input,
+          issueNumber: map.number,
+          phase: "specification",
+          planningThreadId: specificationThreadId,
+        },
+        test.dispatch,
+      );
+      const sliced = yield* service.start(
+        {
+          ...test.input,
+          issueNumber: capability.number,
+          phase: "ticket-breakdown",
+          planningThreadId: otherOpenThreadId,
+        },
+        test.dispatch,
+      );
+
+      expect(sliced.threadId).toBe(specificationThreadId);
+      expect(test.commands).toHaveLength(2);
+      expect(test.commands[1]?.threadId).toBe(specificationThreadId);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("uses an explicit thread for an externally authored mapped capability", () => {
+    const planningThreadId = ThreadId.make("explicit-external-thread");
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([[capability.number, capabilityDetail({ body: mappedCapabilityBody })]]),
+    });
+    return Effect.gen(function* () {
+      const started = yield* (yield* WorkflowStartService.WorkflowStartService).start(
+        {
+          ...test.input,
+          issueNumber: capability.number,
+          phase: "ticket-breakdown",
+          planningThreadId,
+        },
+        test.dispatch,
+      );
+
+      expect(started.threadId).toBe(planningThreadId);
+      expect(test.commands[0]?.threadId).toBe(planningThreadId);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds ticket slicing when the capability source is missing or ambiguous", () => {
+    const missingSource = capabilityDetail({
+      body: "## Summary\n\nCapability without a source declaration.\n",
+    });
+    const ambiguousSource = capabilityDetail({
+      body: `${mappedCapabilityBody.trim()}\n[Other map](https://github.com/${repository}/issues/99)\n`,
+    });
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([[capability.number, missingSource]]),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowStartService.WorkflowStartService;
+      const missing = yield* Effect.flip(
+        service.start(
+          {
+            ...test.input,
+            issueNumber: capability.number,
+            phase: "ticket-breakdown",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(missing).toMatchObject({ failure: "not-ready" });
+      expect(missing.message).toContain("source");
+      expect(test.commands).toHaveLength(0);
+
+      const ambiguousTest = harness({
+        selectedIssue: capability,
+        ancestry: [],
+        planningThreadState: "completed",
+        details: new Map([[capability.number, ambiguousSource]]),
+      });
+      const ambiguous = yield* Effect.flip(
+        WorkflowStartService.WorkflowStartService.pipe(
+          Effect.flatMap((service) =>
+            service.start(
+              {
+                ...ambiguousTest.input,
+                issueNumber: capability.number,
+                phase: "ticket-breakdown",
+                planningThreadId: ThreadId.make("planning-thread"),
+              },
+              ambiguousTest.dispatch,
+            ),
+          ),
+          Effect.provide(ambiguousTest.layer),
+        ),
+      );
+
+      expect(ambiguous).toMatchObject({ failure: "not-ready" });
+      expect(ambiguous.message).toContain("source");
+      expect(ambiguousTest.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("does not reuse a source-map planning association from another project", () => {
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([[capability.number, capabilityDetail({ body: mappedCapabilityBody })]]),
+    });
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO workflow_start_attempts (
+          attempt_id, environment_id, project_id, repository, root_number,
+          issue_number, phase, thread_id, command_id, message_id, status,
+          initial_turn_disposition, created_at, updated_at
+        ) VALUES (
+          'other-project-specification', ${environmentId}, ${otherProjectId}, ${repository}, 10,
+          ${map.number}, 'specification', 'other-project-thread', 'other-command', 'other-message',
+          'submitted', 'accepted', '2026-09-06T08:00:00.000Z', '2026-09-06T08:00:00.000Z'
+        )
+      `;
+      const error = yield* Effect.flip(
+        (yield* WorkflowStartService.WorkflowStartService).start(
+          {
+            ...test.input,
+            issueNumber: capability.number,
+            phase: "ticket-breakdown",
+            planningThreadId: ThreadId.make("current-project-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "workspace-unavailable" });
+      expect(error.message).toContain("another project");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("rejects ticket slicing when the preserved specification no longer matches", () => {
     const stale = capabilityDetail({ approvedContent: `${capabilityBody}\n\nOld scope.` });
     const test = harness({
@@ -625,6 +1010,85 @@ describe("WorkflowStartService", () => {
       expect(test.commands).toHaveLength(0);
     }).pipe(Effect.provide(test.layer));
   });
+
+  it.effect("rejects an arbitrary reported approval source", () => {
+    const reported = capabilityDetail({ source: "Approval mentioned in private notes." });
+    const test = harness({
+      selectedIssue: capability,
+      ancestry: [],
+      planningThreadState: "completed",
+      details: new Map([[capability.number, reported]]),
+    });
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        (yield* WorkflowStartService.WorkflowStartService).start(
+          {
+            ...test.input,
+            issueNumber: capability.number,
+            phase: "ticket-breakdown",
+            planningThreadId: ThreadId.make("planning-thread"),
+          },
+          test.dispatch,
+        ),
+      );
+
+      expect(error).toMatchObject({ failure: "not-ready" });
+      expect("detail" in error ? error.detail : "").toContain("approval source");
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds unavailable, ambiguous, missing, or non-user T3 approval sources", () =>
+    Effect.gen(function* () {
+      const cases = [
+        {
+          planningSourceMessage: "missing" as const,
+          source: "T3 Code thread `planning-thread`, message `approval-message`.",
+        },
+        {
+          planningSourceMessage: "assistant" as const,
+          source: "T3 Code thread `planning-thread`, message `approval-message`.",
+        },
+        {
+          planningSourceMessage: "user" as const,
+          source:
+            "T3 thread `planning-thread`, message `approval-message`; T3 thread `other-thread`, message `other-message`.",
+        },
+        {
+          planningSourceMessage: "user" as const,
+          source: "Unavailable: archived T3 thread reference.",
+        },
+      ];
+      for (const { planningSourceMessage, source } of cases) {
+        const test = harness({
+          selectedIssue: capability,
+          ancestry: [],
+          planningThreadState: "completed",
+          planningSourceMessage,
+          details: new Map([[capability.number, capabilityDetail({ source })]]),
+        });
+        const error = yield* Effect.flip(
+          WorkflowStartService.WorkflowStartService.pipe(
+            Effect.flatMap((service) =>
+              service.start(
+                {
+                  ...test.input,
+                  issueNumber: capability.number,
+                  phase: "ticket-breakdown",
+                  planningThreadId: ThreadId.make("planning-thread"),
+                },
+                test.dispatch,
+              ),
+            ),
+            Effect.provide(test.layer),
+          ),
+        );
+
+        expect(error).toMatchObject({ failure: "not-ready" });
+        expect(test.commands).toHaveLength(0);
+      }
+    }),
+  );
 
   it.effect("does not duplicate a planning turn whose command outcome is unknown", () => {
     const planningThreadId = ThreadId.make("planning-thread");

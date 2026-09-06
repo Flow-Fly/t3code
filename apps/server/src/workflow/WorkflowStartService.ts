@@ -14,7 +14,7 @@ import {
   type WorkflowRecoveryAttempt,
   type WorkflowRecoveryInput,
   type WorkflowRecoveryResult,
-  type WorkflowPhase,
+  WorkflowPhase,
   WorkflowStartError,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
@@ -52,7 +52,7 @@ const AttemptRow = Schema.Struct({
   repository: Schema.String,
   rootNumber: Schema.Number,
   issueNumber: Schema.Number,
-  phase: Schema.String,
+  phase: WorkflowPhase,
   commandId: Schema.String,
   threadId: Schema.String,
   status: Schema.String,
@@ -66,6 +66,7 @@ const AttemptRow = Schema.Struct({
   isCurrent: Schema.Number,
 });
 type AttemptRow = typeof AttemptRow.Type;
+const decodeAttemptRow = Schema.decodeUnknownEffect(AttemptRow);
 
 function workflowPhase(input: { readonly phase?: WorkflowPhase | undefined }): WorkflowPhase {
   return input.phase ?? "decision";
@@ -73,6 +74,58 @@ function workflowPhase(input: { readonly phase?: WorkflowPhase | undefined }): W
 
 function startError(failure: WorkflowStartError["failure"], message: string, detail?: string) {
   return new WorkflowStartError({ failure, message, ...(detail ? { detail } : {}) });
+}
+
+function markdownSection(body: string, name: string): string | undefined {
+  return new RegExp(`(?:^|\\n)#{2,6}\\s+${name}\\s*\\n([\\s\\S]*?)(?=\\n#{1,6}\\s|$)`, "iu")
+    .exec(body)?.[1]
+    ?.trim();
+}
+
+function explicitlyClearedFog(body: string): boolean {
+  const remaining = markdownSection(body, "(?:Remaining fog|Remaining unknowns)");
+  return Boolean(remaining && /^(?:none|no remaining (?:fog|unknowns?))\b/iu.test(remaining));
+}
+
+function sourceMapReferences(body: string) {
+  const source = markdownSection(body, "Source map");
+  if (!source) {
+    const standaloneOrigin =
+      markdownSection(body, "Origin") ?? markdownSection(body, "Specification");
+    return standaloneOrigin
+      ? { kind: "standalone" as const, references: [] }
+      : { kind: "missing" as const, references: [] };
+  }
+  if (/^none(?:\s*\(standalone\))?\.?\s*$/iu.test(source)) {
+    return { kind: "standalone" as const, references: [] };
+  }
+  const references = [
+    ...new Map(
+      [...source.matchAll(/https:\/\/github\.com\/([^/\s]+\/[^/\s)]+)\/issues\/(\d+)/giu)].map(
+        (match) => {
+          const repository = match[1]!;
+          const number = Number(match[2]);
+          return [`${repository.toLowerCase()}#${number}`, { repository, number }] as const;
+        },
+      ),
+    ).values(),
+  ];
+  return {
+    kind: references.length === 1 ? ("mapped" as const) : ("ambiguous" as const),
+    references,
+  };
+}
+
+function samePreservedContent(approvedContent: string, currentContent: string): boolean {
+  return approvedContent.trim() === currentContent.trim();
+}
+
+function durableT3SourceReference(source: string | undefined) {
+  if (!source) return null;
+  const threadIds = [...source.matchAll(/\bT3(?: Code)? thread\s+`([^`]+)`/giu)];
+  const messageIds = [...source.matchAll(/\b(?:user\s+)?message\s+`([^`]+)`/giu)];
+  if (threadIds.length !== 1 || messageIds.length !== 1) return null;
+  return { threadId: threadIds[0]![1]!, messageId: messageIds[0]![1]! };
 }
 
 function requiredSkillNames(labels: ReadonlyArray<string>): ReadonlyArray<string> {
@@ -136,24 +189,28 @@ export function workflowDecisionInstructions(input: {
   ].join("\n");
 }
 
-function currentSpecificationApproval(issue: WorkflowIssueDetail) {
-  return issue.evidence?.records.findLast(
-    (record) =>
-      record.kind === "approval" &&
-      record.approvalKind === "specification" &&
-      record.state === "current" &&
-      record.scope === "current" &&
-      record.authority === "verified" &&
-      record.sourceAccess === "verified" &&
-      typeof record.approvedBy === "string" &&
-      record.approvedBy.length > 0 &&
-      record.approvedContent === issue.body,
+function currentSpecificationApprovals(issue: WorkflowIssueDetail) {
+  return (
+    issue.evidence?.records.filter(
+      (record) =>
+        record.kind === "approval" &&
+        record.approvalKind === "specification" &&
+        record.state === "current" &&
+        record.scope === "current" &&
+        record.authority === "verified" &&
+        record.sourceAccess !== "unavailable" &&
+        typeof record.approvedBy === "string" &&
+        record.approvedBy.length > 0 &&
+        typeof record.approvedContent === "string" &&
+        samePreservedContent(record.approvedContent, issue.body),
+    ) ?? []
   );
 }
 
 export function workflowSpecificationInstructions(input: {
   readonly map: WorkflowIssueDetail;
   readonly resolvedDecisions: ReadonlyArray<WorkflowIssueSummary>;
+  readonly excludedHistory: ReadonlyArray<WorkflowIssueSummary>;
 }): string {
   return [
     "Use the to-spec skill explicitly to turn this resolved Wayfinder map into a capability specification.",
@@ -169,6 +226,14 @@ export function workflowSpecificationInstructions(input: {
       (decision) =>
         `- ${decision.repository}#${decision.number} — ${decision.title} (${decision.url})`,
     ),
+    "",
+    "Excluded history (preserve as context; do not treat as resolved decisions):",
+    ...(input.excludedHistory.length > 0
+      ? input.excludedHistory.map(
+          (decision) =>
+            `- ${decision.repository}#${decision.number} — ${decision.title} (${decision.url})`,
+        )
+      : ["- None."]),
     "",
     "Publish the new capability as the specification issue. Start its body with a concise Summary, include this Source map, and apply workflow:capability. Keep decision issues under the map; the map may inform other capabilities later.",
     "After publishing the specification, stop and ask the owner for explicit specification approval. Preserve any approval as a versioned Approval record with the owner, its explicit source, and the exact approved content. Do not infer approval from labels, issue prose, silence, or an earlier map decision.",
@@ -216,7 +281,7 @@ function resultFromRow(
   disposition: WorkflowStartResult["disposition"],
 ): WorkflowStartResult {
   const held = row.status !== "submitted";
-  const phase = row.phase as WorkflowPhase;
+  const phase = row.phase;
   const submittedMessage =
     phase === "decision"
       ? "Decision work started."
@@ -279,7 +344,7 @@ export const make = Effect.gen(function* () {
   const loadAttempts = Effect.fn("WorkflowStartService.loadAttempts")(function* (
     input: Pick<WorkflowStartInput, "projectId" | "repository" | "issueNumber" | "phase">,
   ) {
-    const rows = yield* sql<AttemptRow>`
+    const rows = yield* sql<Record<string, unknown>>`
       SELECT attempt_id AS "attemptId", environment_id AS "environmentId",
         project_id AS "projectId", repository, root_number AS "rootNumber",
         issue_number AS "issueNumber", phase, command_id AS "commandId", thread_id AS "threadId", status,
@@ -299,7 +364,15 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    return rows;
+    return yield* Effect.forEach(rows, (row) => decodeAttemptRow(row)).pipe(
+      Effect.mapError((error) =>
+        startError(
+          "persistence-failed",
+          "The existing workflow attempt is invalid.",
+          String(error),
+        ),
+      ),
+    );
   });
 
   const readEvidence = Effect.fn("WorkflowStartService.readEvidence")(function* (row: AttemptRow) {
@@ -428,7 +501,7 @@ export const make = Effect.gen(function* () {
     repository: row.repository as WorkflowRecoveryAttempt["repository"],
     rootNumber: row.rootNumber,
     issueNumber: row.issueNumber,
-    phase: row.phase as WorkflowPhase,
+    phase: row.phase,
     threadId: ThreadId.make(row.threadId),
     status:
       row.status === "claiming" ||
@@ -1054,31 +1127,139 @@ export const make = Effect.gen(function* () {
     return { project, shell, skill: matches[0]! };
   });
 
+  const capabilityPlanningThread = Effect.fn("WorkflowStartService.capabilityPlanningThread")(
+    function* (
+      input: WorkflowStartInput,
+      capability: WorkflowIssueDetail,
+      environmentId: EnvironmentId,
+    ) {
+      const source = sourceMapReferences(capability.body);
+      if (source.kind === "missing" || source.kind === "ambiguous") {
+        return yield* startError(
+          "not-ready",
+          "The capability source is missing or ambiguous.",
+          "Record one Source map issue or an explicit standalone origin before slicing tickets.",
+        );
+      }
+      if (source.kind === "standalone") return input.planningThreadId;
+
+      const reference = source.references[0]!;
+      const associations = yield* sql<{
+        readonly projectId: string;
+        readonly threadId: string;
+      }>`
+        SELECT project_id AS "projectId", thread_id AS "threadId"
+        FROM workflow_start_attempts
+        WHERE environment_id = ${environmentId}
+          AND repository COLLATE NOCASE = ${reference.repository}
+          AND issue_number = ${reference.number}
+          AND phase = 'specification' AND is_current = 1
+      `.pipe(
+        Effect.mapError((error) =>
+          startError(
+            "persistence-failed",
+            "The source map planning association could not be read.",
+            String(error),
+          ),
+        ),
+      );
+      const local = associations.find((association) => association.projectId === input.projectId);
+      if (local) return ThreadId.make(local.threadId);
+      if (associations.length > 0) {
+        return yield* startError(
+          "workspace-unavailable",
+          "The source map planning thread belongs to another project.",
+          "Open the capability from the project that owns its specification planning history.",
+        );
+      }
+      return input.planningThreadId;
+    },
+  );
+
+  const currentSpecificationApproval = Effect.fn(
+    "WorkflowStartService.currentSpecificationApproval",
+  )(function* (issue: WorkflowIssueDetail) {
+    for (const record of currentSpecificationApprovals(issue).toReversed()) {
+      if (record.sourceAccess === "verified") return record;
+      const source = durableT3SourceReference(record.source);
+      if (!source) continue;
+      const sourceThreadId = ThreadId.make(source.threadId);
+      const thread = yield* projection
+        .getThreadDetailById(sourceThreadId, { activityKinds: [] })
+        .pipe(
+          Effect.mapError((error) =>
+            startError(
+              "persistence-failed",
+              "The specification approval source could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (
+        Option.isSome(thread) &&
+        thread.value.messages.some(
+          (message) => message.id === source.messageId && message.role === "user",
+        )
+      ) {
+        return record;
+      }
+    }
+    return undefined;
+  });
+
   const resolvedMapContext = Effect.fn("WorkflowStartService.resolvedMapContext")(function* (
     input: Pick<WorkflowStartInput, "projectId" | "repository">,
     map: WorkflowIssueDetail,
   ) {
     const visited = new Set<string>();
-    const resolved: WorkflowIssueSummary[] = [];
-    const pending = [{ parentNumber: map.number, root: true }];
+    const resolvedDecisions: WorkflowIssueSummary[] = [];
+    const excludedHistory: WorkflowIssueSummary[] = [];
+    const pending: Array<{
+      readonly parentNumber: number;
+      readonly map: WorkflowIssueDetail | null;
+    }> = [{ parentNumber: map.number, map }];
     while (pending.length > 0) {
       const next = pending.shift()!;
+      const fog = next.map
+        ? markdownSection(next.map.body, "(?:Remaining fog|Remaining unknowns)")
+        : undefined;
+      if (next.map && !explicitlyClearedFog(next.map.body)) {
+        return yield* startError(
+          "not-ready",
+          "This map is not ready to become a capability.",
+          fog
+            ? `Remaining unknowns for #${next.map.number}: ${fog}`
+            : `Map #${next.map.number} does not explicitly clear its remaining unknowns.`,
+        );
+      }
       const result = yield* workflow.children({
         projectId: input.projectId,
         repository: input.repository,
         parentNumber: next.parentNumber,
       });
-      if (next.root && result.frontier?.status !== "complete") {
-        return yield* startError(
-          "not-ready",
-          "This map is not ready to become a capability.",
-          result.frontier?.message ??
-            "Complete every in-scope decision and clear the map's remaining unknowns first.",
-        );
-      }
       for (const child of result.children) {
         if (visited.has(child.id)) continue;
         visited.add(child.id);
+        if (child.readiness?.status === "out-of-scope") {
+          excludedHistory.push(child);
+          continue;
+        }
+        if (child.kind === "map") {
+          if (child.readiness?.status !== "ready" && child.readiness?.status !== "resolved") {
+            return yield* startError(
+              "not-ready",
+              "This map is not ready to become a capability.",
+              `Nested map #${child.number} ${child.title} is ${child.readiness?.status ?? "unverified"}.`,
+            );
+          }
+          const nestedMap = yield* workflow.issueDetail({
+            projectId: input.projectId,
+            repository: child.repository,
+            number: child.number,
+          });
+          pending.push({ parentNumber: child.number, map: nestedMap });
+          continue;
+        }
         if (child.readiness?.status !== "resolved") {
           return yield* startError(
             "not-ready",
@@ -1086,11 +1267,13 @@ export const make = Effect.gen(function* () {
             `Descendant #${child.number} ${child.title} is ${child.readiness?.status ?? "unverified"}.`,
           );
         }
-        resolved.push(child);
-        if (child.childCount > 0) pending.push({ parentNumber: child.number, root: false });
+        resolvedDecisions.push(child);
+        if (child.childCount > 0) {
+          pending.push({ parentNumber: child.number, map: null });
+        }
       }
     }
-    return resolved;
+    return { resolvedDecisions, excludedHistory };
   });
 
   const startPlanningUnlocked = Effect.fn("WorkflowStartService.startPlanning")(function* (
@@ -1105,42 +1288,6 @@ export const make = Effect.gen(function* () {
       repository: input.repository,
       number: input.issueNumber,
     });
-    let instructions: string;
-    let skillName: "to-spec" | "to-tickets";
-    if (phase === "specification") {
-      if (issue.kind !== "map") {
-        return yield* startError(
-          "unsupported-issue",
-          "Create capability is available for a Wayfinder map.",
-        );
-      }
-      const resolvedDecisions = yield* resolvedMapContext(input, issue);
-      instructions = workflowSpecificationInstructions({ map: issue, resolvedDecisions });
-      skillName = "to-spec";
-    } else {
-      if (issue.kind !== "capability") {
-        return yield* startError(
-          "unsupported-issue",
-          "Slice tickets is available for a capability specification.",
-        );
-      }
-      const approval = currentSpecificationApproval(issue);
-      if (issue.readiness?.status !== "ready" || !approval) {
-        return yield* startError(
-          "not-ready",
-          "This capability does not have current verified specification approval.",
-          issue.readiness?.reasons.map((reason) => reason.message).join(" ") ??
-            "Record the owner's explicit approval source and exact current specification content.",
-        );
-      }
-      instructions = workflowTicketBreakdownInstructions({
-        capability: issue,
-        approvalUrl: approval.url,
-        approvedBy: approval.approvedBy!,
-      });
-      skillName = "to-tickets";
-    }
-    const prepared = yield* preparePlanningPhase(input, skillName);
     const environmentId = yield* environment.getEnvironmentId.pipe(
       Effect.mapError((error) =>
         startError(
@@ -1150,11 +1297,51 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
+    let instructions: string;
+    let skillName: "to-spec" | "to-tickets";
+    let planningThreadId = input.planningThreadId;
+    if (phase === "specification") {
+      if (issue.kind !== "map") {
+        return yield* startError(
+          "unsupported-issue",
+          "Create capability is available for a Wayfinder map.",
+        );
+      }
+      const context = yield* resolvedMapContext(input, issue);
+      instructions = workflowSpecificationInstructions({ map: issue, ...context });
+      skillName = "to-spec";
+    } else {
+      if (issue.kind !== "capability") {
+        return yield* startError(
+          "unsupported-issue",
+          "Slice tickets is available for a capability specification.",
+        );
+      }
+      planningThreadId = yield* capabilityPlanningThread(input, issue, environmentId);
+      const approval = yield* currentSpecificationApproval(issue);
+      if (issue.readiness?.status !== "ready" || !approval) {
+        return yield* startError(
+          "not-ready",
+          "This capability does not have current verified specification approval.",
+          issue.readiness?.status !== "ready"
+            ? issue.readiness?.reasons.map((reason) => reason.message).join(" ")
+            : "Record the owner's explicit available approval source and exact current specification content.",
+        );
+      }
+      instructions = workflowTicketBreakdownInstructions({
+        capability: issue,
+        approvalUrl: approval.url,
+        approvedBy: approval.approvedBy!,
+      });
+      skillName = "to-tickets";
+    }
+    const planningInput = planningThreadId ? { ...input, planningThreadId } : input;
+    const prepared = yield* preparePlanningPhase(planningInput, skillName);
     const createdAt = DateTime.formatIso(yield* DateTime.now);
     const attemptId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
     const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
     const messageId = MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
-    const threadId = input.planningThreadId!;
+    const threadId = planningInput.planningThreadId!;
     yield* sql`
       INSERT INTO workflow_start_attempts (
         attempt_id, environment_id, project_id, repository, root_number,

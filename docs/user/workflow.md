@@ -12,10 +12,12 @@ turn, and opens Workflow beside that thread.
 When a map's in-scope decisions are resolved and its remaining unknowns are clear, open the map
 from its planning thread and choose **Create capability**. T3 Code continues that thread with the
 map context and the `to-spec` skill. Approve the resulting specification before choosing **Slice
-tickets** on the capability. Ticket slicing returns to the same planning thread and first proposes
-a breakdown; publishing the delivery issues requires a separate owner approval of that exact
-breakdown. If the panel cannot identify an available planning thread in the selected project and
-environment, open the intended thread before starting either phase.
+tickets** on the capability. For a mapped capability created in T3 Code, ticket slicing returns to
+the thread where **Create capability** ran. A standalone or externally authored capability uses
+the current thread as its explicit planning target. A missing or ambiguous source, an association
+from another project, or an unavailable planning thread prevents the phase from starting. Ticket
+slicing first proposes a breakdown; publishing the delivery issues requires a separate owner
+approval of that exact breakdown.
 
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the

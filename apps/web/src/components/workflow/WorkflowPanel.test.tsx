@@ -1,4 +1,5 @@
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -21,6 +22,7 @@ const query = vi.hoisted(() => {
     externalClaim: false,
     heldAfterRefresh: false,
     planningKind: null as "map" | "capability" | null,
+    startFailure: false,
     startCalls: new Array<unknown>(),
     navigateCalls: new Array<unknown>(),
     destinationRepository: "Flow-Fly/t3code",
@@ -79,6 +81,9 @@ vi.mock("~/state/entities", () => ({
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: { label: string }) => async (request: unknown) => {
     query.startCalls.push(request);
+    if (command.label === "workflow:start" && query.startFailure) {
+      return { _tag: "Failure", cause: Cause.fail(new Error("Planning link is unavailable.")) };
+    }
     if (command.label === "workflow:start" && query.heldAfterRefresh) {
       return {
         _tag: "Success",
@@ -543,6 +548,7 @@ beforeEach(() => {
   query.externalClaim = false;
   query.heldAfterRefresh = false;
   query.planningKind = null;
+  query.startFailure = false;
   query.startCalls.length = 0;
   query.navigateCalls.length = 0;
   query.destinationRepository = "Flow-Fly/t3code";
@@ -555,19 +561,9 @@ afterEach(() => {
 });
 
 describe("WorkflowPanel browsing", () => {
-  it.each([
-    {
-      kind: "map" as const,
-      label: "Create capability",
-      phase: "specification" as const,
-    },
-    {
-      kind: "capability" as const,
-      label: "Slice tickets",
-      phase: "ticket-breakdown" as const,
-    },
-  ])("submits $label in the current planning thread", async ({ kind, label, phase }) => {
-    query.planningKind = kind;
+  it("shows a planning failure and restores the capability action", async () => {
+    query.planningKind = "map";
+    query.startFailure = true;
     const environmentId = EnvironmentId.make("remote-environment");
     const projectId = ProjectId.make("project-draft");
     const planningThreadId = ThreadId.make("planning-thread");
@@ -597,32 +593,14 @@ describe("WorkflowPanel browsing", () => {
         .findAllByType("button")
         .find((button) => button.children.join("").includes("#10 Capability"));
       await act(() => rootButton!.props.onClick());
-      const start = renderer!.root.findByProps({ "aria-label": `Start workflow ${phase}` });
-      expect(start.findByType("button").children.join("")).toBe(label);
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow specification" });
       await act(() => start.findByType("button").props.onClick());
 
-      expect(query.startCalls).toEqual([
-        {
-          environmentId,
-          input: {
-            projectId,
-            repository: "Flow-Fly/t3code",
-            rootNumber: 10,
-            issueNumber: 10,
-            phase,
-            planningThreadId,
-            modelSelection: {
-              instanceId: "codex-workflow",
-              model: "gpt-6-astra",
-              options: [{ id: "reasoningEffort", value: "high" }],
-            },
-          },
-        },
-      ]);
-      expect(query.navigateCalls).toContainEqual({
-        to: "/$environmentId/$threadId",
-        params: { environmentId, threadId: planningThreadId },
-      });
+      expect(start.findByProps({ role: "alert" }).children.join("")).toContain(
+        "Planning link is unavailable.",
+      );
+      expect(start.findByType("button").children.join("")).toBe("Create capability");
+      expect(start.findByType("button").props.disabled).toBe(false);
     } finally {
       await act(() => renderer?.unmount());
     }

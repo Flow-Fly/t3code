@@ -342,7 +342,7 @@ it.live("starts workflow work once and reconciles real bootstrap failures", () =
         issueDetail: ({ number }) =>
           Effect.succeed({
             ...(number === 10 ? root : number === 12 ? map : decisionFor(number)),
-            body: "Decision context",
+            body: number === 12 ? "## Remaining fog\n\nNone.\n" : "Decision context",
             blockedBy: [],
           }),
         locate: ({ number }) =>
