@@ -23,6 +23,7 @@ import {
   type WorkflowQueryError,
 } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import { parseGitHubRepositoryNameWithOwnerFromRemoteUrl } from "@t3tools/shared/git";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -41,6 +42,7 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
@@ -257,6 +259,7 @@ export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const receipts = yield* OrchestrationCommandReceiptRepository;
   const crypto = yield* Crypto.Crypto;
+  const processRunner = yield* ProcessRunner.ProcessRunner;
   const lock = yield* Semaphore.make(1);
 
   const selectedProject = Effect.fn("WorkflowDirectorService.selectedProject")(function* (
@@ -579,26 +582,65 @@ export const make = Effect.gen(function* () {
     cwd: string,
     repository: string,
   ) {
-    const result = yield* github
-      .execute({
+    const accessibleRepository = yield* github
+      .getRepositoryCloneUrls({ cwd, repository })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "workspace-unavailable",
+            "The selected tracker repository could not be accessed.",
+            error.message,
+          ),
+        ),
+      );
+    if (accessibleRepository.nameWithOwner.toLocaleLowerCase() !== repository.toLocaleLowerCase()) {
+      return yield* directorError(
+        "workspace-unavailable",
+        "The selected tracker repository identity could not be verified.",
+        `Expected ${repository}; observed ${accessibleRepository.nameWithOwner || "unknown"}.`,
+      );
+    }
+
+    const result = yield* processRunner
+      .run({
+        command: "git",
+        args: ["remote", "-v"],
         cwd,
-        args: ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        timeout: "5 seconds",
         maxOutputBytes: 100_000,
       })
       .pipe(
         Effect.mapError((error) =>
           directorError(
             "workspace-unavailable",
-            "The target repository identity or tracker access could not be verified.",
+            "The target repository remotes could not be read.",
             error.message,
           ),
         ),
       );
-    if (result.stdout.trim().toLocaleLowerCase() !== repository.toLocaleLowerCase()) {
+    if (result.code !== 0 || result.timedOut) {
+      return yield* directorError(
+        "workspace-unavailable",
+        "The target repository remotes could not be read.",
+        result.stderr.trim() || "git remote -v failed.",
+      );
+    }
+
+    const remoteRepositories = result.stdout.split("\n").flatMap((line) => {
+      const match = /^\S+\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
+      const remoteRepository = parseGitHubRepositoryNameWithOwnerFromRemoteUrl(match?.[1] ?? null);
+      return remoteRepository ? [remoteRepository] : [];
+    });
+    if (
+      !remoteRepositories.some(
+        (remoteRepository) =>
+          remoteRepository.toLocaleLowerCase() === repository.toLocaleLowerCase(),
+      )
+    ) {
       return yield* directorError(
         "workspace-unavailable",
         "The target workspace belongs to a different repository.",
-        `Expected ${repository}; observed ${result.stdout.trim() || "unknown"}.`,
+        `Expected a ${repository} Git remote; observed ${remoteRepositories.join(", ") || "none"}.`,
       );
     }
   });
@@ -1682,5 +1724,5 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(WorkflowDirectorService, make).pipe(
-  Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+  Layer.provide(Layer.merge(OrchestrationCommandReceiptRepositoryLive, ProcessRunner.layer)),
 );

@@ -11,8 +11,10 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as ServerConfig from "../config.ts";
@@ -23,6 +25,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { makeProviderRegistryMock } from "../provider/testUtils/providerRegistryMock.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
 import { interpretWorkflowEvidence, type WorkflowEvidenceComment } from "./WorkflowEvidence.ts";
@@ -225,6 +228,65 @@ function output(stdout: string) {
   };
 }
 
+function processOutput(stdout: string) {
+  return {
+    stdout,
+    stderr: "",
+    code: ChildProcessSpawner.ExitCode(0),
+    timedOut: false,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    stdoutInvalidUtf8: false,
+    stderrInvalidUtf8: false,
+  };
+}
+
+const runGit = (cwd: string, args: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const processRunner = yield* ProcessRunner.ProcessRunner;
+    const result = yield* processRunner.run({ command: "git", args, cwd });
+    if (result.code !== 0) {
+      return yield* Effect.die(new Error(result.stderr.trim() || `git ${args.join(" ")} failed`));
+    }
+    return result;
+  });
+
+function realWorktreeCreator(input: {
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly processRunner: ProcessRunner.ProcessRunner["Service"];
+}): GitWorkflowService.GitWorkflowService["Service"]["createWorktree"] {
+  return (worktree) =>
+    Effect.gen(function* () {
+      if (!worktree.path || !worktree.newRefName || !worktree.baseRefName) {
+        return yield* Effect.die(
+          new Error("The real worktree fixture requires explicit paths and refs."),
+        );
+      }
+      yield* input.fileSystem
+        .makeDirectory(input.path.dirname(worktree.path), { recursive: true })
+        .pipe(Effect.orDie);
+      const result = yield* input.processRunner
+        .run({
+          command: "git",
+          args: ["worktree", "add", "-b", worktree.newRefName, worktree.path, worktree.baseRefName],
+          cwd: worktree.cwd,
+        })
+        .pipe(Effect.orDie);
+      if (result.code !== 0) {
+        return yield* Effect.die(
+          new Error(result.stderr.trim() || "The real worktree fixture could not be created."),
+        );
+      }
+      return { worktree: { path: worktree.path, refName: worktree.newRefName } };
+    });
+}
+
+const RealGitTestLayer = Layer.merge(
+  NodeServices.layer,
+  ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer)),
+);
+
 function evidenceComment(input: {
   readonly id: string;
   readonly body: string;
@@ -375,6 +437,7 @@ function interpretedCapabilityFixture(
 }
 
 interface HarnessOptions {
+  readonly workspaceRoot?: string;
   readonly capability?: WorkflowIssueDetail;
   readonly worktreeCapability?: WorkflowIssueDetail;
   readonly ticketDetails?: ReadonlyArray<WorkflowIssueDetail>;
@@ -383,6 +446,9 @@ interface HarnessOptions {
   readonly threadShell?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadShellById"];
   readonly threadDetail?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadDetailById"];
   readonly githubExecute?: GitHubCli.GitHubCli["Service"]["execute"];
+  readonly githubGetRepositoryCloneUrls?: GitHubCli.GitHubCli["Service"]["getRepositoryCloneUrls"];
+  readonly processRunner?: ProcessRunner.ProcessRunner["Service"];
+  readonly createWorktree?: GitWorkflowService.GitWorkflowService["Service"]["createWorktree"];
   readonly worktreeSkills?: ReadonlyArray<{
     readonly name: string;
     readonly path: string;
@@ -399,6 +465,7 @@ function harness(options: HarnessOptions = {}) {
   let remainingWorktreeFailures = options.failWorktreeAttempts ?? 0;
   let capabilityReads = 0;
   const selectedProvider = provider();
+  const selectedWorkspaceRoot = options.workspaceRoot ?? workspaceRoot;
   const testCapability = options.capability ?? capability;
   const ticketDetails = options.ticketDetails ?? [ticketDetail];
   const registry = makeProviderRegistryMock([selectedProvider]);
@@ -451,7 +518,13 @@ function harness(options: HarnessOptions = {}) {
     Layer.provide(
       Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
         getProjectShellById: () =>
-          Effect.succeed(Option.some({ id: projectId, title: "T3 Code", workspaceRoot } as never)),
+          Effect.succeed(
+            Option.some({
+              id: projectId,
+              title: "T3 Code",
+              workspaceRoot: selectedWorkspaceRoot,
+            } as never),
+          ),
         getThreadShellById: options.threadShell ?? (() => Effect.succeed(Option.none())),
         getThreadDetailById: options.threadDetail ?? (() => Effect.succeed(Option.none())),
       }),
@@ -461,7 +534,7 @@ function harness(options: HarnessOptions = {}) {
         ...registry,
         probeWorkspaceSnapshot: ({ cwd }) =>
           Effect.succeed(
-            cwd === workspaceRoot || !options.worktreeSkills
+            cwd === selectedWorkspaceRoot || !options.worktreeSkills
               ? selectedProvider
               : { ...selectedProvider, skills: [...options.worktreeSkills] },
           ),
@@ -472,34 +545,57 @@ function harness(options: HarnessOptions = {}) {
         localStatus: ({ cwd }) => {
           statusCalls.push(`${cwd}:${worktreeCreated}`);
           return Effect.succeed({
-            isRepo: cwd === workspaceRoot || worktreeCreated,
+            isRepo: cwd === selectedWorkspaceRoot || worktreeCreated,
             hasPrimaryRemote: true,
-            isDefaultRef: cwd === workspaceRoot,
-            refName: cwd === workspaceRoot ? "main" : worktreeCreated ? "t3code/workflow-17" : null,
+            isDefaultRef: cwd === selectedWorkspaceRoot,
+            refName:
+              cwd === selectedWorkspaceRoot
+                ? "main"
+                : worktreeCreated
+                  ? "t3code/workflow-17"
+                  : null,
             hasWorkingTreeChanges: false,
             workingTree: { files: [], insertions: 0, deletions: 0 },
           });
         },
-        createWorktree: (input) => {
-          worktreeCalls.push({ cwd: input.cwd, path: input.path });
-          if (remainingWorktreeFailures > 0) {
-            remainingWorktreeFailures -= 1;
-            return Effect.fail({ message: "simulated worktree failure" } as never);
-          }
-          worktreeCreated = true;
-          return Effect.succeed({
-            worktree: { path: input.path!, refName: input.newRefName! },
-          });
-        },
+        createWorktree: (input) =>
+          Effect.gen(function* () {
+            worktreeCalls.push({ cwd: input.cwd, path: input.path });
+            if (remainingWorktreeFailures > 0) {
+              remainingWorktreeFailures -= 1;
+              return yield* Effect.fail({ message: "simulated worktree failure" } as never);
+            }
+            const result = options.createWorktree
+              ? yield* options.createWorktree(input)
+              : { worktree: { path: input.path!, refName: input.newRefName! } };
+            worktreeCreated = true;
+            return result;
+          }),
       }),
     ),
     Layer.provide(
       Layer.mock(GitHubCli.GitHubCli)({
         execute:
           options.githubExecute ??
-          (({ args }) =>
-            Effect.succeed(output(args[0] === "repo" ? `${repository}\n` : "Flow-Fly\n"))),
+          (({ args }) => Effect.succeed(output(args[0] === "api" ? "Flow-Fly\n" : ""))),
+        getRepositoryCloneUrls:
+          options.githubGetRepositoryCloneUrls ??
+          (() =>
+            Effect.succeed({
+              nameWithOwner: repository,
+              url: `https://github.com/${repository}`,
+              sshUrl: `git@github.com:${repository}.git`,
+            })),
       }),
+    ),
+    Layer.provide(
+      Layer.succeed(
+        ProcessRunner.ProcessRunner,
+        options.processRunner ?? {
+          run: () =>
+            Effect.succeed(processOutput(`fork\tgit@github.com:${repository}.git (fetch)\n`)),
+        },
+      ),
     ),
     Layer.provide(
       Layer.mock(OrchestrationCommandReceiptRepository)({
@@ -512,7 +608,9 @@ function harness(options: HarnessOptions = {}) {
         getEnvironmentId: Effect.succeed(environmentId),
       }),
     ),
-    Layer.provide(ServerConfig.layerTest(workspaceRoot, { prefix: "workflow-director-test-" })),
+    Layer.provide(
+      ServerConfig.layerTest(selectedWorkspaceRoot, { prefix: "workflow-director-test-" }),
+    ),
     Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provide(NodeServices.layer),
   );
@@ -525,6 +623,104 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe("WorkflowDirectorService", () => {
+  it.effect("accepts a selected fork when GitHub CLI defaults to the upstream repository", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "workflow-director-fork-repository-",
+      });
+      yield* runGit(cwd, ["init", "--initial-branch=main"]);
+      yield* runGit(cwd, ["config", "user.name", "T3 Test"]);
+      yield* runGit(cwd, ["config", "user.email", "t3@example.test"]);
+      yield* runGit(cwd, ["commit", "--allow-empty", "-m", "initial"]);
+      yield* runGit(cwd, ["remote", "add", "origin", "https://github.com/pingdotgg/t3code"]);
+      yield* runGit(cwd, ["config", "remote.origin.gh-resolved", "base"]);
+      yield* runGit(cwd, ["remote", "add", "fork", `git@github.com:${repository}.git`]);
+
+      const fileSystemService = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const processRunner = yield* ProcessRunner.ProcessRunner;
+      const implicitRepositoryCalls: ReadonlyArray<string>[] = [];
+      const explicitRepositoryCalls: string[] = [];
+      const test = harness({
+        workspaceRoot: cwd,
+        processRunner,
+        createWorktree: realWorktreeCreator({
+          fileSystem: fileSystemService,
+          path,
+          processRunner,
+        }),
+        githubExecute: ({ args }) => {
+          if (args[0] === "repo") implicitRepositoryCalls.push(args);
+          return Effect.succeed(output(args[0] === "repo" ? "pingdotgg/t3code\n" : "Flow-Fly\n"));
+        },
+        githubGetRepositoryCloneUrls: ({ repository: requestedRepository }) => {
+          explicitRepositoryCalls.push(requestedRepository);
+          return Effect.succeed({
+            nameWithOwner: repository,
+            url: `https://github.com/${repository}`,
+            sshUrl: `git@github.com:${repository}.git`,
+          });
+        },
+      });
+
+      const evidence = yield* Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const result = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        return {
+          result,
+          worktreeExists: yield* fileSystem.exists(result.director.worktreePath),
+          worktreeRemotes: (yield* runGit(result.director.worktreePath, ["remote", "-v"])).stdout,
+        };
+      }).pipe(Effect.provide(test.layer));
+
+      expect(evidence.result).toMatchObject({
+        disposition: "started",
+        director: { status: "active" },
+      });
+      expect(evidence.worktreeExists).toBe(true);
+      expect(evidence.worktreeRemotes).toContain(`git@github.com:${repository}.git`);
+      expect(explicitRepositoryCalls).toEqual([repository, repository, repository]);
+      expect(implicitRepositoryCalls).toEqual([]);
+    }).pipe(Effect.provide(RealGitTestLayer)),
+  );
+
+  it.effect("rejects a checkout without a remote for the selected tracker", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "workflow-director-unrelated-repository-",
+      });
+      yield* runGit(cwd, ["init", "--initial-branch=main"]);
+      yield* runGit(cwd, ["remote", "add", "origin", "https://github.com/example/unrelated.git"]);
+
+      const processRunner = yield* ProcessRunner.ProcessRunner;
+      const test = harness({ workspaceRoot: cwd, processRunner });
+      const result = yield* Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        return yield* service
+          .start(
+            { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+            test.dispatch,
+          )
+          .pipe(Effect.result);
+      }).pipe(Effect.provide(test.layer));
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({
+          failure: "workspace-unavailable",
+          message: "The target workspace belongs to a different repository.",
+        });
+      }
+      expect(test.worktreeCalls).toHaveLength(0);
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(RealGitTestLayer)),
+  );
+
   it.effect("persists a fresh director and worktree before submitting its first turn", () => {
     const test = harness();
     return Effect.gen(function* () {

@@ -85,6 +85,7 @@ import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { dispatchCreatedThreadTurnStart } from "../dispatchCreatedThreadTurnStart.ts";
 import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
+import * as ProcessRunner from "../../processRunner.ts";
 import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "../../workflow/WorkflowService.ts";
 import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
@@ -878,7 +879,29 @@ describe("ProviderCommandReactor", () => {
                 stdoutInvalidUtf8: false,
                 stderrInvalidUtf8: false,
               } as never),
+            getRepositoryCloneUrls: () =>
+              Effect.succeed({
+                nameWithOwner: workflowRepository,
+                url: `https://github.com/${workflowRepository}`,
+                sshUrl: `git@github.com:${workflowRepository}.git`,
+              }),
           } as unknown as GitHubCli.GitHubCli["Service"]),
+        ),
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({
+            run: () =>
+              Effect.succeed({
+                stdout: `fork\tgit@github.com:${workflowRepository}.git (fetch)\n`,
+                stderr: "",
+                code: 0,
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              } as never),
+          }),
         ),
         Effect.provideService(
           ServerEnvironment.ServerEnvironment,
