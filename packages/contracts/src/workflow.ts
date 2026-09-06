@@ -428,6 +428,8 @@ export const WorkflowWorkerStatus = Schema.Struct({
   parentProviderThreadId: Schema.NullOr(TrimmedNonEmptyString),
   ownership: Schema.NullOr(TrimmedNonEmptyString),
   writePaths: Schema.Array(TrimmedNonEmptyString),
+  writeReservation: Schema.NullOr(Schema.Literals(["held", "released"])),
+  settlementEvidence: Schema.NullOr(Schema.Literal("native-closed")),
   association: Schema.Literals(["associated", "unassociated", "unconfirmed"]),
   providerStatus: TrimmedNonEmptyString,
   requestedProfile: Schema.NullOr(WorkflowWorkerRequestedProfile),
@@ -542,7 +544,8 @@ export const WorkflowWorkerPrepareResult = Schema.Struct({
   requestedProfile: WorkflowWorkerRequestedProfile,
   taskName: TrimmedNonEmptyString,
   instructions: TrimmedNonEmptyString,
-  disposition: Schema.Literals(["prepared", "existing-unconfirmed"]),
+  disposition: Schema.Literals(["prepared", "existing"]),
+  worker: WorkflowWorkerStatus,
 });
 export type WorkflowWorkerPrepareResult = typeof WorkflowWorkerPrepareResult.Type;
 

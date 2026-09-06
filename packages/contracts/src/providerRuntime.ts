@@ -662,6 +662,8 @@ const taskAgentLinkageFields = {
   outputFile: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Codex agent hierarchy path, e.g. "/root/marlow". */
   agentPath: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Explicit native child-thread closure, distinct from an interrupted turn. */
+  nativeLifecycle: Schema.optional(Schema.Literal("closed")),
   /**
    * Set on provider-synthesized child-agent events (Codex) whose activity
    * belongs in the Agents surface, never the parent timeline.

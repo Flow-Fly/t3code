@@ -125,6 +125,7 @@ const WorkerRow = Schema.Struct({
   providerStatus: Schema.String,
   observedModel: Schema.NullOr(Schema.String),
   observedEffort: Schema.NullOr(Schema.String),
+  nativeLifecycle: Schema.NullOr(Schema.String),
   handoffSummary: Schema.NullOr(Schema.String),
   handoffCommitsJson: Schema.NullOr(Schema.String),
   handoffChecksJson: Schema.NullOr(Schema.String),
@@ -137,6 +138,66 @@ const decodeWorkerRow = Schema.decodeUnknownEffect(WorkerRow);
 const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeStringArrayJson = Schema.decodeUnknownEffect(StringArrayJson);
 const encodeStringArrayJson = Schema.encodeUnknownSync(StringArrayJson);
+
+function pathsOverlap(left: string, right: string) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function writeReservationFor(
+  worker: WorkerRow,
+  workers: ReadonlyArray<WorkerRow>,
+  writePathsByDispatch: ReadonlyMap<string, ReadonlyArray<string>>,
+): "held" | "released" | null {
+  // Native closure is enough only when every observation can be placed in a
+  // closed descendant tree or a separately owned dispatch.
+  if (!worker.dispatchId) return null;
+  if (!worker.providerThreadId || worker.nativeLifecycle !== "closed") return "held";
+
+  const observations = new Map(
+    workers.flatMap((candidate) =>
+      candidate.providerThreadId ? [[candidate.providerThreadId, candidate] as const] : [],
+    ),
+  );
+  const workerPaths = writePathsByDispatch.get(worker.dispatchId) ?? [];
+  const isKnownSeparate = (candidate: WorkerRow | null) => {
+    if (!candidate?.dispatchId) return false;
+    if (candidate.admissionId === worker.admissionId) return true;
+    const candidatePaths = writePathsByDispatch.get(candidate.dispatchId) ?? [];
+    if (workerPaths.length === 0 || candidatePaths.length === 0) return false;
+    return !workerPaths.some((workerPath) =>
+      candidatePaths.some((candidatePath) => pathsOverlap(workerPath, candidatePath)),
+    );
+  };
+
+  for (const candidate of workers) {
+    if (
+      !candidate.providerThreadId ||
+      candidate.providerThreadId === worker.providerThreadId ||
+      candidate.nativeLifecycle === "closed"
+    ) {
+      continue;
+    }
+
+    let parentId = candidate.parentProviderThreadId;
+    let associatedAncestor = candidate.dispatchId ? candidate : null;
+    const visited = new Set<string>();
+    while (parentId) {
+      if (parentId === worker.providerThreadId) return "held";
+      if (visited.has(parentId)) return "held";
+      visited.add(parentId);
+      const parent = observations.get(parentId);
+      if (!parent) {
+        if (!isKnownSeparate(associatedAncestor)) return "held";
+        break;
+      }
+      if (parent.dispatchId) associatedAncestor = parent;
+      parentId = parent.parentProviderThreadId;
+    }
+    if (!parentId && !isKnownSeparate(associatedAncestor)) return "held";
+  }
+
+  return "released";
+}
 
 function directorError(
   failure: WorkflowDirectorError["failure"],
@@ -970,7 +1031,11 @@ export const make = Effect.gen(function* () {
   });
 
   const workerStatusFromRow = Effect.fn("WorkflowDirectorService.workerStatusFromRow")(
-    function* (row: WorkerRow): Effect.fn.Return<WorkflowWorkerStatus, WorkflowDirectorError> {
+    function* (
+      row: WorkerRow,
+      rows: ReadonlyArray<WorkerRow>,
+      writePathsByDispatch: ReadonlyMap<string, ReadonlyArray<string>>,
+    ): Effect.fn.Return<WorkflowWorkerStatus, WorkflowDirectorError> {
       const decode = (value: string) =>
         decodeStringArrayJson(value).pipe(
           Effect.mapError((error) =>
@@ -999,6 +1064,8 @@ export const make = Effect.gen(function* () {
         parentProviderThreadId: row.parentProviderThreadId,
         ownership: row.ownership,
         writePaths,
+        writeReservation: writeReservationFor(row, rows, writePathsByDispatch),
+        settlementEvidence: row.nativeLifecycle === "closed" ? "native-closed" : null,
         association: row.dispatchId
           ? row.providerThreadId
             ? "associated"
@@ -1041,6 +1108,7 @@ export const make = Effect.gen(function* () {
         d.requested_effort AS "requestedEffort", d.requested_skill_path AS "requestedSkillPath",
         d.status AS "dispatchStatus", COALESCE(o.provider_status, 'unconfirmed') AS "providerStatus",
         o.observed_model AS "observedModel", o.observed_effort AS "observedEffort",
+        o.native_lifecycle AS "nativeLifecycle",
         d.handoff_summary AS "handoffSummary", d.handoff_commits_json AS "handoffCommitsJson",
         d.handoff_checks_json AS "handoffChecksJson", o.title, o.role,
         COALESCE(o.updated_at, d.updated_at) AS "updatedAt"
@@ -1055,6 +1123,7 @@ export const make = Effect.gen(function* () {
         NULL AS "writePathsJson", NULL AS "requestedModel", NULL AS "requestedEffort",
         NULL AS "requestedSkillPath", NULL AS "dispatchStatus", o.provider_status AS "providerStatus",
         o.observed_model AS "observedModel", o.observed_effort AS "observedEffort",
+        o.native_lifecycle AS "nativeLifecycle",
         NULL AS "handoffSummary", NULL AS "handoffCommitsJson", NULL AS "handoffChecksJson",
         o.title, o.role, o.updated_at AS "updatedAt"
       FROM workflow_worker_observations o
@@ -1074,7 +1143,19 @@ export const make = Effect.gen(function* () {
         directorError("persistence-failed", "A worker history row is invalid.", String(error)),
       ),
     );
-    return yield* Effect.forEach(decoded, (row) => workerStatusFromRow(row));
+    const writePathsByDispatch = new Map<string, ReadonlyArray<string>>();
+    for (const row of decoded) {
+      if (!row.dispatchId || !row.writePathsJson) continue;
+      const paths = yield* decodeStringArrayJson(row.writePathsJson).pipe(
+        Effect.mapError((error) =>
+          directorError("persistence-failed", "Worker history JSON is invalid.", String(error)),
+        ),
+      );
+      writePathsByDispatch.set(row.dispatchId, paths);
+    }
+    return yield* Effect.forEach(decoded, (row) =>
+      workerStatusFromRow(row, decoded, writePathsByDispatch),
+    );
   });
 
   const reconcileDirector = Effect.fn("WorkflowDirectorService.reconcileDirector")(function* (
@@ -2114,9 +2195,6 @@ export const make = Effect.gen(function* () {
     return normalized;
   });
 
-  const pathsOverlap = (left: string, right: string) =>
-    left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
-
   const workerPreflight = Effect.fn("WorkflowDirectorService.workerPreflight")(function* (
     row: DirectorRow,
   ) {
@@ -2161,23 +2239,17 @@ export const make = Effect.gen(function* () {
   ) {
     const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
     const writePaths = yield* normalizeWritePaths(input.writePaths);
-    const activeRows = yield* persistence(
-      sql<{ readonly ticketNumber: number; readonly paths: string }>`
-      SELECT ticket_number AS "ticketNumber", write_paths_json AS paths
-      FROM workflow_worker_dispatches
-      WHERE director_id = ${row.directorId}
-    `,
-      "Worker ownership could not be read.",
-    );
-    for (const active of activeRows) {
-      if (active.ticketNumber === input.ticketNumber) continue;
-      const activePaths = yield* decodeStringArrayJson(active.paths).pipe(
-        Effect.mapError((error) =>
-          directorError("persistence-failed", "Stored worker ownership is invalid.", String(error)),
-        ),
-      );
+    const currentWorkers = yield* workers(row.directorId);
+    for (const active of currentWorkers) {
+      if (
+        !active.dispatchId ||
+        active.writeReservation !== "held" ||
+        active.ticketNumber === input.ticketNumber
+      ) {
+        continue;
+      }
       const overlap = writePaths.find((candidate) =>
-        activePaths.some((owned) => pathsOverlap(candidate, owned)),
+        active.writePaths.some((owned) => pathsOverlap(candidate, owned)),
       );
       if (overlap) {
         return yield* directorError(
@@ -2214,21 +2286,24 @@ export const make = Effect.gen(function* () {
       sql<Record<string, unknown>>`
       SELECT d.dispatch_id AS "dispatchId", d.association_token AS "associationToken",
         d.admission_id AS "admissionId", d.ticket_number AS "ticketNumber",
-        d.provider_thread_id AS "providerThreadId", NULL AS "parentProviderThreadId",
+        d.provider_thread_id AS "providerThreadId", o.parent_provider_thread_id AS "parentProviderThreadId",
         d.ownership, d.write_paths_json AS "writePathsJson", d.requested_model AS "requestedModel",
         d.requested_effort AS "requestedEffort", d.requested_skill_path AS "requestedSkillPath",
-        d.status AS "dispatchStatus", 'unconfirmed' AS "providerStatus", NULL AS "observedModel",
-        NULL AS "observedEffort", d.handoff_summary AS "handoffSummary",
+        d.status AS "dispatchStatus", COALESCE(o.provider_status, 'unconfirmed') AS "providerStatus",
+        o.observed_model AS "observedModel", o.observed_effort AS "observedEffort",
+        o.native_lifecycle AS "nativeLifecycle", d.handoff_summary AS "handoffSummary",
         d.handoff_commits_json AS "handoffCommitsJson", d.handoff_checks_json AS "handoffChecksJson",
-        NULL AS title, NULL AS role, d.updated_at AS "updatedAt"
+        o.title, o.role, COALESCE(o.updated_at, d.updated_at) AS "updatedAt"
       FROM workflow_worker_dispatches d
+      LEFT JOIN workflow_worker_observations o
+        ON o.director_id = d.director_id AND o.provider_thread_id = d.provider_thread_id
       WHERE d.director_id = ${row.directorId} AND d.admission_id = ${admission.admissionId}
-      ORDER BY d.created_at DESC LIMIT 1
+      ORDER BY COALESCE(o.updated_at, d.updated_at) DESC, d.created_at DESC
     `,
       "Prepared worker dispatches could not be read.",
     );
-    if (existingRows[0]) {
-      const existing = yield* decodeWorkerRow(existingRows[0]).pipe(
+    const existing = yield* Effect.forEach(existingRows, (existingRow) =>
+      decodeWorkerRow(existingRow).pipe(
         Effect.mapError((error) =>
           directorError(
             "persistence-failed",
@@ -2236,20 +2311,30 @@ export const make = Effect.gen(function* () {
             String(error),
           ),
         ),
-      );
+      ),
+    );
+    const refreshedWorkers = yield* workers(row.directorId);
+    const existingWorker = refreshedWorkers.findLast(
+      (worker) =>
+        worker.admissionId === admission.admissionId && worker.writeReservation === "held",
+    );
+    const existingDispatch = existingWorker
+      ? existing.find((candidate) => candidate.dispatchId === existingWorker.dispatchId)
+      : undefined;
+    if (existingWorker && existingDispatch) {
       return {
-        dispatchId: existing.dispatchId!,
-        associationToken: existing.associationToken!,
+        dispatchId: existingDispatch.dispatchId!,
+        associationToken: existingDispatch.associationToken!,
         admission,
         requestedProfile: {
-          model: existing.requestedModel!,
-          effort: existing.requestedEffort!,
-          skillPath: existing.requestedSkillPath!,
+          model: existingDispatch.requestedModel!,
+          effort: existingDispatch.requestedEffort!,
+          skillPath: existingDispatch.requestedSkillPath!,
         },
-        taskName: `ticket-${admission.ticketNumber}-${existing.dispatchId!.slice(0, 8)}`,
-        instructions:
-          "A worker dispatch is already unconfirmed. Reconcile or associate its observed child before spawning another child.",
-        disposition: "existing-unconfirmed",
+        taskName: `ticket-${admission.ticketNumber}-${existingDispatch.dispatchId!.slice(0, 8)}`,
+        instructions: `Worker dispatch already exists (${existingWorker.association}, provider ${existingWorker.providerStatus}, write reservation held). Do not spawn another child for this dispatch.`,
+        disposition: "existing",
+        worker: existingWorker,
       } satisfies WorkflowWorkerPrepareResult;
     }
 
@@ -2272,6 +2357,9 @@ export const make = Effect.gen(function* () {
       "The prepared worker dispatch could not be saved.",
     );
     const taskName = `ticket-${admission.ticketNumber}-${dispatchId.slice(0, 8)}`;
+    const worker = (yield* workers(row.directorId)).find(
+      (candidate) => candidate.dispatchId === dispatchId,
+    )!;
     return {
       dispatchId,
       associationToken,
@@ -2287,6 +2375,7 @@ export const make = Effect.gen(function* () {
         `After the native spawn returns its child thread id, call workflow_associate_worker with token ${associationToken}.`,
       ].join("\n"),
       disposition: "prepared",
+      worker,
     } satisfies WorkflowWorkerPrepareResult;
   });
 

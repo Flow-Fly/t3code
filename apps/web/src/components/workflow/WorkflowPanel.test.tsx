@@ -25,6 +25,15 @@ const query = vi.hoisted(() => {
     startFailure: false,
     startCalls: new Array<unknown>(),
     navigateCalls: new Array<unknown>(),
+    threadDetailRefs: new Array<unknown>(),
+    directorActivities: new Array<{
+      id: string;
+      kind: string;
+      payload: unknown;
+      createdAt: string;
+    }>(),
+    directorRefresh: vi.fn(),
+    workerHistory: false,
     destinationRepository: "Flow-Fly/t3code",
   };
 });
@@ -76,6 +85,10 @@ vi.mock("~/state/entities", () => ({
         },
       ],
     ]),
+  useThreadDetail: (reference: unknown) => {
+    query.threadDetailRefs.push(reference);
+    return reference ? { activities: query.directorActivities } : null;
+  },
 }));
 
 vi.mock("~/state/use-atom-command", () => ({
@@ -137,8 +150,11 @@ vi.mock("~/state/workflow", () => ({
     search: (request: unknown) => query.descriptor("search", request),
     locate: (request: unknown) => query.descriptor("locate", request),
     recovery: (request: unknown) => query.descriptor("recovery", request),
+    directorStatus: (request: unknown) => query.descriptor("directorStatus", request),
     start: { label: "workflow:start", run: vi.fn() },
     recover: { label: "workflow:recover", run: vi.fn() },
+    directorStart: { label: "workflow:director-start", run: vi.fn() },
+    directorResume: { label: "workflow:director-resume", run: vi.fn() },
   },
 }));
 
@@ -435,6 +451,69 @@ vi.mock("~/state/query", () => ({
             : null,
       };
     }
+    if (descriptor.kind === "directorStatus") {
+      return {
+        ...idle,
+        refresh: query.directorRefresh,
+        data: query.workerHistory
+          ? {
+              directorId: "director-1",
+              batchId: "batch-1",
+              environmentId: "remote-environment",
+              projectId: "project-draft",
+              repository: "Flow-Fly/t3code",
+              rootNumber: 10,
+              capabilityNumber: 10,
+              threadId: "director-thread",
+              worktreePath: "/tmp/t3code-workflow-10",
+              worktreeBranch: "capability/workflow-10",
+              status: "active",
+              requestedProfile: {
+                instanceId: "codex-workflow",
+                model: "gpt-6-astra",
+                effort: "high",
+              },
+              observedProfile: { model: "gpt-6-astra", effort: "high", match: "match" },
+              admissionCount: 1,
+              admissionLimit: 10,
+              workers: [
+                {
+                  dispatchId: "dispatch-1",
+                  admissionId: "admission-1",
+                  ticketNumber: 11,
+                  providerThreadId: "provider-worker-1",
+                  parentProviderThreadId: "provider-director",
+                  ownership: "workflow panel",
+                  writePaths: ["apps/web/src/components/workflow"],
+                  writeReservation: "released",
+                  settlementEvidence: "native-closed",
+                  association: "associated",
+                  providerStatus: "interrupted",
+                  requestedProfile: {
+                    model: "gpt-5.6-sol",
+                    effort: "high",
+                    skillPath: "/skills/implement/SKILL.md",
+                  },
+                  observedProfile: {
+                    model: "gpt-5.6-sol",
+                    effort: "high",
+                    match: "match",
+                  },
+                  handoff: null,
+                  title: "Implement workflow panel",
+                  role: "worker",
+                  updatedAt: "2026-09-06T11:00:00.000Z",
+                },
+              ],
+              observation: "accepted",
+              actions: ["open"],
+              createdAt: "2026-09-06T10:00:00.000Z",
+              updatedAt: "2026-09-06T11:00:00.000Z",
+              message: "The capability director is active.",
+            }
+          : null,
+      };
+    }
     if (descriptor.kind === "search") {
       return {
         ...idle,
@@ -551,6 +630,10 @@ beforeEach(() => {
   query.startFailure = false;
   query.startCalls.length = 0;
   query.navigateCalls.length = 0;
+  query.threadDetailRefs.length = 0;
+  query.directorActivities.length = 0;
+  query.directorRefresh.mockClear();
+  query.workerHistory = false;
   query.destinationRepository = "Flow-Fly/t3code";
 });
 
@@ -830,6 +913,79 @@ describe("WorkflowPanel browsing", () => {
     }
   });
 
+  it("shows remote worker history and refreshes for the latest qualifying lifecycle activity", async () => {
+    query.workerHistory = true;
+    const props = {
+      environmentId: EnvironmentId.make("remote-environment"),
+      environmentLabel: "Remote environment",
+      projectId: ProjectId.make("project-draft"),
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(<WorkflowPanel {...props} />);
+    });
+
+    try {
+      await act(() =>
+        renderer!.root
+          .findByProps({ "aria-label": "Workflow roots" })
+          .findAllByType("button")[0]!
+          .props.onClick(),
+      );
+      const rootButton = renderer!.root
+        .findByProps({ "aria-label": "Synchronized workflow outline" })
+        .findAllByType("button")
+        .find((button) => button.children.join("").includes("#10 Capability"));
+      await act(() => rootButton!.props.onClick());
+
+      const director = renderer!.root.findByProps({ "aria-label": "Capability director" });
+      expect(director.findByType("h4").children.join("")).toBe("Worker history");
+      expect(director.findAllByType("li")[0]!.findAllByType("p")[0]!.children.join("")).toContain(
+        "Ticket #11",
+      );
+      expect(
+        director
+          .findAllByType("li")[0]!
+          .findAllByType("p")
+          .map((paragraph) => paragraph.children.join(""))
+          .join(" "),
+      ).toContain("write reservation released");
+      expect(
+        query.calls.some(
+          (call) =>
+            call.kind === "directorStatus" &&
+            (call.request as { environmentId?: string }).environmentId === "remote-environment",
+        ),
+      ).toBe(true);
+      expect(query.threadDetailRefs).toContainEqual({
+        environmentId: "remote-environment",
+        threadId: "director-thread",
+      });
+
+      query.directorActivities.push(
+        {
+          id: "worker-lifecycle-1",
+          kind: "task.updated",
+          payload: { taskId: "provider-worker-1", timelineBypass: true, status: "idle" },
+          createdAt: "2026-09-06T11:01:00.000Z",
+        },
+        {
+          id: "ordinary-activity-1",
+          kind: "turn.plan.updated",
+          payload: {},
+          createdAt: "2026-09-06T11:01:01.000Z",
+        },
+      );
+      await act(() => renderer!.update(<WorkflowPanel {...props} />));
+
+      expect(query.directorRefresh).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("browses an unsent draft through read queries without launching a provider", async () => {
     const draft = {
       environmentId: EnvironmentId.make("remote-environment"),
@@ -871,7 +1027,7 @@ describe("WorkflowPanel browsing", () => {
       );
       expect(renderer!.root.findByType("article").findAllByType("li")).toHaveLength(2);
       expect(new Set(query.calls.map((call) => call.kind))).toEqual(
-        new Set(["repositories", "roots", "children", "detail"]),
+        new Set(["repositories", "roots", "children", "detail", "directorStatus"]),
       );
       expect(query.calls.find((call) => call.kind === "repositories")?.request).toEqual({
         environmentId: draft.environmentId,

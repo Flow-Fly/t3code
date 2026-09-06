@@ -1121,6 +1121,8 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
 
       const metadataPayload = events[8]?.payload as Record<string, unknown>;
       NodeAssert.equal("status" in metadataPayload, false);
+      const closedPayload = events[7]?.payload as Record<string, unknown>;
+      NodeAssert.equal(closedPayload.nativeLifecycle, "closed");
       const blankMetadataPayload = events[9]?.payload as Record<string, unknown>;
       NodeAssert.equal("status" in blankMetadataPayload, false);
       NodeAssert.equal("model" in blankMetadataPayload, false);

@@ -14,6 +14,27 @@ describe("ProviderRuntimeEvent", () => {
     expectTypeOf<ProviderRuntimeEvent["type"]>().toEqualTypeOf<ProviderRuntimeEventType>();
   });
 
+  it("keeps native child closure distinct from an interrupted task status", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "task.updated",
+      eventId: "event-child-closed",
+      provider: "codex",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      payload: {
+        taskId: "child-1",
+        status: "interrupted",
+        nativeLifecycle: "closed",
+        timelineBypass: true,
+      },
+    });
+
+    expect(parsed.type).toBe("task.updated");
+    if (parsed.type !== "task.updated") throw new Error("expected task.updated");
+    expect(parsed.payload.nativeLifecycle).toBe("closed");
+    expect(parsed.payload.status).toBe("interrupted");
+  });
+
   it("requires input and output totals for complete turn usage", () => {
     const completeEvent = {
       type: "turn.completed",

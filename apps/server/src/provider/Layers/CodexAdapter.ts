@@ -1284,7 +1284,7 @@ function mapCollabAgentEvent(
         {
           ...base,
           type: "task.updated",
-          payload: { taskId, status: "interrupted", ...linkage },
+          payload: { taskId, status: "interrupted", ...linkage, nativeLifecycle: "closed" },
         },
       ];
     default:

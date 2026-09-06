@@ -191,21 +191,19 @@ function WorkflowDetails(props: {
       ? scopeThreadRef(directorQuery.data.environmentId, directorQuery.data.threadId)
       : null,
   );
-  const lastDirectorActivity = directorThread?.activities.at(-1);
-  const lastDirectorPayload =
-    typeof lastDirectorActivity?.payload === "object" && lastDirectorActivity.payload !== null
-      ? lastDirectorActivity.payload
-      : null;
   const workerActivityRevision =
-    lastDirectorActivity &&
-    (lastDirectorActivity.kind === "task.started" ||
-      lastDirectorActivity.kind === "task.updated" ||
-      lastDirectorActivity.kind === "task.completed") &&
-    lastDirectorPayload &&
-    "timelineBypass" in lastDirectorPayload &&
-    lastDirectorPayload.timelineBypass === true
-      ? lastDirectorActivity.id
-      : null;
+    directorThread?.activities.findLast((activity) => {
+      if (
+        activity.kind !== "task.started" &&
+        activity.kind !== "task.updated" &&
+        activity.kind !== "task.completed"
+      ) {
+        return false;
+      }
+      const payload =
+        typeof activity.payload === "object" && activity.payload !== null ? activity.payload : null;
+      return payload && "timelineBypass" in payload && payload.timelineBypass === true;
+    })?.id ?? null;
   const lastWorkerActivityRevision = useRef<string | null>(null);
   const refreshDirectorQuery = directorQuery.refresh;
   useEffect(() => {
@@ -520,8 +518,8 @@ function WorkflowDetails(props: {
             <div className="mt-2 border-border border-t pt-2">
               <h4 className="font-medium text-xs">Worker history</h4>
               <p className="mt-1 text-muted-foreground text-xs">
-                Write ownership remains reserved until verified settlement. Later overlapping
-                tickets stay held even when a worker is idle or has reported a handoff.
+                Write ownership releases only after the native child and every known descendant
+                close. Idle, turn completion, handoff, and unknown child outcomes keep it held.
               </p>
               <ul className="mt-1 space-y-2">
                 {director.workers.map((worker) => (
@@ -541,8 +539,14 @@ function WorkflowDetails(props: {
                       </p>
                     ) : null}
                     <p className="mt-0.5 text-muted-foreground">
-                      Provider {worker.providerStatus} · requested{" "}
-                      {worker.requestedProfile?.model ?? "unknown"}/
+                      Provider {worker.providerStatus}
+                      {worker.writeReservation
+                        ? ` · write reservation ${worker.writeReservation}`
+                        : ""}
+                      {worker.settlementEvidence === "native-closed"
+                        ? " · native close observed"
+                        : ""}{" "}
+                      · requested {worker.requestedProfile?.model ?? "unknown"}/
                       {worker.requestedProfile?.effort ?? "unknown"} · observed{" "}
                       {worker.observedProfile.model ?? "unknown"}/
                       {worker.observedProfile.effort ?? "unknown"} ({worker.observedProfile.match})

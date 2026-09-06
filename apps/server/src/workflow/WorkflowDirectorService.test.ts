@@ -711,7 +711,7 @@ function harness(options: HarnessOptions = {}) {
     WorkflowDirectorService.WorkflowDirectorService,
     WorkflowDirectorService.make,
   ).pipe(
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mock(WorkflowService.WorkflowService)({
         issueDetail: ({ number }) => {
           if (number === testCapability.number) {
@@ -753,8 +753,8 @@ function harness(options: HarnessOptions = {}) {
             })),
       }),
     ),
-    Layer.provide(projectionLayer),
-    Layer.provide(
+    Layer.provideMerge(projectionLayer),
+    Layer.provideMerge(
       Layer.succeed(ProviderRegistry.ProviderRegistry, {
         ...registry,
         probeWorkspaceSnapshot: ({ cwd }) =>
@@ -765,7 +765,7 @@ function harness(options: HarnessOptions = {}) {
           ),
       }),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mock(GitWorkflowService.GitWorkflowService)({
         localStatus: ({ cwd }) => {
           statusCalls.push(`${cwd}:${worktreeCreated}`);
@@ -798,7 +798,7 @@ function harness(options: HarnessOptions = {}) {
           }),
       }),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mock(GitHubCli.GitHubCli)({
         execute:
           options.githubExecute ??
@@ -813,7 +813,7 @@ function harness(options: HarnessOptions = {}) {
             })),
       }),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.succeed(
         ProcessRunner.ProcessRunner,
         options.processRunner ?? {
@@ -822,22 +822,22 @@ function harness(options: HarnessOptions = {}) {
         },
       ),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mock(OrchestrationCommandReceiptRepository)({
         upsert: () => Effect.void,
         getByCommandId: () => Effect.succeed(Option.none()),
       }),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(environmentId),
       }),
     ),
-    Layer.provide(
+    Layer.provideMerge(
       ServerConfig.layerTest(selectedWorkspaceRoot, { prefix: "workflow-director-test-" }),
     ),
     Layer.provideMerge(SqlitePersistenceMemory),
-    Layer.provide(NodeServices.layer),
+    Layer.provideMerge(NodeServices.layer),
   );
   const dispatch = (command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>) =>
     Effect.sync(() => {
@@ -1065,9 +1065,14 @@ describe("WorkflowDirectorService", () => {
           },
         );
         expect(repeated).toMatchObject({
-          disposition: "existing-unconfirmed",
+          disposition: "existing",
           dispatchId: prepared.dispatchId,
           associationToken: prepared.associationToken,
+          worker: {
+            association: "unconfirmed",
+            providerStatus: "unconfirmed",
+            writeReservation: "held",
+          },
         });
 
         yield* recordWorkflowWorkerObservation({
@@ -1135,7 +1140,8 @@ describe("WorkflowDirectorService", () => {
           },
         });
 
-        const reconnected = yield* service.status({
+        const reconnectedService = yield* WorkflowDirectorService.make;
+        const reconnected = yield* reconnectedService.status({
           projectId,
           repository,
           capabilityNumber: 17,
@@ -1195,9 +1201,15 @@ describe("WorkflowDirectorService", () => {
           },
         );
         expect(repeatAfterHandoff).toMatchObject({
-          disposition: "existing-unconfirmed",
+          disposition: "existing",
           dispatchId: prepared.dispatchId,
           associationToken: prepared.associationToken,
+          worker: {
+            association: "associated",
+            providerStatus: "running",
+            writeReservation: "held",
+            handoff: { outcome: "succeeded" },
+          },
         });
       }).pipe(Effect.provide(test.layer));
     },
@@ -1260,6 +1272,411 @@ describe("WorkflowDirectorService", () => {
       });
       const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
       expect(status.admissionCount).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("derives reservation release from native closure and conservative ancestry", () => {
+    const fixture = interpretedCapabilityFixture(3);
+    const test = harness(fixture);
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const first = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "first worker",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      const second = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[1]!.number,
+          ownership: "known separate worker",
+          writePaths: ["apps/web/src/components/workflow"],
+        },
+      );
+      for (const [taskId, associationToken, parentAgentId] of [
+        ["closure-worker", first.associationToken, "provider-director"],
+        ["separate-worker", second.associationToken, "provider-director"],
+      ] as const) {
+        yield* recordWorkflowWorkerObservation({
+          type: "task.started",
+          eventId: EventId.make(`${taskId}-started`),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-06T11:00:00.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make(taskId),
+            parentAgentId,
+            timelineBypass: true,
+          },
+        });
+        yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+          associationToken,
+          providerThreadId: taskId,
+        });
+      }
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("closure-worker-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:01:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("closure-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      const reservation = () =>
+        service
+          .status({ projectId, repository, capabilityNumber: 17 })
+          .pipe(
+            Effect.map(
+              (status) =>
+                status.workers.find((worker) => worker.dispatchId === first.dispatchId)!
+                  .writeReservation,
+            ),
+          );
+      expect(yield* reservation()).toBe("released");
+
+      const associatedDescendant = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[2]!.number,
+          ownership: "associated descendant",
+          writePaths: ["packages/contracts/src/workflow.ts"],
+        },
+      );
+      yield* recordWorkflowWorkerObservation({
+        type: "task.started",
+        eventId: EventId.make("associated-descendant-started"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:01:30.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("associated-descendant"),
+          parentAgentId: "closure-worker",
+          timelineBypass: true,
+        },
+      });
+      yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+        associationToken: associatedDescendant.associationToken,
+        providerThreadId: "associated-descendant",
+      });
+      expect(yield* reservation()).toBe("held");
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("associated-descendant-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:01:45.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("associated-descendant"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("released");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("nested-worker-idle"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:02:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("nested-worker"),
+          parentAgentId: "closure-worker",
+          status: "idle",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("held");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("nested-worker-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:03:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("nested-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("released");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("unknown-worker-idle"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:04:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("unknown-worker"),
+          parentAgentId: "unobserved-parent",
+          status: "idle",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("held");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("unknown-worker-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:05:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("unknown-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("released");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("closure-worker-late-metadata"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:06:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("closure-worker"),
+          model: "gpt-5.6-sol",
+          effort: "high",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("released");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("closure-worker-resumed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:07:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("closure-worker"),
+          status: "running",
+          timelineBypass: true,
+        },
+      });
+      expect(yield* reservation()).toBe("held");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("starts a fresh same-ticket attempt only after native closure", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const test = harness(fixture);
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const first = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "workflow service",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("retry-worker-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:00:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("retry-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+        associationToken: first.associationToken,
+        providerThreadId: "retry-worker",
+      });
+
+      const correction = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "workflow service correction",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      expect(correction).toMatchObject({
+        disposition: "prepared",
+        admission: { admissionId: first.admission.admissionId },
+        worker: { association: "unconfirmed", writeReservation: "held" },
+      });
+      expect(correction.dispatchId).not.toBe(first.dispatchId);
+
+      const repeated = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "workflow service correction",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      expect(repeated).toMatchObject({
+        disposition: "existing",
+        dispatchId: correction.dispatchId,
+        associationToken: correction.associationToken,
+        worker: { association: "unconfirmed", writeReservation: "held" },
+      });
+
+      const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+      expect(status.admissionCount).toBe(1);
+      expect(status.workers.filter((worker) => worker.dispatchId)).toHaveLength(2);
+      expect(
+        status.workers.find((worker) => worker.dispatchId === first.dispatchId)?.writeReservation,
+      ).toBe("released");
+
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("correction-worker-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2099-09-06T11:01:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("correction-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+        associationToken: correction.associationToken,
+        providerThreadId: "correction-worker",
+      });
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("retry-worker-reactivated"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2099-09-06T11:02:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("retry-worker"),
+          status: "running",
+          timelineBypass: true,
+        },
+      });
+
+      const reconciled = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "workflow service second correction",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      expect(reconciled).toMatchObject({
+        disposition: "existing",
+        dispatchId: first.dispatchId,
+        associationToken: first.associationToken,
+        worker: { providerStatus: "running", writeReservation: "held" },
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("allows overlapping ownership after the prior native worker closes", () => {
+    const fixture = interpretedCapabilityFixture(2);
+    const test = harness(fixture);
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const first = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          ownership: "first worker",
+          writePaths: ["apps/server/src/workflow"],
+        },
+      );
+      yield* recordWorkflowWorkerObservation({
+        type: "task.updated",
+        eventId: EventId.make("overlap-release-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: instanceId,
+        threadId: started.director.threadId,
+        createdAt: "2026-09-06T11:00:00.000Z",
+        payload: {
+          taskId: RuntimeTaskId.make("overlap-release-worker"),
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      });
+      yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+        associationToken: first.associationToken,
+        providerThreadId: "overlap-release-worker",
+      });
+
+      const next = yield* service.prepareWorker(
+        environmentId,
+        started.director.threadId,
+        instanceId,
+        {
+          ticketNumber: fixture.ticketDetails[1]!.number,
+          ownership: "next worker",
+          writePaths: ["apps/server/src/workflow/WorkflowDirectorService.ts"],
+        },
+      );
+      expect(next).toMatchObject({
+        disposition: "prepared",
+        admission: { ticketNumber: fixture.ticketDetails[1]!.number },
+        worker: { writeReservation: "held" },
+      });
     }).pipe(Effect.provide(test.layer));
   });
 

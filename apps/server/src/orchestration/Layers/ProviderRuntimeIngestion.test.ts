@@ -414,10 +414,12 @@ describe("ProviderRuntimeIngestion", () => {
               readonly parentProviderThreadId: string | null;
               readonly providerStatus: string;
               readonly observedModel: string | null;
+              readonly nativeLifecycle: string | null;
             }>`
               SELECT provider_thread_id AS "providerThreadId",
                 parent_provider_thread_id AS "parentProviderThreadId",
-                provider_status AS "providerStatus", observed_model AS "observedModel"
+                provider_status AS "providerStatus", observed_model AS "observedModel",
+                native_lifecycle AS "nativeLifecycle"
               FROM workflow_worker_observations ORDER BY provider_thread_id
             `;
           }),
@@ -482,14 +484,72 @@ describe("ProviderRuntimeIngestion", () => {
         parentProviderThreadId: "provider-director",
         providerStatus: "running",
         observedModel: "gpt-5.6-luna",
+        nativeLifecycle: null,
       },
       {
         providerThreadId: "provider-child-2",
         parentProviderThreadId: "provider-child-1",
         providerStatus: "idle",
         observedModel: null,
+        nativeLifecycle: null,
       },
     ]);
+
+    await harness.emitAndDrain([
+      {
+        type: "task.updated",
+        eventId: asEventId("worker-native-closed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:03.000Z",
+        payload: {
+          taskId: "provider-child-1",
+          status: "interrupted",
+          nativeLifecycle: "closed",
+          timelineBypass: true,
+        },
+      },
+      {
+        type: "task.updated",
+        eventId: asEventId("worker-late-metadata"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:04.000Z",
+        payload: {
+          taskId: "provider-child-1",
+          model: "gpt-5.6-sol",
+          timelineBypass: true,
+        },
+      },
+    ]);
+    expect((await harness.readWorkflowWorkerObservations())[0]).toMatchObject({
+      providerThreadId: "provider-child-1",
+      providerStatus: "interrupted",
+      nativeLifecycle: "closed",
+    });
+
+    await harness.emitAndDrain([
+      {
+        type: "task.updated",
+        eventId: asEventId("worker-resumed"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        createdAt: "2026-01-01T00:01:05.000Z",
+        payload: {
+          taskId: "provider-child-1",
+          status: "running",
+          timelineBypass: true,
+        },
+      },
+    ]);
+    expect((await harness.readWorkflowWorkerObservations())[0]).toMatchObject({
+      providerThreadId: "provider-child-1",
+      providerStatus: "running",
+      nativeLifecycle: null,
+    });
   });
 
   it("maps turn started/completed events into thread session updates", async () => {

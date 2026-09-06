@@ -27,15 +27,22 @@ export const recordWorkflowWorkerObservation = Effect.fn(
   const model = payload.model ?? null;
   const effort = payload.effort ?? null;
   const status = providerStatus(event);
+  const nativeLifecycle = payload.nativeLifecycle ?? null;
+  const updatesLifecycle =
+    event.type === "task.started" ||
+    event.type === "task.completed" ||
+    (event.type === "task.updated" && event.payload.status !== undefined)
+      ? 1
+      : 0;
 
   yield* sql`
     INSERT INTO workflow_worker_observations (
       director_id, provider_thread_id, parent_provider_thread_id, title, role, agent_path,
-      observed_model, observed_effort, provider_status, last_event_kind,
+      observed_model, observed_effort, provider_status, native_lifecycle, last_event_kind,
       first_observed_at, updated_at
     )
     SELECT director_id, ${payload.taskId}, ${parentProviderThreadId}, ${title}, ${role}, ${agentPath},
-      ${model}, ${effort}, ${status}, ${event.type}, ${event.createdAt}, ${event.createdAt}
+      ${model}, ${effort}, ${status}, ${nativeLifecycle}, ${event.type}, ${event.createdAt}, ${event.createdAt}
     FROM workflow_directors
     WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
       AND is_current = 1
@@ -49,6 +56,11 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       provider_status = CASE
         WHEN excluded.provider_status = 'observed' THEN provider_status
         ELSE excluded.provider_status
+      END,
+      native_lifecycle = CASE
+        WHEN excluded.native_lifecycle = 'closed' THEN 'closed'
+        WHEN ${updatesLifecycle} THEN NULL
+        ELSE native_lifecycle
       END,
       last_event_kind = excluded.last_event_kind,
       updated_at = excluded.updated_at
