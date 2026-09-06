@@ -1,7 +1,10 @@
 import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveWorkflowStartSelection } from "./WorkflowStart.logic";
+import {
+  resolveWorkflowDirectorSelection,
+  resolveWorkflowStartSelection,
+} from "./WorkflowStart.logic";
 
 function provider(driver = ProviderDriverKind.make("codex")): ServerProvider {
   return {
@@ -83,5 +86,35 @@ describe("resolveWorkflowStartSelection", () => {
       selection: null,
       message: "Reasoning effort 'ultra' is unavailable for the project default Codex model.",
     });
+  });
+});
+
+describe("resolveWorkflowDirectorSelection", () => {
+  it("uses the selected Codex instance with the required Astra/high profile", () => {
+    const codex = provider();
+    expect(
+      resolveWorkflowDirectorSelection([codex], {
+        instanceId: codex.instanceId,
+        model: "another-model",
+      }),
+    ).toEqual({
+      selection: {
+        instanceId: codex.instanceId,
+        model: "gpt-6-astra",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+      message: null,
+    });
+  });
+
+  it("does not fall back to a different Codex instance", () => {
+    const selected = { ...provider(), models: [] };
+    const other = { ...provider(), instanceId: ProviderInstanceId.make("other-codex") };
+    expect(
+      resolveWorkflowDirectorSelection([selected, other], {
+        instanceId: selected.instanceId,
+        model: "gpt-6-astra",
+      }).selection,
+    ).toBeNull();
   });
 });

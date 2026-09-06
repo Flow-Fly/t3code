@@ -5,6 +5,9 @@ import {
   WorkflowChildrenResult,
   WorkflowIssueDetail,
   WorkflowIssueSummary,
+  WorkflowDirectorAdmissionInput,
+  WorkflowDirectorStartInput,
+  WorkflowDirectorStatus,
   WorkflowRepositoriesResult,
   WorkflowRootsInput,
   WorkflowStartInput,
@@ -13,8 +16,62 @@ import {
 
 const decodeWorkflowStartInput = Schema.decodeUnknownSync(WorkflowStartInput);
 const decodeWorkflowStartResult = Schema.decodeUnknownSync(WorkflowStartResult);
+const decodeDirectorStart = Schema.decodeUnknownSync(WorkflowDirectorStartInput);
+const decodeDirectorStatus = Schema.decodeUnknownSync(WorkflowDirectorStatus);
+const decodeAdmission = Schema.decodeUnknownSync(WorkflowDirectorAdmissionInput);
 
 describe("workflow contracts", () => {
+  it("keeps director profile observations and admission identity explicit", () => {
+    const input = decodeDirectorStart({
+      projectId: "project-1",
+      repository: "Flow-Fly/t3code",
+      rootNumber: 10,
+      capabilityNumber: 17,
+      modelSelection: {
+        instanceId: "codex-workflow",
+        model: "gpt-6-astra",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+    });
+    const status = decodeDirectorStatus({
+      directorId: "director-17",
+      batchId: "batch-17-1",
+      environmentId: "environment-1",
+      projectId: input.projectId,
+      repository: input.repository,
+      rootNumber: input.rootNumber,
+      capabilityNumber: input.capabilityNumber,
+      threadId: "thread-17",
+      worktreePath: "/tmp/t3/workflow-17",
+      worktreeBranch: "t3code/workflow-17",
+      status: "active",
+      requestedProfile: {
+        instanceId: "codex-workflow",
+        model: "gpt-6-astra",
+        effort: "high",
+      },
+      observedProfile: { model: null, effort: null, match: "unknown" },
+      admissionCount: 1,
+      admissionLimit: 10,
+      observation: "director-17|active|thread-17|1",
+      actions: ["open"],
+      createdAt: "2026-09-06T10:00:00.000Z",
+      updatedAt: "2026-09-06T10:01:00.000Z",
+      message: "Director is active.",
+    });
+    const admission = decodeAdmission({
+      projectId: input.projectId,
+      directorId: status.directorId,
+      repository: input.repository,
+      ticketNumber: 18,
+      purpose: "retry",
+      ownership: "apps/server/src/workflow",
+    });
+
+    expect(status.observedProfile.match).toBe("unknown");
+    expect(admission).toMatchObject({ directorId: "director-17", ticketNumber: 18 });
+  });
+
   it("carries the explicit environment model choice and durable start identity", () => {
     const input = decodeWorkflowStartInput({
       projectId: "project-1",

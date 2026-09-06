@@ -366,6 +366,150 @@ export const WorkflowRecoverResult = Schema.Struct({
 });
 export type WorkflowRecoverResult = typeof WorkflowRecoverResult.Type;
 
+export const WorkflowDirectorStartInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  capabilityNumber: PositiveInt,
+  modelSelection: ModelSelection,
+});
+export type WorkflowDirectorStartInput = typeof WorkflowDirectorStartInput.Type;
+
+export const WorkflowDirectorRequestedProfile = Schema.Struct({
+  instanceId: TrimmedNonEmptyString,
+  model: TrimmedNonEmptyString,
+  effort: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorRequestedProfile = typeof WorkflowDirectorRequestedProfile.Type;
+
+export const WorkflowDirectorObservedProfile = Schema.Struct({
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  effort: Schema.NullOr(TrimmedNonEmptyString),
+  match: Schema.Literals(["match", "mismatch", "unknown"]),
+});
+export type WorkflowDirectorObservedProfile = typeof WorkflowDirectorObservedProfile.Type;
+
+export const WorkflowDirectorLifecycleStatus = Schema.Literals([
+  "preparing-worktree",
+  "submitting",
+  "active",
+  "held",
+  "waiting",
+]);
+export type WorkflowDirectorLifecycleStatus = typeof WorkflowDirectorLifecycleStatus.Type;
+
+export const WorkflowDirectorStatusInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  capabilityNumber: PositiveInt,
+});
+export type WorkflowDirectorStatusInput = typeof WorkflowDirectorStatusInput.Type;
+
+export const WorkflowDirectorStatus = Schema.Struct({
+  directorId: TrimmedNonEmptyString,
+  batchId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  capabilityNumber: PositiveInt,
+  threadId: ThreadId,
+  worktreePath: TrimmedNonEmptyString,
+  worktreeBranch: TrimmedNonEmptyString,
+  status: WorkflowDirectorLifecycleStatus,
+  requestedProfile: WorkflowDirectorRequestedProfile,
+  observedProfile: WorkflowDirectorObservedProfile,
+  admissionCount: Schema.Number,
+  admissionLimit: PositiveInt,
+  observation: TrimmedNonEmptyString,
+  actions: Schema.Array(Schema.Literals(["open", "resume", "retry"])),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorStatus = typeof WorkflowDirectorStatus.Type;
+
+export const WorkflowDirectorStartResult = Schema.Struct({
+  disposition: Schema.Literals(["started", "existing", "held"]),
+  director: WorkflowDirectorStatus,
+});
+export type WorkflowDirectorStartResult = typeof WorkflowDirectorStartResult.Type;
+
+export const WorkflowDirectorResumeInput = Schema.Struct({
+  ...WorkflowDirectorStatusInput.fields,
+  directorId: TrimmedNonEmptyString,
+  observation: TrimmedNonEmptyString,
+  modelSelection: ModelSelection,
+});
+export type WorkflowDirectorResumeInput = typeof WorkflowDirectorResumeInput.Type;
+
+export const WorkflowDirectorAdmissionPurpose = Schema.Literals(["implement", "retry", "review"]);
+export type WorkflowDirectorAdmissionPurpose = typeof WorkflowDirectorAdmissionPurpose.Type;
+
+export const WorkflowDirectorAdmissionInput = Schema.Struct({
+  projectId: ProjectId,
+  directorId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  ticketNumber: PositiveInt,
+  parentTicketNumber: Schema.optional(PositiveInt),
+  purpose: WorkflowDirectorAdmissionPurpose,
+  ownership: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorAdmissionInput = typeof WorkflowDirectorAdmissionInput.Type;
+
+export const WorkflowDirectorAdmission = Schema.Struct({
+  admissionId: TrimmedNonEmptyString,
+  directorId: TrimmedNonEmptyString,
+  batchId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  ticketNumber: PositiveInt,
+  slotTicketNumber: PositiveInt,
+  purpose: WorkflowDirectorAdmissionPurpose,
+  ownership: TrimmedNonEmptyString,
+  claimLogin: Schema.NullOr(TrimmedNonEmptyString),
+  claimStatus: Schema.Literals(["pending", "confirmed", "uncertain", "conflict"]),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkflowDirectorAdmission = typeof WorkflowDirectorAdmission.Type;
+
+export const WorkflowDirectorAdmissionResult = Schema.Struct({
+  disposition: Schema.Literals(["admitted", "existing", "limit-reached"]),
+  admission: Schema.NullOr(WorkflowDirectorAdmission),
+  admissionCount: Schema.Number,
+  admissionLimit: PositiveInt,
+  directorStatus: WorkflowDirectorLifecycleStatus,
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorAdmissionResult = typeof WorkflowDirectorAdmissionResult.Type;
+
+export const WorkflowDirectorFailure = Schema.Literals([
+  "not-ready",
+  "approval-unavailable",
+  "breakdown-incomplete",
+  "workspace-unavailable",
+  "provider-unavailable",
+  "model-unavailable",
+  "effort-required",
+  "skill-unavailable",
+  "worktree-failed",
+  "director-active",
+  "director-not-found",
+  "claim-failed",
+  "persistence-failed",
+  "dispatch-failed",
+]);
+export type WorkflowDirectorFailure = typeof WorkflowDirectorFailure.Type;
+
+export class WorkflowDirectorError extends Schema.TaggedErrorClass<WorkflowDirectorError>()(
+  "WorkflowDirectorError",
+  {
+    failure: WorkflowDirectorFailure,
+    message: TrimmedNonEmptyString,
+    detail: Schema.optional(TrimmedNonEmptyString),
+  },
+) {}
+
 export const WorkflowStartFailure = Schema.Literals([
   "not-ready",
   "unsupported-issue",

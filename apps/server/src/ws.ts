@@ -122,6 +122,7 @@ import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkflowService from "./workflow/WorkflowService.ts";
 import * as WorkflowAdoptionService from "./workflow/WorkflowAdoptionService.ts";
 import * as WorkflowStartService from "./workflow/WorkflowStartService.ts";
+import * as WorkflowDirectorService from "./workflow/WorkflowDirectorService.ts";
 import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
@@ -540,6 +541,7 @@ const makeWsRpcLayer = (
       const workflow = yield* WorkflowService.WorkflowService;
       const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
       const workflowStart = yield* WorkflowStartService.WorkflowStartService;
+      const workflowDirector = yield* WorkflowDirectorService.WorkflowDirectorService;
       const canReplayPersistedRange = Effect.fnUntraced(function* (
         afterSequence: number,
         headSequence: number,
@@ -2181,6 +2183,26 @@ const makeWsRpcLayer = (
             workflowStart.recover(input, dispatchNormalizedCommand),
             { "rpc.aggregate": "workflow" },
           ),
+        [WS_METHODS.workflowDirectorStart]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.workflowDirectorStart,
+            workflowDirector.start(input, dispatchNormalizedCommand),
+            { "rpc.aggregate": "workflow" },
+          ),
+        [WS_METHODS.workflowDirectorStatus]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowDirectorStatus, workflowDirector.status(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowDirectorResume]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.workflowDirectorResume,
+            workflowDirector.resume(input, dispatchNormalizedCommand),
+            { "rpc.aggregate": "workflow" },
+          ),
+        [WS_METHODS.workflowDirectorAdmit]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowDirectorAdmit, workflowDirector.admit(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.workflowAdoptionPreview]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionPreview, workflowAdoption.preview(input), {
             "rpc.aggregate": "workflow",
@@ -2984,6 +3006,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
     const workflow = yield* WorkflowService.WorkflowService;
     const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
     const workflowStart = yield* WorkflowStartService.WorkflowStartService;
+    const workflowDirector = yield* WorkflowDirectorService.WorkflowDirectorService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -3030,6 +3053,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               ),
               Layer.provide(
                 Layer.succeed(WorkflowStartService.WorkflowStartService, workflowStart),
+              ),
+              Layer.provide(
+                Layer.succeed(WorkflowDirectorService.WorkflowDirectorService, workflowDirector),
               ),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(

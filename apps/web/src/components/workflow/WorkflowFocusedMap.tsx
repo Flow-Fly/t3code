@@ -59,7 +59,10 @@ import {
   workflowIssueStateLabel,
   workflowSourceLinks,
 } from "./WorkflowPanel.logic";
-import { resolveWorkflowStartSelection } from "./WorkflowStart.logic";
+import {
+  resolveWorkflowDirectorSelection,
+  resolveWorkflowStartSelection,
+} from "./WorkflowStart.logic";
 
 function ChildrenLoader(props: {
   environmentId: EnvironmentId;
@@ -122,6 +125,10 @@ function WorkflowDetails(props: {
   const serverConfigs = useServerConfigs();
   const providers = serverConfigs.get(props.environmentId)?.providers ?? [];
   const startSelection = resolveWorkflowStartSelection(providers, project?.defaultModelSelection);
+  const directorSelection = resolveWorkflowDirectorSelection(
+    providers,
+    project?.defaultModelSelection,
+  );
   const phase =
     props.issue.kind === "map"
       ? ("specification" as const)
@@ -130,6 +137,12 @@ function WorkflowDetails(props: {
         : ("decision" as const);
   const startWorkflow = useAtomCommand(workflowEnvironment.start, { reportFailure: false });
   const recoverWorkflow = useAtomCommand(workflowEnvironment.recover, { reportFailure: false });
+  const startDirector = useAtomCommand(workflowEnvironment.directorStart, {
+    reportFailure: false,
+  });
+  const resumeDirector = useAtomCommand(workflowEnvironment.directorResume, {
+    reportFailure: false,
+  });
   const [startPending, setStartPending] = useState(false);
   const [startMessage, setStartMessage] = useState<string | null>(null);
   const query = useEnvironmentQuery(
@@ -142,11 +155,33 @@ function WorkflowDetails(props: {
       },
     }),
   );
+  const hasBreakdownApproval =
+    query.data?.kind === "capability" &&
+    query.data.evidence?.records.some(
+      (record) =>
+        record.kind === "approval" &&
+        record.approvalKind === "ticket-breakdown" &&
+        record.state === "current" &&
+        record.authority === "verified",
+    ) === true;
+  const directorQuery = useEnvironmentQuery(
+    hasBreakdownApproval
+      ? workflowEnvironment.directorStatus({
+          environmentId: props.environmentId,
+          input: {
+            projectId: props.projectId,
+            repository: props.issue.repository,
+            capabilityNumber: props.issue.number,
+          },
+        })
+      : null,
+  );
   const recoveryQuery = useEnvironmentQuery(
-    props.issue.kind === "decision" ||
-      props.issue.kind === "map" ||
-      props.issue.kind === "capability" ||
-      props.issue.labels.includes("wayfinder:task")
+    !hasBreakdownApproval &&
+      (props.issue.kind === "decision" ||
+        props.issue.kind === "map" ||
+        props.issue.kind === "capability" ||
+        props.issue.labels.includes("wayfinder:task"))
       ? workflowEnvironment.recovery({
           environmentId: props.environmentId,
           input: {
@@ -190,13 +225,15 @@ function WorkflowDetails(props: {
   });
   const evidence = query.data.evidence;
   const canStart =
-    (query.data.kind === "map" || query.data.readiness?.status === "ready") &&
-    (query.data.kind === "decision" ||
-      query.data.kind === "map" ||
-      query.data.kind === "capability" ||
-      query.data.labels.includes("wayfinder:task"));
-  const startLabel =
-    phase === "specification"
+    hasBreakdownApproval ||
+    ((query.data.kind === "map" || query.data.readiness?.status === "ready") &&
+      (query.data.kind === "decision" ||
+        query.data.kind === "map" ||
+        query.data.kind === "capability" ||
+        query.data.labels.includes("wayfinder:task")));
+  const startLabel = hasBreakdownApproval
+    ? "Start implementation"
+    : phase === "specification"
       ? "Create capability"
       : phase === "ticket-breakdown"
         ? "Slice tickets"
@@ -207,6 +244,7 @@ function WorkflowDetails(props: {
     (recovery.currentAttempt !== null ||
       recovery.assignees.length > 0 ||
       recovery.actions.length > 0);
+  const director = directorQuery.data;
   const openLinkedThread = (environmentId: EnvironmentId, threadId: ThreadId) => {
     const threadRef = scopeThreadRef(environmentId, threadId);
     useRightPanelStore.getState().open(threadRef, "workflow");
@@ -216,9 +254,39 @@ function WorkflowDetails(props: {
     });
   };
   const handleStart = async () => {
-    if (startPending || !startSelection.selection) return;
+    const selection = hasBreakdownApproval ? directorSelection.selection : startSelection.selection;
+    if (startPending || !selection) return;
     setStartPending(true);
     setStartMessage(null);
+    if (hasBreakdownApproval) {
+      const result = await startDirector({
+        environmentId: props.environmentId,
+        input: {
+          projectId: props.projectId,
+          repository: selectedIssue.repository,
+          rootNumber: props.rootNumber,
+          capabilityNumber: selectedIssue.number,
+          modelSelection: selection,
+        },
+      });
+      setStartPending(false);
+      directorQuery.refresh();
+      if (result._tag === "Failure") {
+        const failure = squashAtomCommandFailure(result);
+        setStartMessage(
+          failure instanceof Error
+            ? failure.message
+            : "The capability director could not start. Refresh Workflow and try again.",
+        );
+        return;
+      }
+      if (result.value.director.status === "active") {
+        openLinkedThread(result.value.director.environmentId, result.value.director.threadId);
+      } else {
+        setStartMessage(result.value.director.message);
+      }
+      return;
+    }
     const result = await startWorkflow({
       environmentId: props.environmentId,
       input: {
@@ -230,7 +298,7 @@ function WorkflowDetails(props: {
         ...(phase !== "decision" && props.planningThreadId
           ? { planningThreadId: props.planningThreadId }
           : {}),
-        modelSelection: startSelection.selection,
+        modelSelection: selection,
       },
     });
     setStartPending(false);
@@ -246,6 +314,41 @@ function WorkflowDetails(props: {
     }
     if (result.value.status === "held") {
       setStartMessage(result.value.message);
+      return;
+    }
+    openLinkedThread(result.value.environmentId, result.value.threadId);
+  };
+  const handleDirectorAction = async (action: "open" | "resume" | "retry") => {
+    if (!director || startPending) return;
+    if (action === "open") {
+      openLinkedThread(director.environmentId, director.threadId);
+      return;
+    }
+    if (!directorSelection.selection) return;
+    if (action === "retry") {
+      await handleStart();
+      return;
+    }
+    setStartPending(true);
+    setStartMessage(null);
+    const result = await resumeDirector({
+      environmentId: props.environmentId,
+      input: {
+        projectId: director.projectId,
+        repository: director.repository,
+        capabilityNumber: director.capabilityNumber,
+        directorId: director.directorId,
+        observation: director.observation,
+        modelSelection: directorSelection.selection,
+      },
+    });
+    setStartPending(false);
+    directorQuery.refresh();
+    if (result._tag === "Failure") {
+      const failure = squashAtomCommandFailure(result);
+      setStartMessage(
+        failure instanceof Error ? failure.message : "The capability director could not resume.",
+      );
       return;
     }
     openLinkedThread(result.value.environmentId, result.value.threadId);
@@ -318,20 +421,23 @@ function WorkflowDetails(props: {
       <p className="whitespace-pre-wrap text-muted-foreground text-xs leading-relaxed">
         {workflowIssueBrief(query.data) ?? "No description provided."}
       </p>
-      {canStart && !hasRecoveryDetails ? (
+      {canStart && !hasRecoveryDetails && !director ? (
         <section aria-label={`Start workflow ${phase}`}>
           <Button
             size="sm"
             disabled={
               startPending ||
-              startSelection.selection === null ||
-              (phase !== "decision" && !props.planningThreadId)
+              (hasBreakdownApproval
+                ? directorSelection.selection === null
+                : startSelection.selection === null) ||
+              (!hasBreakdownApproval && phase !== "decision" && !props.planningThreadId)
             }
             onClick={() => void handleStart()}
           >
             {startPending ? "Starting…" : startLabel}
           </Button>
-          {(startMessage ?? startSelection.message) ? (
+          {(startMessage ??
+          (hasBreakdownApproval ? directorSelection.message : startSelection.message)) ? (
             <p
               className={cn(
                 "mt-1 text-xs",
@@ -339,17 +445,68 @@ function WorkflowDetails(props: {
               )}
               role={startMessage ? "alert" : undefined}
             >
-              {startMessage ?? startSelection.message}
+              {startMessage ??
+                (hasBreakdownApproval ? directorSelection.message : startSelection.message)}
             </p>
           ) : (
             <p className="mt-1 text-muted-foreground text-xs">
-              {phase === "specification"
-                ? "Continues in this planning thread after the server verifies every map decision and remaining unknown."
-                : phase === "ticket-breakdown"
-                  ? "Continues in this planning thread after the server verifies the current specification approval. Publishing still needs separate owner approval."
-                  : "Claims this issue and starts Codex with its required Wayfinder skills."}
+              {hasBreakdownApproval
+                ? "Creates or reuses an isolated capability worktree after verifying the current approved specification, complete published breakdown, provider, and skills."
+                : phase === "specification"
+                  ? "Continues in this planning thread after the server verifies every map decision and remaining unknown."
+                  : phase === "ticket-breakdown"
+                    ? "Continues in this planning thread after the server verifies the current specification approval. Publishing still needs separate owner approval."
+                    : "Claims this issue and starts Codex with its required Wayfinder skills."}
             </p>
           )}
+        </section>
+      ) : null}
+      {director ? (
+        <section aria-label="Capability director" className="rounded-md border border-border p-2">
+          <h3 className="font-medium text-xs">Capability director</h3>
+          <p className="mt-1 text-xs">{director.message}</p>
+          <p className="mt-1 text-muted-foreground text-xs">
+            Environment {director.environmentId} · project {director.projectId}
+          </p>
+          <p className="mt-1 break-all text-muted-foreground text-xs">
+            {director.worktreePath} · {director.admissionCount}/{director.admissionLimit} delivery
+            slots
+          </p>
+          <p className="mt-1 text-muted-foreground text-xs">
+            Requested {director.requestedProfile.model}/{director.requestedProfile.effort} ·
+            observed {director.observedProfile.model ?? "unknown"}/
+            {director.observedProfile.effort ?? "unknown"} ({director.observedProfile.match})
+          </p>
+          {startMessage ? (
+            <p className="mt-1 text-destructive text-xs" role="alert">
+              {startMessage}
+            </p>
+          ) : null}
+          <div className="mt-2 flex flex-wrap gap-1">
+            {director.actions.includes("open") ? (
+              <Button size="xs" variant="outline" onClick={() => void handleDirectorAction("open")}>
+                Open director
+              </Button>
+            ) : null}
+            {director.actions.includes("resume") ? (
+              <Button
+                size="xs"
+                disabled={startPending || !directorSelection.selection}
+                onClick={() => void handleDirectorAction("resume")}
+              >
+                Resume
+              </Button>
+            ) : null}
+            {director.actions.includes("retry") ? (
+              <Button
+                size="xs"
+                disabled={startPending || !directorSelection.selection}
+                onClick={() => void handleDirectorAction("retry")}
+              >
+                Retry setup
+              </Button>
+            ) : null}
+          </div>
         </section>
       ) : null}
       {recovery && hasRecoveryDetails ? (

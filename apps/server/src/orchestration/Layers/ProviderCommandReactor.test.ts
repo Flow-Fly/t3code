@@ -30,10 +30,12 @@ import {
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Crypto from "effect/Crypto";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -86,6 +88,7 @@ import * as ProviderRegistry from "../../provider/Services/ProviderRegistry.ts";
 import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "../../workflow/WorkflowService.ts";
 import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
+import * as WorkflowDirectorService from "../../workflow/WorkflowDirectorService.ts";
 import { interpretWorkflowEvidence } from "../../workflow/WorkflowEvidence.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
@@ -139,6 +142,10 @@ describe("ProviderCommandReactor", () => {
     | ProjectionSnapshotQuery
     | ProviderRegistry.ProviderRegistry
     | OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository
+    | GitWorkflowService.GitWorkflowService
+    | ServerConfig
+    | Crypto.Crypto
+    | Path.Path
     | SqlClient.SqlClient,
     unknown
   > | null = null;
@@ -323,9 +330,31 @@ describe("ProviderCommandReactor", () => {
       }),
     );
     const pruneWorktrees = vi.fn((_: { readonly cwd: string }) => Effect.void);
+    let directorWorktreePath: string | null = null;
     const createWorktree = vi.fn(
-      (input: { readonly refName: string; readonly path: string | null }) =>
-        Effect.succeed({ worktree: { path: input.path ?? "", refName: input.refName } }),
+      (
+        input: Parameters<GitWorkflowService.GitWorkflowService["Service"]["createWorktree"]>[0],
+      ) => {
+        if (input.path) directorWorktreePath = input.path;
+        return Effect.succeed({
+          worktree: { path: input.path ?? "", refName: input.newRefName ?? input.refName },
+        });
+      },
+    );
+    const localStatus = vi.fn(({ cwd }: { readonly cwd: string }) =>
+      Effect.succeed({
+        isRepo: cwd === "/tmp/provider-project" || cwd === directorWorktreePath,
+        hasPrimaryRemote: true,
+        isDefaultRef: cwd === "/tmp/provider-project",
+        refName:
+          cwd === "/tmp/provider-project"
+            ? "main"
+            : cwd === directorWorktreePath
+              ? "t3code/workflow-17"
+              : null,
+        hasWorkingTreeChanges: false,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+      }),
     );
     const refreshStatus = vi.fn((_: string) =>
       Effect.succeed({
@@ -387,9 +416,28 @@ describe("ProviderCommandReactor", () => {
               ],
             },
           },
+          ...(modelSelection.model === "gpt-6-astra"
+            ? []
+            : [
+                {
+                  slug: "gpt-6-astra",
+                  name: "GPT-6 Astra",
+                  isCustom: false,
+                  capabilities: {
+                    optionDescriptors: [
+                      {
+                        id: "reasoningEffort",
+                        label: "Reasoning effort",
+                        type: "select" as const,
+                        options: [{ id: "high", label: "High" }],
+                      },
+                    ],
+                  },
+                },
+              ]),
         ],
         slashCommands: [],
-        skills: ["wayfinder", "research"].map((name) => ({
+        skills: ["wayfinder", "research", "implement", "code-review"].map((name) => ({
           name,
           path: `/skills/${name}/SKILL.md`,
           enabled: true,
@@ -507,6 +555,7 @@ describe("ProviderCommandReactor", () => {
           renameBranch,
           pruneWorktrees,
           createWorktree,
+          localStatus,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
       Layer.provideMerge(
@@ -568,6 +617,119 @@ describe("ProviderCommandReactor", () => {
     const workflowRoot = workflowSummary(10, "container", null, ["workflow:container"]);
     const workflowMap = workflowSummary(12, "map", 10, ["wayfinder:map"]);
     const workflowDecision = workflowSummary(15, "decision", 12, ["wayfinder:research"]);
+    const directorCapabilitySummary = {
+      ...workflowSummary(17, "capability", 10, ["workflow:capability"]),
+      title: "Capability delivery",
+    };
+    const directorTicketSummary = {
+      ...workflowSummary(18, "ticket", 17, ["workflow:ticket", "ready-for-agent"]),
+      title: "First delivery",
+    };
+    const directorCapabilityBody =
+      "## Summary\n\nDeliver the capability.\n\n## Source map\n\nNone (standalone)";
+    const directorSlice = [
+      "## What to build",
+      "",
+      "Build the first delivery.",
+      "",
+      "## Acceptance criteria",
+      "",
+      "- [ ] It works.",
+      "",
+      "## Blocked by",
+      "",
+      "None",
+    ].join("\n");
+    const directorBreakdown = [
+      "<details>",
+      "<summary>T01 — First delivery</summary>",
+      directorSlice,
+      "</details>",
+    ].join("\n");
+    const ownerSource = {
+      id: "director-owner-source",
+      url: `${directorCapabilitySummary.url}#issuecomment-owner-source`,
+      body: "Owner approval source.",
+      createdAt: now,
+      author: "Flow-Fly",
+      authorAssociation: "OWNER",
+    };
+    const specificationApproval = {
+      ...ownerSource,
+      id: "director-specification",
+      url: `${directorCapabilitySummary.url}#issuecomment-specification`,
+      body: [
+        "<!-- t3-workflow:v1 approval -->",
+        "Kind: specification",
+        "Approved by: Flow-Fly (owner)",
+        `Source: ${ownerSource.url}`,
+        "## Approved content",
+        directorCapabilityBody,
+      ].join("\n"),
+    };
+    const breakdownApproval = {
+      ...ownerSource,
+      id: "director-breakdown",
+      url: `${directorCapabilitySummary.url}#issuecomment-breakdown`,
+      body: [
+        "<!-- t3-workflow:v1 approval -->",
+        "Kind: ticket-breakdown",
+        "Approved by: Flow-Fly (owner)",
+        `Source: ${ownerSource.url}`,
+        "## Approved content",
+        directorBreakdown,
+      ].join("\n"),
+    };
+    const directorCapabilityEvidence = interpretWorkflowEvidence({
+      issue: {
+        id: directorCapabilitySummary.id,
+        url: directorCapabilitySummary.url,
+        number: directorCapabilitySummary.number,
+        title: directorCapabilitySummary.title,
+        kind: "capability",
+        state: "open",
+        stateReason: null,
+        labels: directorCapabilitySummary.labels,
+        assignees: [],
+        body: directorCapabilityBody,
+        comments: [ownerSource, specificationApproval, breakdownApproval],
+        reopenedAt: [],
+      },
+    });
+    const directorTicketBody = [
+      `Approved slice: **T01** ([ticket-breakdown approval](${breakdownApproval.url}))`,
+      "",
+      directorSlice,
+    ].join("\n");
+    const directorTicketEvidence = interpretWorkflowEvidence({
+      issue: {
+        id: directorTicketSummary.id,
+        url: directorTicketSummary.url,
+        number: directorTicketSummary.number,
+        title: directorTicketSummary.title,
+        kind: "ticket",
+        state: "open",
+        stateReason: null,
+        labels: directorTicketSummary.labels,
+        assignees: [],
+        body: directorTicketBody,
+        comments: [],
+        reopenedAt: [],
+      },
+      approvalComments: [ownerSource, breakdownApproval],
+    });
+    const directorCapability: WorkflowIssueDetail = {
+      ...directorCapabilitySummary,
+      body: directorCapabilityBody,
+      blockedBy: [],
+      ...directorCapabilityEvidence,
+    };
+    const directorTicket: WorkflowIssueDetail = {
+      ...directorTicketSummary,
+      body: directorTicketBody,
+      blockedBy: [],
+      ...directorTicketEvidence,
+    };
     const workflowAssignees = new Set<string>();
     const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => {
       const body = "Workflow integration fixture";
@@ -667,6 +829,63 @@ describe("ProviderCommandReactor", () => {
           } as ServerEnvironment.ServerEnvironment["Service"]),
         ),
         Effect.provide(NodeServices.layer),
+      ),
+    );
+    const workflowDirector = await runtime.runPromise(
+      WorkflowDirectorService.make.pipe(
+        Effect.provideService(
+          WorkflowService.WorkflowService,
+          WorkflowService.WorkflowService.of({
+            issueDetail: ({
+              number,
+            }: Parameters<WorkflowService.WorkflowService["Service"]["issueDetail"]>[0]) =>
+              Effect.succeed(
+                number === directorCapability.number ? directorCapability : directorTicket,
+              ),
+            children: ({
+              parentNumber,
+            }: Parameters<WorkflowService.WorkflowService["Service"]["children"]>[0]) =>
+              Effect.succeed({
+                parentNumber,
+                children: parentNumber === directorCapability.number ? [directorTicket] : [],
+                frontier: {
+                  status: parentNumber === directorCapability.number ? "available" : "empty",
+                  message:
+                    parentNumber === directorCapability.number ? "1 item can proceed." : "No work.",
+                  readyIssueIds:
+                    parentNumber === directorCapability.number ? [directorTicket.id] : [],
+                },
+              }),
+            locate: () =>
+              Effect.succeed({
+                issue: directorTicket,
+                ancestry: [directorCapability],
+                ancestryComplete: true,
+              }),
+          } as unknown as WorkflowService.WorkflowService["Service"]),
+        ),
+        Effect.provideService(
+          GitHubCli.GitHubCli,
+          GitHubCli.GitHubCli.of({
+            execute: ({ args }: Parameters<GitHubCli.GitHubCli["Service"]["execute"]>[0]) =>
+              Effect.succeed({
+                stdout: args[0] === "repo" ? `${workflowRepository}\n` : "",
+                stderr: "",
+                exitCode: 0,
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              } as never),
+          } as unknown as GitHubCli.GitHubCli["Service"]),
+        ),
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("workflow-environment")),
+          } as ServerEnvironment.ServerEnvironment["Service"]),
+        ),
       ),
     );
     const dispatchForWorkflow = (command: OrchestrationCommand) =>
@@ -798,6 +1017,16 @@ describe("ProviderCommandReactor", () => {
           `;
         }),
       );
+    const readDirectorRows = (directorId: string) =>
+      runtime!.runPromise(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          return yield* sql<{ readonly commandId: string; readonly status: string }>`
+            SELECT command_id AS "commandId", status FROM workflow_directors
+            WHERE director_id = ${directorId}
+          `;
+        }),
+      );
 
     return {
       engine,
@@ -843,7 +1072,9 @@ describe("ProviderCommandReactor", () => {
       runEffect,
       emitProviderEvents,
       readWorkflowResumeRows,
+      readDirectorRows,
       workflowStart,
+      workflowDirector,
       dispatchWorkflow,
       workflowAssignees,
       get titleRegenerationCompletionDispatchAttempts() {
@@ -1105,6 +1336,57 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
+
+  effectIt.effect(
+    "starts a capability director through the real orchestration reactor and records its receipt",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        NodeFS.mkdirSync("/tmp/provider-project", { recursive: true });
+        const started = yield* harness.workflowDirector.start(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            capabilityNumber: 17,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+          harness.dispatchWorkflow,
+        );
+        yield* Effect.promise(() => harness.drain());
+        const rows = yield* Effect.promise(() =>
+          harness.readDirectorRows(started.director.directorId),
+        );
+        const receipt = yield* Effect.promise(() =>
+          harness.readCommandReceipt(CommandId.make(rows[0]!.commandId)),
+        );
+        const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (candidate) => candidate.id === started.director.threadId,
+        );
+
+        expect(started).toMatchObject({ disposition: "started", director: { status: "active" } });
+        expect(rows).toEqual([{ commandId: rows[0]!.commandId, status: "active" }]);
+        expect(Option.getOrNull(receipt)).toMatchObject({
+          commandId: rows[0]!.commandId,
+          status: "accepted",
+        });
+        expect(thread).toMatchObject({
+          id: started.director.threadId,
+          worktreePath: started.director.worktreePath,
+        });
+        expect(harness.sendTurn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            input: expect.stringContaining("Before every ticket admission"),
+            modelSelection: expect.objectContaining({ model: "gpt-6-astra" }),
+          }),
+        );
+        expect(harness.sendTurn.mock.calls.at(-1)?.[0]).not.toHaveProperty("skills");
+      }),
+  );
 
   effectIt.effect(
     "delivers one provider continuation for simultaneous workflow resume retries",

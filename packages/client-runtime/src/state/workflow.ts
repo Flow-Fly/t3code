@@ -62,6 +62,29 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       scheduler: commandScheduler,
       concurrency: serialPerEnvironment,
     }),
+    directorStart: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:director-start",
+      tag: WS_METHODS.workflowDirectorStart,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
+    directorStatus: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:workflow:director-status",
+      tag: WS_METHODS.workflowDirectorStatus,
+      staleTimeMs: 0,
+    }),
+    directorResume: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:director-resume",
+      tag: WS_METHODS.workflowDirectorResume,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
+    directorAdmit: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:director-admit",
+      tag: WS_METHODS.workflowDirectorAdmit,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     adoptionPreview: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:adoption-preview",
       tag: WS_METHODS.workflowAdoptionPreview,

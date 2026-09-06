@@ -19,6 +19,15 @@ from another project, or an unavailable planning thread prevents the phase from 
 slicing first proposes a breakdown; publishing the delivery issues requires a separate owner
 approval of that exact breakdown.
 
+After the approved breakdown is published, choose **Start implementation** on the capability.
+T3 Code verifies the current specification, every published delivery slice, Astra with high
+reasoning effort, and the implementation and review skills in a dedicated capability worktree.
+The director and its worktree survive reconnects. **Open director** returns to its thread,
+**Resume** continues confirmed interrupted work, and **Retry setup** recovers setup that was
+recorded but never submitted. A director admits up to ten delivery slices in one batch; blocked
+or failed slices still count, while retries, review, and nested tasks reuse their slice's slot.
+At ten, finish or settle admitted work and wait for a successor before admitting more.
+
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the
 GitHub assignment; it does not stop another agent or make the assignment an atomic lock.

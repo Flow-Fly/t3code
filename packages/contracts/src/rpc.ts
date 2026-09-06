@@ -145,6 +145,14 @@ import {
   WorkflowIssueDetailInput,
   WorkflowLocateInput,
   WorkflowLocateResult,
+  WorkflowDirectorAdmissionInput,
+  WorkflowDirectorAdmissionResult,
+  WorkflowDirectorError,
+  WorkflowDirectorResumeInput,
+  WorkflowDirectorStartInput,
+  WorkflowDirectorStartResult,
+  WorkflowDirectorStatus,
+  WorkflowDirectorStatusInput,
   WorkflowRecoveryInput,
   WorkflowRecoveryResult,
   WorkflowRecoverInput,
@@ -402,6 +410,10 @@ export const WS_METHODS = {
   workflowStart: "workflow.start",
   workflowRecovery: "workflow.recovery",
   workflowRecover: "workflow.recover",
+  workflowDirectorStart: "workflow.director.start",
+  workflowDirectorStatus: "workflow.director.status",
+  workflowDirectorResume: "workflow.director.resume",
+  workflowDirectorAdmit: "workflow.director.admit",
   workflowAdoptionPreview: "workflow.adoption.preview",
   workflowAdoptionApply: "workflow.adoption.apply",
   workflowAdoptionHistory: "workflow.adoption.history",
@@ -871,6 +883,36 @@ export const WsWorkflowRecoverRpc = Rpc.make(WS_METHODS.workflowRecover, {
   payload: WorkflowRecoverInput,
   success: WorkflowRecoverResult,
   error: Schema.Union([WorkflowQueryError, WorkflowStartError, EnvironmentAuthorizationError]),
+});
+
+const WorkflowDirectorRpcError = Schema.Union([
+  WorkflowQueryError,
+  WorkflowDirectorError,
+  EnvironmentAuthorizationError,
+]);
+
+export const WsWorkflowDirectorStartRpc = Rpc.make(WS_METHODS.workflowDirectorStart, {
+  payload: WorkflowDirectorStartInput,
+  success: WorkflowDirectorStartResult,
+  error: WorkflowDirectorRpcError,
+});
+
+export const WsWorkflowDirectorStatusRpc = Rpc.make(WS_METHODS.workflowDirectorStatus, {
+  payload: WorkflowDirectorStatusInput,
+  success: WorkflowDirectorStatus,
+  error: WorkflowDirectorRpcError,
+});
+
+export const WsWorkflowDirectorResumeRpc = Rpc.make(WS_METHODS.workflowDirectorResume, {
+  payload: WorkflowDirectorResumeInput,
+  success: WorkflowDirectorStatus,
+  error: WorkflowDirectorRpcError,
+});
+
+export const WsWorkflowDirectorAdmitRpc = Rpc.make(WS_METHODS.workflowDirectorAdmit, {
+  payload: WorkflowDirectorAdmissionInput,
+  success: WorkflowDirectorAdmissionResult,
+  error: WorkflowDirectorRpcError,
 });
 
 const WorkflowAdoptionRpcError = Schema.Union([
@@ -1408,6 +1450,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowStartRpc,
   WsWorkflowRecoveryRpc,
   WsWorkflowRecoverRpc,
+  WsWorkflowDirectorStartRpc,
+  WsWorkflowDirectorStatusRpc,
+  WsWorkflowDirectorResumeRpc,
+  WsWorkflowDirectorAdmitRpc,
   WsWorkflowAdoptionPreviewRpc,
   WsWorkflowAdoptionApplyRpc,
   WsWorkflowAdoptionHistoryRpc,
