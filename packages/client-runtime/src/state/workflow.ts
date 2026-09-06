@@ -62,6 +62,12 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       tag: WS_METHODS.workflowAdoptionHistory,
       staleTimeMs: 0,
     }),
+    adoptionRecover: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:adoption-recover",
+      tag: WS_METHODS.workflowAdoptionRecover,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     adoptionUndo: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:adoption-undo",
       tag: WS_METHODS.workflowAdoptionUndo,

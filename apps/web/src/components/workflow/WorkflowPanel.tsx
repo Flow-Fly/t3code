@@ -4,7 +4,7 @@ import type {
   WorkflowRepository,
   WorkflowSearchMatch,
 } from "@t3tools/contracts";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
@@ -104,6 +104,12 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
   );
   const [rootSearch, setRootSearch] = useState("");
   const [adopting, setAdopting] = useState(false);
+  const adoptButtonRef = useRef<HTMLButtonElement>(null);
+  const wasAdopting = useRef(false);
+  useEffect(() => {
+    if (wasAdopting.current && !adopting) adoptButtonRef.current?.focus();
+    wasAdopting.current = adopting;
+  }, [adopting]);
   const roots = rootsQuery.data?.roots ?? [];
   const visibleRoots = useMemo(() => filterWorkflowRoots(roots, rootSearch), [rootSearch, roots]);
   const context = repository
@@ -270,6 +276,20 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
         </ul>
       </div>
     );
+  else if (adopting)
+    content = (
+      <WorkflowAdoptionPanel
+        key={`${props.environmentId}:${props.projectId}:${focusedRoot.repository}:${focusedRoot.number}`}
+        environmentId={props.environmentId}
+        projectId={props.projectId}
+        repository={focusedRoot.repository}
+        rootNumber={focusedRoot.number}
+        onClose={() => setAdopting(false)}
+        onChanged={() => {
+          rootsQuery.refresh();
+        }}
+      />
+    );
   else
     content = (
       <>
@@ -283,7 +303,13 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
             #{focusedRoot.number} {focusedRoot.title}
           </button>
           <span className="text-muted-foreground">Top-to-bottom map</span>
-          <Button className="ml-auto" size="xs" variant="outline" onClick={() => setAdopting(true)}>
+          <Button
+            ref={adoptButtonRef}
+            className="ml-auto"
+            size="xs"
+            variant="outline"
+            onClick={() => setAdopting(true)}
+          >
             Adopt branch
           </Button>
         </div>
@@ -295,19 +321,6 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           onRefreshRoot={rootsQuery.refresh}
           onNavigateMatch={navigateToMatch}
         />
-        {adopting ? (
-          <WorkflowAdoptionPanel
-            key={`${props.environmentId}:${props.projectId}:${focusedRoot.repository}:${focusedRoot.number}`}
-            environmentId={props.environmentId}
-            projectId={props.projectId}
-            repository={focusedRoot.repository}
-            rootNumber={focusedRoot.number}
-            onClose={() => setAdopting(false)}
-            onChanged={() => {
-              rootsQuery.refresh();
-            }}
-          />
-        ) : null}
       </>
     );
 

@@ -48,6 +48,9 @@ export function WorkflowAdoptionPanel(props: {
   const undoCommand = useAtomCommand(workflowEnvironment.adoptionUndo, {
     reportFailure: false,
   });
+  const recoverCommand = useAtomCommand(workflowEnvironment.adoptionRecover, {
+    reportFailure: false,
+  });
   const history = useEnvironmentQuery(
     workflowEnvironment.adoptionHistory({
       environmentId: props.environmentId,
@@ -65,7 +68,9 @@ export function WorkflowAdoptionPanel(props: {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [undoReview, setUndoReview] = useState<WorkflowAdoptionRecord | null>(null);
   const requestId = useRef(0);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
+    closeButtonRef.current?.focus();
     return () => {
       requestId.current += 1;
     };
@@ -142,6 +147,30 @@ export function WorkflowAdoptionPanel(props: {
     } else if (AsyncResult.isFailure(response)) setError(commandError(response));
   };
 
+  const recover = async (adoptionId: string) => {
+    if (isSubmitting) return;
+    const currentRequest = ++requestId.current;
+    setIsSubmitting(true);
+    setError(null);
+    const response = await recoverCommand({
+      environmentId: props.environmentId,
+      input: {
+        projectId: props.projectId,
+        repository: props.repository,
+        rootNumber: props.rootNumber,
+        adoptionId,
+      },
+    });
+    if (currentRequest !== requestId.current) return;
+    setIsSubmitting(false);
+    if (AsyncResult.isSuccess(response)) {
+      setPreview(response.value.preview);
+      setItems(response.value.preview.items);
+      setResult(response.value.record);
+      setUndoReview(null);
+    } else if (AsyncResult.isFailure(response)) setError(commandError(response));
+  };
+
   const parentConfirmationMissing = items.some(
     (item) =>
       item.included &&
@@ -151,18 +180,20 @@ export function WorkflowAdoptionPanel(props: {
 
   return (
     <section
-      className="absolute inset-0 z-40 flex flex-col bg-background"
-      aria-label="Adopt workflow branch"
+      className="flex min-h-0 flex-1 flex-col bg-background"
+      aria-labelledby="workflow-adoption-heading"
     >
       <header className="flex items-center justify-between border-b border-border px-3 py-2">
         <div>
-          <h2 className="font-medium text-sm">Adopt branch #{props.rootNumber}</h2>
+          <h2 id="workflow-adoption-heading" className="font-medium text-sm">
+            Adopt branch #{props.rootNumber}
+          </h2>
           <p className="text-muted-foreground text-xs">
             Review classifications and exact GitHub changes. This does not start work or approve
             delivery.
           </p>
         </div>
-        <Button size="xs" variant="ghost" onClick={props.onClose}>
+        <Button ref={closeButtonRef} size="xs" variant="ghost" onClick={props.onClose}>
           Close
         </Button>
       </header>
@@ -325,9 +356,20 @@ export function WorkflowAdoptionPanel(props: {
             <p className="font-medium">Result: {result.status}</p>
             <ul className="mt-1 list-disc pl-5">
               {result.operations.map((operation) => (
-                <li key={`${operation.issueNumber}:${operation.kind}:${operation.description}`}>
-                  #{operation.issueNumber} {operation.description}: {operation.status}
+                <li
+                  key={`${operation.repository}:${operation.issueId}:${operation.kind}:${operation.description}`}
+                >
+                  <a
+                    className="underline"
+                    href={`https://github.com/${operation.repository}/issues/${operation.issueNumber}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {operation.repository}#{operation.issueNumber}
+                  </a>{" "}
+                  {operation.description}: {operation.status}
                   {operation.owned ? " (adoption-owned)" : ""}
+                  {operation.detail ? ` · ${operation.detail}` : ""}
                 </li>
               ))}
             </ul>
@@ -344,14 +386,26 @@ export function WorkflowAdoptionPanel(props: {
               <span>
                 {record.createdAt} · {record.status}
               </span>
-              <Button
-                size="xs"
-                variant="outline"
-                disabled={isSubmitting || record.status === "undone"}
-                onClick={() => setUndoReview(record)}
-              >
-                Review undo
-              </Button>
+              <span className="flex gap-1">
+                {record.status === "partial" ? (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={isSubmitting}
+                    onClick={() => void recover(record.adoptionId)}
+                  >
+                    Resume review
+                  </Button>
+                ) : null}
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isSubmitting || record.status === "undone"}
+                  onClick={() => setUndoReview(record)}
+                >
+                  Review undo
+                </Button>
+              </span>
             </div>
           ))}
           {undoReview ? (
@@ -366,8 +420,18 @@ export function WorkflowAdoptionPanel(props: {
               </p>
               <ul className="mt-2 list-disc pl-5">
                 {undoReview.operations.map((operation) => (
-                  <li key={`${operation.issueNumber}:${operation.kind}:${operation.description}`}>
-                    #{operation.issueNumber} {operation.description} ·{" "}
+                  <li
+                    key={`${operation.repository}:${operation.issueId}:${operation.kind}:${operation.description}`}
+                  >
+                    <a
+                      className="underline"
+                      href={`https://github.com/${operation.repository}/issues/${operation.issueNumber}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {operation.repository}#{operation.issueNumber}
+                    </a>{" "}
+                    {operation.description} ·{" "}
                     {operation.owned ? "eligible if unchanged" : "will be preserved"}
                     {operation.detail ? ` · ${operation.detail}` : ""}
                   </li>

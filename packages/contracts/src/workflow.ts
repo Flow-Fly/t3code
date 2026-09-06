@@ -306,9 +306,18 @@ export const WorkflowAdoptionApplyInput = Schema.Struct({
 export type WorkflowAdoptionApplyInput = typeof WorkflowAdoptionApplyInput.Type;
 
 export const WorkflowAdoptionOperation = Schema.Struct({
+  issueId: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
   issueNumber: PositiveInt,
   kind: Schema.Literals(["add-label", "remove-label", "change-parent"]),
-  status: Schema.Literals(["applied", "already-current", "failed", "undo-skipped", "undone"]),
+  status: Schema.Literals([
+    "applied",
+    "already-current",
+    "uncertain",
+    "failed",
+    "undo-skipped",
+    "undone",
+  ]),
   description: TrimmedNonEmptyString,
   owned: Schema.Boolean,
   detail: Schema.optionalKey(TrimmedNonEmptyString),
@@ -336,6 +345,18 @@ export const WorkflowAdoptionHistoryResult = Schema.Struct({
   records: Schema.Array(WorkflowAdoptionRecord),
 });
 export type WorkflowAdoptionHistoryResult = typeof WorkflowAdoptionHistoryResult.Type;
+
+export const WorkflowAdoptionRecoveryInput = Schema.Struct({
+  ...WorkflowAdoptionHistoryInput.fields,
+  adoptionId: TrimmedNonEmptyString,
+});
+export type WorkflowAdoptionRecoveryInput = typeof WorkflowAdoptionRecoveryInput.Type;
+
+export const WorkflowAdoptionRecoveryResult = Schema.Struct({
+  record: WorkflowAdoptionRecord,
+  preview: WorkflowAdoptionPreview,
+});
+export type WorkflowAdoptionRecoveryResult = typeof WorkflowAdoptionRecoveryResult.Type;
 
 export const WorkflowAdoptionUndoInput = Schema.Struct({
   projectId: ProjectId,

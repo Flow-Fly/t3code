@@ -9,6 +9,8 @@ import {
   WorkflowAdoptionPreview,
   type WorkflowAdoptionPreviewInput,
   type WorkflowAdoptionRecord,
+  type WorkflowAdoptionRecoveryInput,
+  type WorkflowAdoptionRecoveryResult,
   type WorkflowAdoptionUndoInput,
   type WorkflowIssueKind,
 } from "@t3tools/contracts";
@@ -58,6 +60,7 @@ const RawIssue = Schema.Struct({
 type RawIssue = typeof RawIssue.Type;
 
 const InternalOperation = Schema.Struct({
+  issueId: Schema.String,
   issueNumber: Schema.Number,
   issueDatabaseId: Schema.Number,
   repository: Schema.String,
@@ -66,6 +69,7 @@ const InternalOperation = Schema.Struct({
     "pending",
     "applied",
     "already-current",
+    "uncertain",
     "failed",
     "undo-skipped",
     "undone",
@@ -102,6 +106,9 @@ const decodeInternalRecord = Schema.decodeEffect(Schema.fromJsonString(InternalR
 const encodePreview = Schema.encodeEffect(Schema.fromJsonString(WorkflowAdoptionPreview));
 const encodeInternalRecord = Schema.encodeEffect(Schema.fromJsonString(InternalRecord));
 const encodeSelection = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(WorkflowAdoptionItem)),
+);
+const decodeSelection = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Array(WorkflowAdoptionItem)),
 );
 const encodeLabelPayload = Schema.encodeSync(
@@ -266,6 +273,9 @@ function publicRecord(record: InternalRecord): WorkflowAdoptionRecord {
     createdAt: record.createdAt,
     status: record.status === "applying" ? "partial" : record.status,
     operations: record.operations.map((operation) => ({
+      issueId: operation.issueId,
+      repository:
+        operation.repository as WorkflowAdoptionRecord["operations"][number]["repository"],
       issueNumber: operation.issueNumber,
       kind: operation.kind,
       status: operation.status === "pending" ? "failed" : operation.status,
@@ -289,6 +299,87 @@ function clearFailure(operation: InternalOperation): InternalOperation {
   return remaining;
 }
 
+function operationIdentity(operation: InternalOperation) {
+  return `${operation.repository}:${operation.issueId}`;
+}
+
+function classificationLabels(labels: ReadonlyArray<string>) {
+  return labels
+    .filter((label) => KIND_BY_LABEL[label as keyof typeof KIND_BY_LABEL] !== undefined)
+    .toSorted();
+}
+
+function updateClassification(
+  labels: ReadonlyArray<string>,
+  operation: InternalOperation,
+): ReadonlyArray<string> {
+  if (!operation.label || operation.kind === "change-parent") return labels;
+  if (operation.kind === "add-label") return [...new Set([...labels, operation.label])].toSorted();
+  return labels.filter((label) => label !== operation.label);
+}
+
+function expectedClassificationStates(
+  item: WorkflowAdoptionItem,
+  operations: ReadonlyArray<InternalOperation>,
+) {
+  let states: ReadonlyArray<ReadonlyArray<string>> = [classificationLabels(item.labels)];
+  for (const operation of operations) {
+    if (operation.kind === "change-parent") continue;
+    if (
+      operation.status === "undone" ||
+      operation.status === "pending" ||
+      operation.status === "failed"
+    )
+      continue;
+    if (operation.status === "uncertain") {
+      const possibleStates = Array.from(states);
+      for (const labels of states) possibleStates.push(updateClassification(labels, operation));
+      states = possibleStates;
+    } else {
+      states = states.map((labels) => updateClassification(labels, operation));
+    }
+  }
+  return new Set(states.map((labels) => labels.join("\n")));
+}
+
+function expectedParentNumbers(
+  item: WorkflowAdoptionItem,
+  operations: ReadonlyArray<InternalOperation>,
+) {
+  const expected = new Set<number | null>([item.currentParentNumber]);
+  const operation = operations.find((candidate) => candidate.kind === "change-parent");
+  if (!operation) return expected;
+  if (operation.status === "uncertain") expected.add(operation.afterParentNumber ?? null);
+  else if (
+    operation.status === "applied" ||
+    operation.status === "already-current" ||
+    operation.status === "undo-skipped"
+  )
+    return new Set([operation.afterParentNumber ?? null]);
+  return expected;
+}
+
+function reviewedStateFailure(
+  item: WorkflowAdoptionItem,
+  operations: ReadonlyArray<InternalOperation>,
+  live: RawIssue,
+) {
+  if (
+    live.node_id !== item.id ||
+    issueRepository(live) !== item.repository ||
+    live.number !== item.number ||
+    live.title.trim() !== item.title ||
+    (live.body ?? "") !== item.sourceBody
+  )
+    return "The reviewed source changed before this write.";
+  if (!expectedParentNumbers(item, operations).has(parentNumber(live)))
+    return "The reviewed branch changed before this write.";
+  const liveClassification = classificationLabels(labelsOf(live)).join("\n");
+  if (!expectedClassificationStates(item, operations).has(liveClassification))
+    return "The reviewed classification changed before this write.";
+  return null;
+}
+
 export class WorkflowAdoptionService extends Context.Service<
   WorkflowAdoptionService,
   {
@@ -301,6 +392,9 @@ export class WorkflowAdoptionService extends Context.Service<
     readonly history: (
       input: WorkflowAdoptionHistoryInput,
     ) => Effect.Effect<WorkflowAdoptionHistoryResult, WorkflowAdoptionError>;
+    readonly recover: (
+      input: WorkflowAdoptionRecoveryInput,
+    ) => Effect.Effect<WorkflowAdoptionRecoveryResult, WorkflowAdoptionError>;
     readonly undo: (
       input: WorkflowAdoptionUndoInput,
     ) => Effect.Effect<WorkflowAdoptionRecord, WorkflowQueryError | WorkflowAdoptionError>;
@@ -694,6 +788,7 @@ export const make = Effect.gen(function* () {
         const classification = classificationChanges(labelsOf(live), item.proposedKind);
         if (classification.added)
           operations.push({
+            issueId: item.id,
             issueNumber: item.number,
             issueDatabaseId: live.id,
             repository: item.repository,
@@ -706,6 +801,7 @@ export const make = Effect.gen(function* () {
           });
         for (const label of classification.conflicting)
           operations.push({
+            issueId: item.id,
             issueNumber: item.number,
             issueDatabaseId: live.id,
             repository: item.repository,
@@ -718,6 +814,7 @@ export const make = Effect.gen(function* () {
           });
         if (item.proposedParentNumber !== item.currentParentNumber)
           operations.push({
+            issueId: item.id,
             issueNumber: item.number,
             issueDatabaseId: live.id,
             repository: item.repository,
@@ -743,7 +840,54 @@ export const make = Effect.gen(function* () {
       yield* saveRecord(record);
     }
 
+    const reviewedItems = yield* decodeSelection(record.planJson).pipe(
+      Effect.mapError((error) =>
+        adoptionError("persistence-failed", "The saved adoption plan is invalid.", String(error)),
+      ),
+    );
+    const reviewedItemsByIdentity = new Map(
+      reviewedItems.map((item) => [`${item.repository}:${item.id}`, item]),
+    );
+    let planFailure: string | null = null;
+    if (Option.isSome(existing)) {
+      for (const reviewedItem of reviewedItems.filter((item) => item.included)) {
+        const reviewedIdentity = `${reviewedItem.repository}:${reviewedItem.id}`;
+        const live = yield* readIssue(
+          project.workspaceRoot,
+          reviewedItem.repository,
+          reviewedItem.number,
+        );
+        const itemOperations = record.operations.filter(
+          (candidate) => operationIdentity(candidate) === reviewedIdentity,
+        );
+        const failure = reviewedStateFailure(reviewedItem, itemOperations, live);
+        if (failure) {
+          planFailure = `${reviewedItem.repository}#${reviewedItem.number}: ${failure}`;
+          break;
+        }
+      }
+    }
+    if (planFailure) {
+      const failure = planFailure;
+      record = {
+        ...record,
+        operations: record.operations.map((operation) =>
+          operation.status === "applied" ||
+          operation.status === "already-current" ||
+          operation.status === "undone"
+            ? operation
+            : {
+                ...operation,
+                status: operation.status === "uncertain" ? "uncertain" : "failed",
+                owned: false,
+                failure,
+              },
+        ),
+      };
+      yield* saveRecord(record);
+    }
     for (let index = 0; index < record.operations.length; index += 1) {
+      if (planFailure) break;
       const operation = record.operations[index];
       if (
         !operation ||
@@ -752,11 +896,38 @@ export const make = Effect.gen(function* () {
         operation.status === "undone"
       )
         continue;
+      const identity = operationIdentity(operation);
+      const reviewedItem = reviewedItemsByIdentity.get(identity);
       const live = yield* readIssue(
         project.workspaceRoot,
         operation.repository,
         operation.issueNumber,
       );
+      const itemOperations = record.operations.filter(
+        (candidate) => operationIdentity(candidate) === identity,
+      );
+      const stateFailure = reviewedItem
+        ? reviewedStateFailure(reviewedItem, itemOperations, live)
+        : "The reviewed issue identity is missing from the saved plan.";
+      if (stateFailure) {
+        record = {
+          ...record,
+          operations: record.operations.map((item) =>
+            item.status === "applied" ||
+            item.status === "already-current" ||
+            item.status === "undone"
+              ? item
+              : {
+                  ...item,
+                  status: item.status === "uncertain" ? "uncertain" : "failed",
+                  owned: false,
+                  failure: `${operation.repository}#${operation.issueNumber}: ${stateFailure}`,
+                },
+          ),
+        };
+        yield* saveRecord(record);
+        break;
+      }
       const alreadyCurrent =
         operation.kind === "add-label"
           ? labelsOf(live).includes(operation.label ?? "")
@@ -768,30 +939,15 @@ export const make = Effect.gen(function* () {
           ...record,
           operations: record.operations.map((item, itemIndex) =>
             itemIndex === index
-              ? { ...clearFailure(item), status: "already-current", owned: false }
-              : item,
-          ),
-        };
-        yield* saveRecord(record);
-        continue;
-      }
-      const stillAtReviewedBaseline =
-        operation.kind === "add-label"
-          ? !labelsOf(live).includes(operation.label ?? "")
-          : operation.kind === "remove-label"
-            ? labelsOf(live).includes(operation.label ?? "")
-            : parentNumber(live) === operation.beforeParentNumber;
-      if (!stillAtReviewedBaseline) {
-        record = {
-          ...record,
-          operations: record.operations.map((item, itemIndex) =>
-            itemIndex === index
-              ? {
-                  ...item,
-                  status: "failed",
-                  owned: false,
-                  failure: "The reviewed source changed before this write.",
-                }
+              ? operation.status === "uncertain"
+                ? {
+                    ...item,
+                    status: "uncertain",
+                    owned: false,
+                    failure:
+                      "The attempted write is present, but it could not be attributed to this adoption.",
+                  }
+                : { ...clearFailure(item), status: "already-current", owned: false }
               : item,
           ),
         };
@@ -818,14 +974,41 @@ export const make = Effect.gen(function* () {
                 operation.afterParentNumber ?? null,
               );
       const outcome = yield* Effect.result(attempt);
+      let completedOperation: InternalOperation;
+      if (outcome._tag === "Failure") {
+        completedOperation = {
+          ...operation,
+          status: "uncertain",
+          owned: false,
+          failure: `The write was attempted, but its result could not be confirmed: ${String(outcome.failure)}`,
+        };
+      } else if (operation.kind === "change-parent") {
+        const readback = yield* Effect.result(
+          readIssue(project.workspaceRoot, operation.repository, operation.issueNumber),
+        );
+        completedOperation =
+          readback._tag === "Failure"
+            ? {
+                ...operation,
+                status: "uncertain",
+                owned: false,
+                failure: `The parent write was accepted, but readback failed: ${String(readback.failure)}`,
+              }
+            : parentNumber(readback.success) !== operation.afterParentNumber
+              ? {
+                  ...operation,
+                  status: "failed",
+                  owned: false,
+                  failure: "GitHub did not retain the reviewed parent change.",
+                }
+              : { ...clearFailure(operation), status: "applied", owned: true };
+      } else {
+        completedOperation = { ...clearFailure(operation), status: "applied", owned: true };
+      }
       record = {
         ...record,
         operations: record.operations.map((item, itemIndex) =>
-          itemIndex !== index
-            ? item
-            : outcome._tag === "Success"
-              ? { ...clearFailure(item), status: "applied", owned: true }
-              : { ...item, status: "failed", owned: false, failure: String(outcome.failure) },
+          itemIndex === index ? completedOperation : item,
         ),
       };
       yield* saveRecord(record);
@@ -833,7 +1016,10 @@ export const make = Effect.gen(function* () {
     record = {
       ...record,
       status: record.operations.some(
-        (operation) => operation.status === "failed" || operation.status === "pending",
+        (operation) =>
+          operation.status === "failed" ||
+          operation.status === "pending" ||
+          operation.status === "uncertain",
       )
         ? "partial"
         : "applied",
@@ -865,6 +1051,35 @@ export const make = Effect.gen(function* () {
     return { records };
   });
 
+  const recover: WorkflowAdoptionService["Service"]["recover"] = Effect.fn(
+    "WorkflowAdoptionService.recover",
+  )(function* (input) {
+    const record = yield* loadRecord(input.adoptionId);
+    if (
+      record.projectId !== input.projectId ||
+      record.repository !== input.repository ||
+      record.rootNumber !== input.rootNumber
+    )
+      return yield* adoptionError(
+        "adoption-not-found",
+        "This adoption record does not belong to the selected workflow branch.",
+      );
+    const items = yield* decodeSelection(record.planJson).pipe(
+      Effect.mapError((error) =>
+        adoptionError("persistence-failed", "The saved adoption plan is invalid.", String(error)),
+      ),
+    );
+    return {
+      record: publicRecord(record),
+      preview: {
+        previewId: record.previewId,
+        repository: record.repository as WorkflowAdoptionPreview["repository"],
+        rootNumber: record.rootNumber,
+        items,
+      },
+    };
+  });
+
   const undoUnlocked: WorkflowAdoptionService["Service"]["undo"] = Effect.fn(
     "WorkflowAdoptionService.undo",
   )(function* (input) {
@@ -875,20 +1090,95 @@ export const make = Effect.gen(function* () {
         "This adoption record does not belong to the selected project.",
       );
     const project = yield* selectedProject(input.projectId);
+    const reviewedItems = yield* decodeSelection(record.planJson).pipe(
+      Effect.mapError((error) =>
+        adoptionError("persistence-failed", "The saved adoption plan is invalid.", String(error)),
+      ),
+    );
+    const reviewedItemsByIdentity = new Map(
+      reviewedItems.map((item) => [`${item.repository}:${item.id}`, item]),
+    );
+    const checkedClassifications = new Set<string>();
     for (let index = record.operations.length - 1; index >= 0; index -= 1) {
       const operation = record.operations[index];
       if (!operation || !operation.owned || operation.status === "undone") continue;
+      const identity = operationIdentity(operation);
+      if (operation.kind !== "change-parent") {
+        if (checkedClassifications.has(identity)) continue;
+        checkedClassifications.add(identity);
+        const relatedIndexes = record.operations.flatMap((candidate, candidateIndex) =>
+          operationIdentity(candidate) === identity && candidate.kind !== "change-parent"
+            ? [candidateIndex]
+            : [],
+        );
+        const ownedIndexes = relatedIndexes.filter((candidateIndex) => {
+          const candidate = record.operations[candidateIndex];
+          return candidate?.owned && candidate.status !== "undone";
+        });
+        if (ownedIndexes.length === 0) continue;
+        const live = yield* readIssue(
+          project.workspaceRoot,
+          operation.repository,
+          operation.issueNumber,
+        );
+        const item = reviewedItemsByIdentity.get(identity);
+        const related = relatedIndexes.flatMap((candidateIndex) => {
+          const candidate = record.operations[candidateIndex];
+          return candidate ? [candidate] : [];
+        });
+        const hasUnattributedChange = related.some(
+          (candidate) =>
+            !candidate.owned &&
+            (candidate.status === "uncertain" || candidate.status === "already-current"),
+        );
+        const expected = item ? expectedClassificationStates(item, related) : new Set<string>();
+        const safe =
+          !hasUnattributedChange &&
+          expected.size === 1 &&
+          expected.has(classificationLabels(labelsOf(live)).join("\n"));
+        if (!safe) {
+          const operations = [...record.operations];
+          for (const candidateIndex of ownedIndexes) {
+            const candidate = operations[candidateIndex];
+            if (candidate)
+              operations[candidateIndex] = {
+                ...candidate,
+                status: "undo-skipped",
+                failure: "A later or unattributed classification replaced this adoption change.",
+              };
+          }
+          record = Object.assign({}, record, { operations });
+          yield* saveRecord(record);
+          continue;
+        }
+        for (const candidateIndex of ownedIndexes.toReversed()) {
+          const candidate = record.operations[candidateIndex];
+          if (!candidate) continue;
+          const attempt =
+            candidate.kind === "add-label"
+              ? removeLabel(project.workspaceRoot, candidate.repository, candidate)
+              : addLabel(project.workspaceRoot, candidate.repository, candidate);
+          const outcome = yield* Effect.result(attempt);
+          const operations = [...record.operations];
+          operations[candidateIndex] =
+            outcome._tag === "Success"
+              ? { ...clearFailure(candidate), status: "undone" }
+              : {
+                  ...candidate,
+                  status: "undo-skipped",
+                  failure: `The classification restoration failed: ${String(outcome.failure)}`,
+                };
+          record = Object.assign({}, record, { operations });
+          yield* saveRecord(record);
+        }
+        continue;
+      }
       const live = yield* readIssue(
         project.workspaceRoot,
         operation.repository,
         operation.issueNumber,
       );
-      const safe =
-        operation.kind === "add-label"
-          ? labelsOf(live).includes(operation.label ?? "")
-          : operation.kind === "remove-label"
-            ? !labelsOf(live).includes(operation.label ?? "")
-            : parentNumber(live) === operation.afterParentNumber;
+      const safe = parentNumber(live) === operation.afterParentNumber;
       if (!safe) {
         const operations = [...record.operations];
         operations[index] = {
@@ -901,31 +1191,48 @@ export const make = Effect.gen(function* () {
         yield* saveRecord(record);
         continue;
       }
-      const attempt =
-        operation.kind === "add-label"
-          ? removeLabel(project.workspaceRoot, operation.repository, operation)
-          : operation.kind === "remove-label"
-            ? addLabel(project.workspaceRoot, operation.repository, operation)
-            : changeParent(
-                project.workspaceRoot,
-                operation.repository,
-                operation,
-                operation.afterParentNumber ?? null,
-                operation.beforeParentNumber ?? null,
-              );
+      const attempt = changeParent(
+        project.workspaceRoot,
+        operation.repository,
+        operation,
+        operation.afterParentNumber ?? null,
+        operation.beforeParentNumber ?? null,
+      );
       const outcome = yield* Effect.result(attempt);
+      const readback = yield* Effect.result(
+        readIssue(project.workspaceRoot, operation.repository, operation.issueNumber),
+      );
       const operations = [...record.operations];
       operations[index] =
-        outcome._tag === "Success"
-          ? { ...clearFailure(operation), status: "undone" }
-          : { ...operation, status: "undo-skipped", failure: String(outcome.failure) };
+        readback._tag === "Success" &&
+        parentNumber(readback.success) === operation.beforeParentNumber
+          ? outcome._tag === "Success"
+            ? { ...clearFailure(operation), status: "undone" }
+            : {
+                ...operation,
+                status: "uncertain",
+                failure:
+                  "The parent was restored, but the restoration could not be attributed to this undo.",
+              }
+          : readback._tag === "Success"
+            ? {
+                ...operation,
+                status: "undo-skipped",
+                failure: "GitHub did not retain the parent restoration.",
+              }
+            : {
+                ...operation,
+                status: "uncertain",
+                failure: `The parent restoration could not be verified: ${String(readback.failure)}`,
+              };
       record = Object.assign({}, record, { operations });
       yield* saveRecord(record);
     }
     record = {
       ...record,
       status: record.operations.some(
-        (operation) => operation.owned && operation.status !== "undone",
+        (operation) =>
+          operation.status === "uncertain" || (operation.owned && operation.status !== "undone"),
       )
         ? "undo-partial"
         : "undone",
@@ -936,7 +1243,7 @@ export const make = Effect.gen(function* () {
   const undo: WorkflowAdoptionService["Service"]["undo"] = (input) =>
     mutationLock.withPermit(undoUnlocked(input));
 
-  return WorkflowAdoptionService.of({ preview, apply, history, undo });
+  return WorkflowAdoptionService.of({ preview, apply, history, recover, undo });
 });
 
 export const layer = Layer.effect(WorkflowAdoptionService, make).pipe(

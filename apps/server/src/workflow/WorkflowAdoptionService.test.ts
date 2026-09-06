@@ -14,7 +14,7 @@ import * as WorkflowAdoptionService from "./WorkflowAdoptionService.ts";
 
 const projectId = ProjectId.make("project-1");
 const repository = "Flow-Fly/t3code" as const;
-const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeLabelPayload = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.Struct({ labels: Schema.optionalKey(Schema.Array(Schema.String)) })),
 );
@@ -36,7 +36,7 @@ function output(stdout: string) {
   return {
     stdout,
     stderr: "",
-    code: ChildProcessSpawner.ExitCode(0),
+    exitCode: ChildProcessSpawner.ExitCode(0),
     timedOut: false,
     stdoutTruncated: false,
     stderrTruncated: false,
@@ -98,7 +98,9 @@ function harness() {
     ],
   ]);
   const writes = new Array<ReadonlyArray<string>>();
+  const issueReads = new Array<string>();
   let failNextWrite = false;
+  let ignoreParentWrite = false;
   let loseNextWriteResponse = false;
 
   const execute: GitHubCli.GitHubCli["Service"]["execute"] = ({ args, stdin }) =>
@@ -117,6 +119,7 @@ function harness() {
       const issueRead = /^repos\/[^/]+\/[^/]+\/issues\/(\d+)$/u.exec(endpoint);
       if (issueRead?.[1] && !args.includes("--method")) {
         const issue = issues.get(Number(issueRead[1]));
+        issueReads.push(`${issue?.repository}#${issueRead[1]}`);
         return issue
           ? Effect.succeed(output(encodeJson(serialized(issue))))
           : Effect.die("missing issue");
@@ -153,7 +156,7 @@ function harness() {
         const child = [...issues.values()].find(
           (issue) => issue.id === Number(idArg?.split("=")[1]),
         )!;
-        child.parent = Number(parentAdd[1]);
+        if (!ignoreParentWrite) child.parent = Number(parentAdd[1]);
       }
       const parentRemove = /^repos\/[^/]+\/[^/]+\/issues\/(\d+)\/sub_issue$/u.exec(endpoint);
       if (parentRemove?.[1]) {
@@ -161,7 +164,7 @@ function harness() {
         const child = [...issues.values()].find(
           (issue) => issue.id === Number(idArg?.split("=")[1]),
         )!;
-        child.parent = null;
+        if (!ignoreParentWrite) child.parent = null;
       }
       if (loseNextWriteResponse) {
         loseNextWriteResponse = false;
@@ -199,10 +202,14 @@ function harness() {
 
   return {
     issues,
+    issueReads,
     writes,
     layer: serviceLayer,
     failNextWrite: () => {
       failNextWrite = true;
+    },
+    ignoreParentWrite: () => {
+      ignoreParentWrite = true;
     },
     loseNextWriteResponse: () => {
       loseNextWriteResponse = true;
@@ -252,6 +259,28 @@ describe("WorkflowAdoptionService", () => {
     },
   );
 
+  it.effect("rereads issues linearly while applying a multi-issue branch", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const readsBeforeApply = test.issueReads.length;
+      const items = preview.items.map((item) =>
+        item.number === 11 ? corrected(item, { proposedKind: "ticket" }) : item,
+      );
+      const applied = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(applied.status).toBe("applied");
+      expect(applied.operations).toHaveLength(3);
+      expect(test.issueReads.length - readsBeforeApply).toBe(5);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("refuses changed source body before the first write", () => {
     const test = harness();
     return Effect.gen(function* () {
@@ -272,41 +301,150 @@ describe("WorkflowAdoptionService", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
-  it.effect(
-    "retries partial writes and reconciles a lost response without duplicate ownership",
-    () => {
-      const test = harness();
-      return Effect.gen(function* () {
-        const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
-        const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
-        const items = preview.items.map((item) =>
-          item.number === 11
-            ? corrected(item, { proposedKind: "ticket" })
-            : corrected(item, { included: false }),
-        );
-        test.loseNextWriteResponse();
-        const partial = yield* service.apply({
-          projectId,
-          previewId: preview.previewId,
-          repository,
-          rootNumber: 10,
-          items,
-        });
-        expect(partial.status).toBe("partial");
-        const retried = yield* service.apply({
-          projectId,
-          previewId: preview.previewId,
-          repository,
-          rootNumber: 10,
-          items,
-        });
-        expect(retried.status).toBe("applied");
-        expect(retried.operations[0]).toMatchObject({ status: "already-current", owned: false });
-        expect(test.writes.filter((args) => args.includes("POST"))).toHaveLength(1);
-        expect(test.issues.get(11)!.labels).toContain("workflow:ticket");
-      }).pipe(Effect.provide(test.layer));
-    },
-  );
+  it.effect("preserves an uncertain write without repeating it or claiming ownership", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      test.loseNextWriteResponse();
+      const partial = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(partial.status).toBe("partial");
+      const retried = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(retried.status).toBe("partial");
+      expect(retried.operations[0]).toMatchObject({
+        repository,
+        issueId: "issue-11",
+        status: "uncertain",
+        owned: false,
+      });
+      expect(retried.operations[0]?.detail).toContain("could not be attributed");
+      expect(test.writes.filter((args) => args.includes("POST"))).toHaveLength(1);
+      expect(test.issues.get(11)!.labels).toContain("workflow:ticket");
+      const undone = yield* service.undo({ projectId, adoptionId: retried.adoptionId });
+      expect(undone.status).toBe("undo-partial");
+      expect(undone.operations[0]).toMatchObject({ status: "uncertain", owned: false });
+      expect(test.issues.get(11)!.labels).toContain("workflow:ticket");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("refuses pending retry writes after the reviewed body changes", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      test.failNextWrite();
+      const partial = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(partial.status).toBe("partial");
+      test.issues.get(11)!.body = "## What to build\n\nA different reviewed scope.";
+      const writesBeforeRetry = test.writes.length;
+      const retried = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(retried.status).toBe("partial");
+      expect(retried.operations[0]?.detail).toContain("reviewed source changed");
+      expect(test.writes).toHaveLength(writesBeforeRetry);
+      expect(test.issues.get(11)!.labels).not.toContain("workflow:ticket");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("refuses pending retry writes after the issue leaves the reviewed branch", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      test.failNextWrite();
+      yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      test.issues.get(11)!.parent = 99;
+      const writesBeforeRetry = test.writes.length;
+      const retried = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(retried.status).toBe("partial");
+      expect(retried.operations[0]?.detail).toContain("reviewed branch changed");
+      expect(test.writes).toHaveLength(writesBeforeRetry);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("refuses pending retry writes after a later classification replaces the review", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      test.failNextWrite();
+      yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      test.issues.get(11)!.labels = ["workflow:container", "keep-me"];
+      const writesBeforeRetry = test.writes.length;
+      const retried = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(retried.status).toBe("partial");
+      expect(retried.operations[0]?.detail).toContain("reviewed classification changed");
+      expect(test.writes).toHaveLength(writesBeforeRetry);
+      expect(test.issues.get(11)!.labels).toEqual(["workflow:container", "keep-me"]);
+    }).pipe(Effect.provide(test.layer));
+  });
 
   it.effect(
     "refuses a retry when a pending reparent no longer matches the reviewed baseline",
@@ -340,7 +478,7 @@ describe("WorkflowAdoptionService", () => {
         expect(retried.status).toBe("partial");
         expect(
           retried.operations.find((operation) => operation.kind === "change-parent")?.detail,
-        ).toContain("reviewed source changed");
+        ).toContain("reviewed branch changed");
         expect(test.issues.get(11)!.parent).toBe(99);
       }).pipe(Effect.provide(test.layer));
     },
@@ -388,6 +526,109 @@ describe("WorkflowAdoptionService", () => {
     },
   );
 
+  it.effect("keeps a later classification intact when undoing a replaced classification", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      const applied = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      test.issues.get(11)!.labels = ["workflow:container", "keep-me"];
+      const undone = yield* service.undo({ projectId, adoptionId: applied.adoptionId });
+      expect(undone.status).toBe("undo-partial");
+      expect(test.issues.get(11)!.labels).toEqual(["workflow:container", "keep-me"]);
+      expect(
+        undone.operations.filter(
+          (operation) => operation.issueId === "issue-11" && operation.kind !== "change-parent",
+        ),
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ status: "undo-skipped" }),
+          expect.objectContaining({ status: "undo-skipped" }),
+        ]),
+      );
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("records a successful parent command as failed when readback does not match", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedParentNumber: null, parentChangeConfirmed: true })
+          : corrected(item, { included: false }),
+      );
+      test.ignoreParentWrite();
+      const result = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      expect(result.status).toBe("partial");
+      expect(
+        result.operations.find((operation) => operation.kind === "change-parent"),
+      ).toMatchObject({
+        status: "failed",
+        owned: false,
+        detail: "GitHub did not retain the reviewed parent change.",
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("recovers the persisted reviewed plan for the original partial adoption", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+      const preview = yield* service.preview({ projectId, repository, rootNumber: 10 });
+      const items = preview.items.map((item) =>
+        item.number === 11
+          ? corrected(item, { proposedKind: "ticket" })
+          : corrected(item, { included: false }),
+      );
+      test.failNextWrite();
+      const partial = yield* service.apply({
+        projectId,
+        previewId: preview.previewId,
+        repository,
+        rootNumber: 10,
+        items,
+      });
+      const history = yield* service.history({ projectId, repository, rootNumber: 10 });
+      const recovered = yield* service.recover({
+        projectId,
+        repository,
+        rootNumber: 10,
+        adoptionId: history.records[0]!.adoptionId,
+      });
+      expect(recovered.record.adoptionId).toBe(partial.adoptionId);
+      expect(recovered.preview.previewId).toBe(preview.previewId);
+      expect(recovered.preview.items).toEqual(items);
+      const retried = yield* service.apply({
+        projectId,
+        previewId: recovered.preview.previewId,
+        repository: recovered.preview.repository,
+        rootNumber: recovered.preview.rootNumber,
+        items: recovered.preview.items,
+      });
+      expect(retried.adoptionId).toBe(partial.adoptionId);
+      expect(retried.status).toBe("applied");
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("skips an adoption-owned parent change that was edited again later", () => {
     const test = harness();
     return Effect.gen(function* () {
@@ -417,4 +658,39 @@ describe("WorkflowAdoptionService", () => {
       expect(test.issues.get(11)!.parent).toBe(99);
     }).pipe(Effect.provide(test.layer));
   });
+
+  it.effect(
+    "does not record parent undo when relationship readback still shows the adopted parent",
+    () => {
+      const test = harness();
+      return Effect.gen(function* () {
+        const service = yield* WorkflowAdoptionService.WorkflowAdoptionService;
+        test.issues.get(11)!.parent = null;
+        const refreshed = yield* service.preview({ projectId, repository, rootNumber: 10 });
+        const items = refreshed.items.map((item) =>
+          item.number === 11
+            ? corrected(item, { proposedParentNumber: 10, parentChangeConfirmed: true })
+            : corrected(item, { included: false }),
+        );
+        const applied = yield* service.apply({
+          projectId,
+          previewId: refreshed.previewId,
+          repository,
+          rootNumber: 10,
+          items,
+        });
+        expect(applied.status).toBe("applied");
+        test.ignoreParentWrite();
+        const undone = yield* service.undo({ projectId, adoptionId: applied.adoptionId });
+        expect(undone.status).toBe("undo-partial");
+        expect(
+          undone.operations.find((operation) => operation.kind === "change-parent"),
+        ).toMatchObject({
+          status: "undo-skipped",
+          detail: "GitHub did not retain the parent restoration.",
+        });
+        expect(test.issues.get(11)!.parent).toBe(10);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
 });

@@ -138,6 +138,8 @@ import {
   WorkflowAdoptionPreview,
   WorkflowAdoptionPreviewInput,
   WorkflowAdoptionRecord,
+  WorkflowAdoptionRecoveryInput,
+  WorkflowAdoptionRecoveryResult,
   WorkflowAdoptionUndoInput,
   WorkflowIssueDetail,
   WorkflowIssueDetailInput,
@@ -393,6 +395,7 @@ export const WS_METHODS = {
   workflowAdoptionPreview: "workflow.adoption.preview",
   workflowAdoptionApply: "workflow.adoption.apply",
   workflowAdoptionHistory: "workflow.adoption.history",
+  workflowAdoptionRecover: "workflow.adoption.recover",
   workflowAdoptionUndo: "workflow.adoption.undo",
 
   // Source control methods
@@ -863,6 +866,12 @@ export const WsWorkflowAdoptionApplyRpc = Rpc.make(WS_METHODS.workflowAdoptionAp
 export const WsWorkflowAdoptionHistoryRpc = Rpc.make(WS_METHODS.workflowAdoptionHistory, {
   payload: WorkflowAdoptionHistoryInput,
   success: WorkflowAdoptionHistoryResult,
+  error: WorkflowAdoptionRpcError,
+});
+
+export const WsWorkflowAdoptionRecoverRpc = Rpc.make(WS_METHODS.workflowAdoptionRecover, {
+  payload: WorkflowAdoptionRecoveryInput,
+  success: WorkflowAdoptionRecoveryResult,
   error: WorkflowAdoptionRpcError,
 });
 
@@ -1371,6 +1380,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowAdoptionPreviewRpc,
   WsWorkflowAdoptionApplyRpc,
   WsWorkflowAdoptionHistoryRpc,
+  WsWorkflowAdoptionRecoverRpc,
   WsWorkflowAdoptionUndoRpc,
   WsSourceControlLookupRepositoryRpc,
   WsSourceControlCloneRepositoryRpc,

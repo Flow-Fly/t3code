@@ -2141,6 +2141,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowAdoptionHistory, workflowAdoption.history(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowAdoptionRecover]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowAdoptionRecover, workflowAdoption.recover(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.workflowAdoptionUndo]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionUndo, workflowAdoption.undo(input), {
             "rpc.aggregate": "workflow",
