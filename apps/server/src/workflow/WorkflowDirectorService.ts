@@ -1086,11 +1086,7 @@ export const make = Effect.gen(function* () {
   );
 
   const verifyPublishedBreakdown = Effect.fn("WorkflowDirectorService.verifyPublishedBreakdown")(
-    function* (
-      approval: WorkflowEvidenceRecord,
-      tickets: ReadonlyArray<WorkflowIssueDetail>,
-      uncertainFailure: WorkflowDirectorError["failure"] = "breakdown-incomplete",
-    ) {
+    function* (approval: WorkflowEvidenceRecord, tickets: ReadonlyArray<WorkflowIssueDetail>) {
       const approved = breakdownUnits(approval.approvedContent ?? "");
       if (approved.length === 0) {
         return yield* directorError(
@@ -1166,13 +1162,7 @@ export const make = Effect.gen(function* () {
             .join(" "),
         );
       }
-      if (unknownScope.length > 0) {
-        return yield* directorError(
-          uncertainFailure,
-          "Published delivery scope cannot be verified from the available approval evidence.",
-          `Unavailable or unknown scope: ${unknownScope.map((ticket) => `#${ticket.number}`).join(", ")}.`,
-        );
-      }
+      return unknownScope;
     },
   );
 
@@ -1182,7 +1172,6 @@ export const make = Effect.gen(function* () {
       readonly repository: string;
       readonly capabilityNumber: number;
       readonly breakdownApproval: WorkflowEvidenceRecord;
-      readonly uncertainFailure?: WorkflowDirectorError["failure"];
     }) {
       const ticketSummaries = yield* collectDeliveryTickets(input);
       const approvedTickets = yield* Effect.forEach(ticketSummaries, (ticket) =>
@@ -1192,10 +1181,9 @@ export const make = Effect.gen(function* () {
           number: ticket.number,
         }),
       );
-      yield* verifyPublishedBreakdown(
+      const unknownPublishedTickets = yield* verifyPublishedBreakdown(
         input.breakdownApproval,
         approvedTickets,
-        input.uncertainFailure,
       );
 
       const required = new Map(approvedTickets.map((ticket) => [ticket.number, ticket]));
@@ -1233,7 +1221,11 @@ export const make = Effect.gen(function* () {
           }
         }
       }
-      return { approvedTickets, requiredIssues: [...required.values()] };
+      return {
+        approvedTickets,
+        requiredIssues: [...required.values()],
+        unknownPublishedTickets,
+      };
     },
   );
 
@@ -1465,7 +1457,14 @@ export const make = Effect.gen(function* () {
         number: ticket.number,
       }),
     );
-    yield* verifyPublishedBreakdown(breakdownApproval, tickets);
+    const unknownPublishedTickets = yield* verifyPublishedBreakdown(breakdownApproval, tickets);
+    if (unknownPublishedTickets.length > 0) {
+      return yield* directorError(
+        "breakdown-incomplete",
+        "Published delivery scope cannot be verified from the available approval evidence.",
+        `Unavailable or unknown scope: ${unknownPublishedTickets.map((ticket) => `#${ticket.number}`).join(", ")}.`,
+      );
+    }
     yield* verifyRepository(cwd, input.repository);
     if (capability.readiness?.status !== "ready") {
       return yield* directorError(
@@ -4473,7 +4472,6 @@ export const make = Effect.gen(function* () {
         repository: row.repository,
         capabilityNumber: row.capabilityNumber,
         breakdownApproval: breakdown,
-        uncertainFailure: "completion-unavailable",
       });
       const requiredEvidence = hierarchy.requiredIssues.map((issue) => ({
         issue,
@@ -4485,6 +4483,13 @@ export const make = Effect.gen(function* () {
           "completion-pending",
           "Every approved delivery ticket and nested task needs current resolution evidence.",
           invalidated.map(({ issue }) => `#${issue.number}: ${readinessDetail(issue)}`).join(" "),
+        );
+      }
+      if (hierarchy.unknownPublishedTickets.length > 0) {
+        return yield* directorError(
+          "completion-unavailable",
+          "Published delivery scope cannot be verified from the available approval evidence.",
+          `Unavailable or unknown scope: ${hierarchy.unknownPublishedTickets.map((ticket) => `#${ticket.number}`).join(", ")}.`,
         );
       }
       const uncertain = requiredEvidence.filter((entry) => entry.state === "unknown");

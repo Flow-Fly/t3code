@@ -6077,6 +6077,177 @@ describe("capability combined acceptance", () => {
     },
   );
 
+  it.effect(
+    "invalidates an owned completion when published evidence is unavailable and another slice reopens",
+    () => {
+      const fixture = interpretedCapabilityFixture(2);
+      const completed = interpretedCapabilityFixture(2, new Set([1, 2]));
+      const unavailableTicket = fixture.ticketDetails[0]!;
+      const reopenedTicket = fixture.ticketDetails[1]!;
+      let commentWrites = 0;
+      let closeWrites = 0;
+      let reopenWrites = 0;
+      const completionComments: WorkflowEvidenceComment[] = [];
+      const refreshCapability = (state: "open" | "closed") => {
+        Object.assign(fixture.capability, {
+          state,
+          stateReason: state === "closed" ? "completed" : null,
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: fixture.capability.id,
+              url: fixture.capability.url,
+              number: fixture.capability.number,
+              title: fixture.capability.title,
+              kind: fixture.capability.kind,
+              state,
+              stateReason: state === "closed" ? "completed" : null,
+              labels: fixture.capability.labels,
+              assignees: [],
+              body: fixture.capability.body,
+              comments: [
+                fixture.source,
+                fixture.specification,
+                fixture.breakdownRecord,
+                ...completionComments,
+              ],
+              reopenedAt: [],
+            },
+          }),
+        });
+      };
+      const test = harness({
+        ...fixture,
+        processRunner: reviewProcessRunner(),
+        githubExecute: ({ args, stdin }) => {
+          if (args[0] === "issue" && args[1] === "comment") {
+            commentWrites += 1;
+            completionComments.push({
+              id: "capability-completion",
+              url: `${fixture.capability.url}#issuecomment-completion`,
+              body: stdin!,
+              createdAt: "2026-09-07T11:00:00.000Z",
+              author: "Flow-Fly",
+              authorAssociation: "OWNER",
+            });
+            refreshCapability("open");
+            return Effect.succeed(output("commented\n"));
+          }
+          if (args[0] === "issue" && args[1] === "close") {
+            closeWrites += 1;
+            refreshCapability("closed");
+            return Effect.succeed(acknowledgedCloseOutput(fixture.capability));
+          }
+          if (args[0] === "issue" && args[1] === "reopen") {
+            reopenWrites += 1;
+            refreshCapability("open");
+            return Effect.succeed(output("reopened\n"));
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        Object.assign(unavailableTicket, completed.ticketDetails[0]);
+        Object.assign(reopenedTicket, completed.ticketDetails[1]);
+        const sql = yield* SqlClient.SqlClient;
+        yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: unavailableTicket.number,
+          scopeBody: unavailableTicket.body,
+          suffix: "mixed-published-unavailable",
+        });
+        yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: reopenedTicket.number,
+          scopeBody: reopenedTicket.body,
+          suffix: "mixed-published-reopened",
+        });
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+          workflowDirectorHandlers
+            .workflow_complete_capability({
+              resultingHead: reviewHead,
+              checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+              receipts,
+            })
+            .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+        const registered = yield* complete([]);
+        yield* observeReviewCheck({
+          threadId: started.director.threadId,
+          toolCallId: "mixed-published-combined",
+          command: "vp test run combined.test.ts",
+          cwd: started.director.worktreePath,
+          startedAt: new Date(Date.parse(registered.completion.createdAt) + 1_000).toISOString(),
+          completedAt: new Date(Date.parse(registered.completion.createdAt) + 2_000).toISOString(),
+          exitCode: 0,
+        });
+        const completedResult = yield* complete([
+          { label: "combined", toolCallId: "mixed-published-combined" },
+        ]);
+        expect(completedResult).toMatchObject({
+          disposition: "completed",
+          completion: { status: "completed", authority: "current" },
+        });
+        const owned = yield* sql<{ readonly status: string; readonly closeOwned: number }>`
+          SELECT status, close_owned AS "closeOwned" FROM workflow_capability_completions
+        `;
+        expect(owned).toEqual([{ status: "completed", closeOwned: 1 }]);
+
+        Object.assign(unavailableTicket, {
+          evidence: {
+            ...unavailableTicket.evidence!,
+            records: unavailableTicket.evidence!.records.map((record) =>
+              record.kind === "approval" && record.approvalKind === "ticket-breakdown"
+                ? { ...record, sourceAccess: "unavailable" as const }
+                : record,
+            ),
+          },
+        });
+        Object.assign(reopenedTicket, {
+          state: "open",
+          stateReason: null,
+          readiness: {
+            status: "blocked",
+            reasons: [{ kind: "reopened", message: "Required slice reopened after acceptance." }],
+          },
+        });
+
+        const status = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(status.completion).toMatchObject({
+          status: "invalidated",
+          authority: "historical",
+        });
+        expect(status.completion?.lastError).toContain(`#${reopenedTicket.number}`);
+        expect(fixture.capability.state).toBe("open");
+        expect(commentWrites).toBe(1);
+        expect(closeWrites).toBe(1);
+        expect(reopenWrites).toBe(1);
+        const invalidated = yield* sql<{ readonly status: string; readonly closeOwned: number }>`
+          SELECT status, close_owned AS "closeOwned" FROM workflow_capability_completions
+        `;
+        expect(invalidated).toEqual([{ status: "invalidated", closeOwned: 1 }]);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
   it.effect("holds completion when published breakdown evidence is unavailable", () => {
     const fixture = interpretedCapabilityFixture(1);
     const deliveryTicket = fixture.ticketDetails[0]!;
