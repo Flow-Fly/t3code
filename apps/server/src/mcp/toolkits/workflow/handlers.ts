@@ -6,6 +6,15 @@ import * as WorkflowMonitor from "../../../workflow/WorkflowMonitor.ts";
 import { WorkflowDirectorToolkit } from "./tools.ts";
 
 export const workflowDirectorHandlers = {
+  workflow_prepare_director_handoff: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const workflow = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const notifier = yield* WorkflowMonitor.WorkflowRefreshNotifier;
+      return yield* workflow
+        .prepareHandoff(scope.environmentId, scope.threadId, scope.providerInstanceId, input)
+        .pipe(Effect.ensuring(notifier.directorChanged(scope).pipe(Effect.ignore)));
+    }),
   workflow_prepare_worker: (input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

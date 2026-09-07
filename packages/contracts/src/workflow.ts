@@ -646,6 +646,32 @@ export const WorkflowCapabilityCompletionStatus = Schema.Struct({
 });
 export type WorkflowCapabilityCompletionStatus = typeof WorkflowCapabilityCompletionStatus.Type;
 
+export const WorkflowDirectorHandoffPrepareInput = Schema.Struct({
+  lessons: Schema.Array(TrimmedNonEmptyString),
+  unresolvedContext: Schema.Array(TrimmedNonEmptyString),
+  suggestedSkills: Schema.Array(TrimmedNonEmptyString),
+  suggestedStaffing: Schema.Array(TrimmedNonEmptyString),
+});
+export type WorkflowDirectorHandoffPrepareInput = typeof WorkflowDirectorHandoffPrepareInput.Type;
+
+export const WorkflowDirectorHandoffStatus = Schema.Struct({
+  handoffId: TrimmedNonEmptyString,
+  sourceDirectorId: TrimmedNonEmptyString,
+  sourceBatchId: TrimmedNonEmptyString,
+  sourceThreadId: ThreadId,
+  successorDirectorId: Schema.NullOr(TrimmedNonEmptyString),
+  successorThreadId: Schema.NullOr(ThreadId),
+  implementationHead: Schema.NullOr(TrimmedNonEmptyString),
+  status: Schema.Literals(["waiting-settlement", "submitting", "submitted", "held"]),
+  admissionCount: Schema.Number,
+  lessons: Schema.Array(TrimmedNonEmptyString),
+  unresolvedContext: Schema.Array(TrimmedNonEmptyString),
+  requiredAction: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkflowDirectorHandoffStatus = typeof WorkflowDirectorHandoffStatus.Type;
+
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
   batchId: TrimmedNonEmptyString,
@@ -667,6 +693,7 @@ export const WorkflowDirectorStatus = Schema.Struct({
   resolutions: Schema.optionalKey(Schema.Array(WorkflowTicketResolutionStatus)),
   reassessment: Schema.optionalKey(Schema.NullOr(WorkflowReassessmentStatus)),
   completion: Schema.optionalKey(Schema.NullOr(WorkflowCapabilityCompletionStatus)),
+  handoff: Schema.optionalKey(Schema.NullOr(WorkflowDirectorHandoffStatus)),
   observation: TrimmedNonEmptyString,
   actions: Schema.Array(Schema.Literals(["open", "resume", "retry", "stop"])),
   createdAt: IsoDateTime,

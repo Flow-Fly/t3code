@@ -2611,6 +2611,15 @@ describe("WorkflowDirectorService", () => {
         purpose: "retry",
         ownership: "worker-one",
       });
+      const nestedReuse = yield* service.admit({
+        projectId,
+        directorId: started.director.directorId,
+        repository,
+        ticketNumber: nestedTask.number,
+        parentTicketNumber: fixture.ticketDetails[0]!.number,
+        purpose: "implement",
+        ownership: "worker-one/nested",
+      });
       const parentTicket = fixture.ticketDetails[0]!;
       const blockerReadiness = interpretWorkflowEvidence({
         issue: {
@@ -2672,6 +2681,7 @@ describe("WorkflowDirectorService", () => {
         ownership: "worker-eleven",
       });
       expect(retry).toMatchObject({ disposition: "existing", admissionCount: 10 });
+      expect(nestedReuse).toMatchObject({ disposition: "admitted", admissionCount: 10 });
       expect(blockedRetry._tag).toBe("Failure");
       expect(nested._tag).toBe("Failure");
       expect(eleventh).toMatchObject({
@@ -2679,6 +2689,9 @@ describe("WorkflowDirectorService", () => {
         admission: null,
         admissionCount: 10,
         directorStatus: "waiting",
+      });
+      expect(yield* service.status({ projectId, repository, capabilityNumber: 17 })).toMatchObject({
+        admissionCount: 10,
       });
       const forgedParent = yield* service
         .admit({

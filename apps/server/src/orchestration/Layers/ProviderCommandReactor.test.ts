@@ -10,6 +10,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
+  RuntimeItemId,
+  RuntimeTaskId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import {
@@ -91,6 +93,7 @@ import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "../../workflow/WorkflowService.ts";
 import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
 import * as WorkflowDirectorService from "../../workflow/WorkflowDirectorService.ts";
+import * as WorkflowMonitor from "../../workflow/WorkflowMonitor.ts";
 import {
   interpretWorkflowEvidence,
   workflowEvidenceBodyFingerprint,
@@ -198,6 +201,7 @@ describe("ProviderCommandReactor", () => {
   });
 
   async function createHarness(input?: {
+    directorTicketCount?: number;
     readonly baseDir?: string;
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
@@ -422,6 +426,25 @@ describe("ProviderCommandReactor", () => {
               ],
             },
           },
+          ...(modelSelection.model === "gpt-5.6-sol"
+            ? []
+            : [
+                {
+                  slug: "gpt-5.6-sol",
+                  name: "GPT-5.6 Sol",
+                  isCustom: false,
+                  capabilities: {
+                    optionDescriptors: [
+                      {
+                        id: "reasoningEffort",
+                        label: "Reasoning effort",
+                        type: "select" as const,
+                        options: [{ id: "high", label: "High" }],
+                      },
+                    ],
+                  },
+                },
+              ]),
           ...(modelSelection.model === "gpt-6-astra"
             ? []
             : [
@@ -600,6 +623,7 @@ describe("ProviderCommandReactor", () => {
     const runEffect = <A, E>(effect: Effect.Effect<A, E>) => runtime!.runPromise(effect);
 
     const workflowRepository = "Flow-Fly/t3code" as const;
+    let directorImplementationHead = "a".repeat(40);
     const workflowSummary = (
       number: number,
       kind: WorkflowIssueSummary["kind"],
@@ -627,10 +651,13 @@ describe("ProviderCommandReactor", () => {
       ...workflowSummary(17, "capability", 10, ["workflow:capability"]),
       title: "Capability delivery",
     };
-    const directorTicketSummary = {
-      ...workflowSummary(18, "ticket", 17, ["workflow:ticket", "ready-for-agent"]),
-      title: "First delivery",
-    };
+    const directorTicketSummaries = Array.from(
+      { length: input?.directorTicketCount ?? 1 },
+      (_, index) => ({
+        ...workflowSummary(18 + index, "ticket", 17, ["workflow:ticket", "ready-for-agent"]),
+        title: `T${String(index + 1).padStart(2, "0")} — Delivery ${index + 1}`,
+      }),
+    );
     const directorCapabilityBody =
       "## Summary\n\nDeliver the capability.\n\n## Source map\n\nNone (standalone)";
     const directorSlice = [
@@ -646,12 +673,16 @@ describe("ProviderCommandReactor", () => {
       "",
       "None",
     ].join("\n");
-    const directorBreakdown = [
-      "<details>",
-      "<summary>T01 — First delivery</summary>",
-      directorSlice,
-      "</details>",
-    ].join("\n");
+    const directorBreakdown = directorTicketSummaries
+      .map((ticket, index) =>
+        [
+          "<details>",
+          `<summary>T${String(index + 1).padStart(2, "0")} — Delivery ${index + 1}</summary>`,
+          directorSlice,
+          "</details>",
+        ].join("\n"),
+      )
+      .join("\n");
     const ownerSource = {
       id: "director-owner-source",
       url: `${directorCapabilitySummary.url}#issuecomment-owner-source`,
@@ -702,39 +733,113 @@ describe("ProviderCommandReactor", () => {
         reopenedAt: [],
       },
     });
-    const directorTicketBody = [
-      `Approved slice: **T01** ([ticket-breakdown approval](${breakdownApproval.url}))`,
-      "",
-      directorSlice,
-    ].join("\n");
-    const directorTicketEvidence = interpretWorkflowEvidence({
-      issue: {
-        id: directorTicketSummary.id,
-        url: directorTicketSummary.url,
-        number: directorTicketSummary.number,
-        title: directorTicketSummary.title,
-        kind: "ticket",
-        state: "open",
-        stateReason: null,
-        labels: directorTicketSummary.labels,
-        assignees: [],
-        body: directorTicketBody,
-        comments: [],
-        reopenedAt: [],
-      },
-      approvalComments: [ownerSource, breakdownApproval],
-    });
     const directorCapability: WorkflowIssueDetail = {
       ...directorCapabilitySummary,
       body: directorCapabilityBody,
       blockedBy: [],
       ...directorCapabilityEvidence,
     };
-    const directorTicket: WorkflowIssueDetail = {
-      ...directorTicketSummary,
-      body: directorTicketBody,
-      blockedBy: [],
-      ...directorTicketEvidence,
+    const directorTickets: WorkflowIssueDetail[] = directorTicketSummaries.map((summary, index) => {
+      const body = [
+        `Approved slice: **T${String(index + 1).padStart(2, "0")}** ([ticket-breakdown approval](${breakdownApproval.url}))`,
+        "",
+        directorSlice,
+      ].join("\n");
+      const evidence = interpretWorkflowEvidence({
+        issue: {
+          id: summary.id,
+          url: summary.url,
+          number: summary.number,
+          title: summary.title,
+          kind: "ticket",
+          state: "open",
+          stateReason: null,
+          labels: summary.labels,
+          assignees: [],
+          body,
+          comments: [],
+          reopenedAt: [],
+        },
+        approvalComments: [ownerSource, breakdownApproval],
+      });
+      return { ...summary, body, blockedBy: [], ...evidence };
+    });
+    const directorTicket = directorTickets[0]!;
+    const completionComments: Array<{
+      readonly id: string;
+      readonly url: string;
+      readonly body: string;
+      readonly createdAt: string;
+      readonly author: string;
+      readonly authorAssociation: "OWNER";
+    }> = [];
+    const refreshDirectorCapability = (state: "open" | "closed") => {
+      Object.assign(directorCapability, {
+        state,
+        stateReason: state === "closed" ? "completed" : null,
+        ...interpretWorkflowEvidence({
+          issue: {
+            id: directorCapability.id,
+            url: directorCapability.url,
+            number: directorCapability.number,
+            title: directorCapability.title,
+            kind: directorCapability.kind,
+            state,
+            stateReason: state === "closed" ? "completed" : null,
+            labels: directorCapability.labels,
+            assignees: [],
+            body: directorCapability.body,
+            comments: [
+              ownerSource,
+              specificationApproval,
+              breakdownApproval,
+              ...completionComments,
+            ],
+            reopenedAt: [],
+          },
+        }),
+      });
+    };
+    const resolveDirectorTickets = () => {
+      for (const ticket of directorTickets) {
+        const resolution = {
+          id: `resolution-${ticket.number}`,
+          url: `${ticket.url}#issuecomment-resolution`,
+          body: [
+            "<!-- t3-workflow:v1 resolution -->",
+            "Outcome: resolved",
+            "## Summary",
+            "Delivered across the durable director batches.",
+            "## Evidence",
+            `https://github.com/${workflowRepository}/commit/${directorImplementationHead}`,
+          ].join("\n"),
+          createdAt: "2026-09-07T13:02:00.000Z",
+          author: "Flow-Fly",
+          authorAssociation: "OWNER" as const,
+        };
+        Object.assign(ticket, {
+          state: "closed",
+          stateReason: "completed",
+          labels: ticket.labels.filter((label) => label !== "ready-for-agent"),
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: ticket.id,
+              url: ticket.url,
+              number: ticket.number,
+              title: ticket.title,
+              kind: ticket.kind,
+              state: "closed",
+              stateReason: "completed",
+              labels: ticket.labels.filter((label) => label !== "ready-for-agent"),
+              assignees: [],
+              body: ticket.body,
+              comments: [resolution],
+              reopenedAt: [],
+            },
+            approvalComments: [ownerSource, breakdownApproval],
+          }),
+        });
+      }
     };
     const workflowAssignees = new Set<string>();
     const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => {
@@ -837,53 +942,84 @@ describe("ProviderCommandReactor", () => {
         Effect.provide(NodeServices.layer),
       ),
     );
+    const directorWorkflow = WorkflowService.WorkflowService.of({
+      issueDetail: ({
+        number,
+      }: Parameters<WorkflowService.WorkflowService["Service"]["issueDetail"]>[0]) =>
+        Effect.succeed(
+          number === directorCapability.number
+            ? directorCapability
+            : (directorTickets.find((ticket) => ticket.number === number) ?? directorTicket),
+        ),
+      children: ({
+        parentNumber,
+      }: Parameters<WorkflowService.WorkflowService["Service"]["children"]>[0]) =>
+        Effect.succeed({
+          parentNumber,
+          children: parentNumber === directorCapability.number ? directorTickets : [],
+          frontier: {
+            status: parentNumber === directorCapability.number ? "available" : "empty",
+            message:
+              parentNumber === directorCapability.number
+                ? `${directorTickets.length} items can proceed.`
+                : "No work.",
+            readyIssueIds:
+              parentNumber === directorCapability.number
+                ? directorTickets.map((ticket) => ticket.id)
+                : [],
+          },
+        }),
+      locate: () =>
+        Effect.succeed({
+          issue: directorTicket,
+          ancestry: [directorCapability],
+          ancestryComplete: true,
+        }),
+      validateProject: () => Effect.void,
+      roots: () => Effect.succeed({ repository: workflowRepository, roots: [directorCapability] }),
+    } as unknown as WorkflowService.WorkflowService["Service"]);
     const workflowDirector = await runtime.runPromise(
       WorkflowDirectorService.make.pipe(
-        Effect.provideService(
-          WorkflowService.WorkflowService,
-          WorkflowService.WorkflowService.of({
-            issueDetail: ({
-              number,
-            }: Parameters<WorkflowService.WorkflowService["Service"]["issueDetail"]>[0]) =>
-              Effect.succeed(
-                number === directorCapability.number ? directorCapability : directorTicket,
-              ),
-            children: ({
-              parentNumber,
-            }: Parameters<WorkflowService.WorkflowService["Service"]["children"]>[0]) =>
-              Effect.succeed({
-                parentNumber,
-                children: parentNumber === directorCapability.number ? [directorTicket] : [],
-                frontier: {
-                  status: parentNumber === directorCapability.number ? "available" : "empty",
-                  message:
-                    parentNumber === directorCapability.number ? "1 item can proceed." : "No work.",
-                  readyIssueIds:
-                    parentNumber === directorCapability.number ? [directorTicket.id] : [],
-                },
-              }),
-            locate: () =>
-              Effect.succeed({
-                issue: directorTicket,
-                ancestry: [directorCapability],
-                ancestryComplete: true,
-              }),
-          } as unknown as WorkflowService.WorkflowService["Service"]),
-        ),
+        Effect.provideService(WorkflowService.WorkflowService, directorWorkflow),
         Effect.provideService(
           GitHubCli.GitHubCli,
           GitHubCli.GitHubCli.of({
-            execute: ({ args }: Parameters<GitHubCli.GitHubCli["Service"]["execute"]>[0]) =>
-              Effect.succeed({
-                stdout: args[0] === "repo" ? `${workflowRepository}\n` : "",
-                stderr: "",
-                exitCode: 0,
-                timedOut: false,
-                stdoutTruncated: false,
-                stderrTruncated: false,
-                stdoutInvalidUtf8: false,
-                stderrInvalidUtf8: false,
-              } as never),
+            execute: ({ args, stdin }: Parameters<GitHubCli.GitHubCli["Service"]["execute"]>[0]) =>
+              Effect.sync(() => {
+                if (args[0] === "issue" && args[1] === "comment" && stdin) {
+                  completionComments.push({
+                    id: "director-capability-completion",
+                    url: `${directorCapability.url}#issuecomment-completion`,
+                    body: stdin,
+                    createdAt: "2026-09-07T13:03:00.000Z",
+                    author: "Flow-Fly",
+                    authorAssociation: "OWNER",
+                  });
+                  refreshDirectorCapability("open");
+                }
+                if (args[0] === "issue" && args[1] === "close") {
+                  refreshDirectorCapability("closed");
+                }
+                const addAt = args.indexOf("--add-assignee");
+                if (addAt >= 0) workflowAssignees.add(args[addAt + 1]!);
+                return {
+                  stdout:
+                    args[0] === "repo"
+                      ? `${workflowRepository}\n`
+                      : args[0] === "api"
+                        ? "Flow-Fly\n"
+                        : args.includes("--json")
+                          ? [...workflowAssignees].join("\n")
+                          : "",
+                  stderr: "",
+                  exitCode: 0,
+                  timedOut: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                } as never;
+              }),
             getRepositoryCloneUrls: () =>
               Effect.succeed({
                 nameWithOwner: workflowRepository,
@@ -895,9 +1031,14 @@ describe("ProviderCommandReactor", () => {
         Effect.provideService(
           ProcessRunner.ProcessRunner,
           ProcessRunner.ProcessRunner.of({
-            run: () =>
+            run: ({ args }) =>
               Effect.succeed({
-                stdout: `fork\tgit@github.com:${workflowRepository}.git (fetch)\n`,
+                stdout:
+                  args[0] === "rev-parse"
+                    ? `${directorImplementationHead}\n`
+                    : args[0] === "status"
+                      ? ""
+                      : `fork\tgit@github.com:${workflowRepository}.git (fetch)\n`,
                 stderr: "",
                 code: 0,
                 timedOut: false,
@@ -937,6 +1078,22 @@ describe("ProviderCommandReactor", () => {
             drainThreadDeletionThrough: () => Effect.void,
           })
         : dispatchForWorkflow(command);
+    const sqlClient = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
+    const makeWorkflowMonitor = () =>
+      Effect.runPromise(
+        Effect.scoped(
+          WorkflowMonitor.make.pipe(
+            Effect.provideService(WorkflowService.WorkflowService, directorWorkflow),
+            Effect.provideService(
+              WorkflowDirectorService.WorkflowDirectorService,
+              workflowDirector,
+            ),
+            Effect.provideService(OrchestrationEngineService, engine),
+            Effect.provideService(SqlClient.SqlClient, sqlClient),
+          ),
+        ),
+      );
+    const workflowMonitor = await makeWorkflowMonitor();
 
     await Effect.runPromise(
       engine.dispatch({
@@ -1103,10 +1260,18 @@ describe("ProviderCommandReactor", () => {
       readDirectorRows,
       workflowStart,
       workflowDirector,
+      workflowMonitor,
+      makeWorkflowMonitor,
       directorCapability,
       directorTicket,
+      directorTickets,
+      directorImplementationHead,
+      advanceDirectorImplementationHead: () => {
+        directorImplementationHead = "b".repeat(40);
+      },
       dispatchWorkflow,
       workflowAssignees,
+      resolveDirectorTickets,
       get titleRegenerationCompletionDispatchAttempts() {
         return titleRegenerationCompletionDispatchAttempts;
       },
@@ -1415,6 +1580,520 @@ describe("ProviderCommandReactor", () => {
           }),
         );
         expect(harness.sendTurn.mock.calls.at(-1)?.[0]).not.toHaveProperty("skills");
+      }),
+  );
+
+  effectIt.effect(
+    "rotates an eleven-ticket capability through the monitor and recovers the accepted first-turn receipt",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness({ directorTicketCount: 11 }));
+        NodeFS.mkdirSync("/tmp/provider-project", { recursive: true });
+        const started = yield* harness.workflowDirector.start(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            capabilityNumber: 17,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+          harness.dispatchWorkflow,
+        );
+        yield* Effect.promise(() => harness.drain());
+
+        for (const [index, ticket] of harness.directorTickets.slice(0, 10).entries()) {
+          const admission = yield* harness.workflowDirector.admit({
+            projectId: ProjectId.make("project-1"),
+            directorId: started.director.directorId,
+            repository: "Flow-Fly/t3code",
+            ticketNumber: ticket.number,
+            purpose: index === 1 ? "retry" : index === 2 ? "review" : "implement",
+            ownership: `delivery-${index + 1}`,
+          });
+          expect(admission).toMatchObject({ disposition: "admitted", admissionCount: index + 1 });
+        }
+        expect(
+          yield* harness.workflowDirector.admit({
+            projectId: ProjectId.make("project-1"),
+            directorId: started.director.directorId,
+            repository: "Flow-Fly/t3code",
+            ticketNumber: harness.directorTickets[0]!.number,
+            purpose: "retry",
+            ownership: "delivery-1",
+          }),
+        ).toMatchObject({ disposition: "existing", admissionCount: 10 });
+        expect(
+          yield* harness.workflowDirector.admit({
+            projectId: ProjectId.make("project-1"),
+            directorId: started.director.directorId,
+            repository: "Flow-Fly/t3code",
+            ticketNumber: harness.directorTickets[10]!.number,
+            purpose: "implement",
+            ownership: "delivery-11",
+          }),
+        ).toMatchObject({ disposition: "limit-reached", admissionCount: 10 });
+
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-source-native-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-source-turn"),
+              createdAt: "2026-09-07T13:00:00.000Z",
+              payload: {},
+              raw: {
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-source-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-source-native-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-source-turn"),
+              createdAt: "2026-09-07T13:00:01.000Z",
+              payload: { reason: "Interrupted for durable handoff." },
+              raw: {
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-source-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+
+        const handoffInput = {
+          lessons: ["Preserve exact native settlement evidence."],
+          unresolvedContext: ["Ticket 28 is the next approved delivery slice."],
+          suggestedSkills: ["implement", "code-review"],
+          suggestedStaffing: ["Sol/high implementation", "Astra/medium review"],
+        };
+        const prepared = yield* harness.workflowDirector.prepareHandoff(
+          EnvironmentId.make("workflow-environment"),
+          started.director.threadId,
+          ProviderInstanceId.make("codex"),
+          handoffInput,
+        );
+        expect(
+          yield* harness.workflowDirector.prepareHandoff(
+            EnvironmentId.make("workflow-environment"),
+            started.director.threadId,
+            ProviderInstanceId.make("codex"),
+            handoffInput,
+          ),
+        ).toMatchObject({ handoffId: prepared.handoffId, status: "waiting-settlement" });
+
+        const stoppedBeforeDispatch = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            () =>
+              Effect.fail(
+                new OrchestrationDispatchCommandError({
+                  message: "Simulated outage before engine dispatch.",
+                  bootstrapTurnDisposition: "not-accepted",
+                }),
+              ),
+          )
+          .pipe(Effect.result);
+        expect(stoppedBeforeDispatch._tag).toBe("Failure");
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-source-late-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-source-late-turn"),
+              createdAt: "2026-09-07T13:00:02.000Z",
+              payload: {},
+              raw: {
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-source-late-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-source-late-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-source-late-turn"),
+              createdAt: "2026-09-07T13:00:03.000Z",
+              payload: { reason: "Late source activity invalidated the frozen handoff." },
+              raw: {
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-source-late-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        const heldForChangedSource = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(heldForChangedSource._tag).toBe("Failure");
+        const recoveredHandoff = yield* harness.workflowDirector.prepareHandoff(
+          EnvironmentId.make("workflow-environment"),
+          started.director.threadId,
+          ProviderInstanceId.make("codex"),
+          handoffInput,
+        );
+        expect(recoveredHandoff).toMatchObject({
+          handoffId: prepared.handoffId,
+          status: "waiting-settlement",
+          successorDirectorId: null,
+        });
+
+        const crashedAfterReceipt = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            (command) =>
+              harness.dispatchWorkflow(command).pipe(
+                Effect.flatMap(() =>
+                  Effect.fail(
+                    new OrchestrationDispatchCommandError({
+                      message: "Simulated crash after the engine accepted the successor turn.",
+                    }),
+                  ),
+                ),
+              ),
+          )
+          .pipe(Effect.result);
+        expect(crashedAfterReceipt._tag).toBe("Failure");
+        yield* Effect.promise(() => harness.drain());
+        harness.advanceDirectorImplementationHead();
+
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+
+        const rotated = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(rotated).toMatchObject({
+          status: "active",
+          admissionCount: 0,
+          requestedProfile: { model: "gpt-6-astra", effort: "high" },
+          worktreePath: started.director.worktreePath,
+          handoff: {
+            handoffId: prepared.handoffId,
+            status: "submitted",
+            sourceDirectorId: started.director.directorId,
+            implementationHead: harness.directorImplementationHead,
+            admissionCount: 10,
+          },
+        });
+        expect(rotated.directorId).not.toBe(started.director.directorId);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+        expect(harness.sendTurn.mock.calls.at(-1)?.[0]).toMatchObject({
+          input: expect.stringContaining("Reread current GitHub tracker authority"),
+          modelSelection: expect.objectContaining({ model: "gpt-6-astra" }),
+        });
+
+        const continued = yield* harness.workflowDirector.admit({
+          projectId: ProjectId.make("project-1"),
+          directorId: rotated.directorId,
+          repository: "Flow-Fly/t3code",
+          ticketNumber: harness.directorTickets[10]!.number,
+          purpose: "implement",
+          ownership: "delivery-11",
+        });
+        expect(continued).toMatchObject({ disposition: "admitted", admissionCount: 1 });
+        const durableRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly currentCount: number;
+                readonly directorCount: number;
+                readonly handoffCount: number;
+              }>`SELECT
+                (SELECT count(*) FROM workflow_directors WHERE is_current = 1) AS "currentCount",
+                (SELECT count(*) FROM workflow_directors WHERE capability_number = 17) AS "directorCount",
+                (SELECT count(*) FROM workflow_director_handoffs WHERE status = 'submitted') AS "handoffCount"`;
+            }),
+          ),
+        );
+        expect({ ...durableRows[0] }).toEqual({
+          currentCount: 1,
+          directorCount: 3,
+          handoffCount: 1,
+        });
+
+        for (const [index, ticket] of harness.directorTickets.slice(0, 9).entries()) {
+          const successorAdmission = yield* harness.workflowDirector.admit({
+            projectId: ProjectId.make("project-1"),
+            directorId: rotated.directorId,
+            repository: "Flow-Fly/t3code",
+            ticketNumber: ticket.number,
+            purpose: "retry",
+            ownership: `successor-delivery-${index + 1}`,
+          });
+          expect(successorAdmission).toMatchObject({
+            disposition: "admitted",
+            admissionCount: index + 2,
+          });
+          if (index === 0) {
+            expect(successorAdmission.admission).toMatchObject({
+              claimLogin: "Flow-Fly",
+              claimStatus: "confirmed",
+            });
+          }
+        }
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-successor-native-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: rotated.threadId,
+              turnId: TurnId.make("rotation-successor-turn"),
+              createdAt: "2026-09-07T13:01:00.000Z",
+              payload: {},
+              raw: {
+                payload: {
+                  threadId: "rotation-successor-session",
+                  turn: { id: "rotation-successor-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-successor-native-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: rotated.threadId,
+              turnId: TurnId.make("rotation-successor-turn"),
+              createdAt: "2026-09-07T13:01:01.000Z",
+              payload: { reason: "Second durable handoff." },
+              raw: {
+                payload: {
+                  threadId: "rotation-successor-session",
+                  turn: { id: "rotation-successor-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+        yield* harness.workflowDirector.prepareHandoff(
+          EnvironmentId.make("workflow-environment"),
+          rotated.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            ...handoffInput,
+            lessons: ["The incoming handoff must not mask this outgoing handoff."],
+          },
+        );
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+        const third = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(third).toMatchObject({ status: "active", admissionCount: 0 });
+        expect(third.directorId).not.toBe(rotated.directorId);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(3);
+        const repeatedRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly currentCount: number;
+                readonly directorCount: number;
+                readonly handoffCount: number;
+              }>`SELECT
+                (SELECT count(*) FROM workflow_directors WHERE is_current = 1) AS "currentCount",
+                (SELECT count(*) FROM workflow_directors WHERE capability_number = 17) AS "directorCount",
+                (SELECT count(*) FROM workflow_director_handoffs WHERE status = 'submitted') AS "handoffCount"`;
+            }),
+          ),
+        );
+        expect({ ...repeatedRows[0] }).toEqual({
+          currentCount: 1,
+          directorCount: 4,
+          handoffCount: 2,
+        });
+        harness.workflowAssignees.clear();
+        const delegatedAfterRecovery = yield* harness.workflowDirector.prepareWorker(
+          EnvironmentId.make("workflow-environment"),
+          third.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            ticketNumber: harness.directorTickets[10]!.number,
+            ownership: "post-recovery worker",
+            writePaths: ["apps/server/src/workflow"],
+          },
+        );
+        expect(delegatedAfterRecovery).toMatchObject({
+          disposition: "prepared",
+          admission: { ticketNumber: harness.directorTickets[10]!.number },
+        });
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "task.started",
+              eventId: EventId.make("rotation-post-recovery-worker-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: third.threadId,
+              createdAt: "2026-09-07T13:01:59.000Z",
+              payload: {
+                taskId: RuntimeTaskId.make("rotation-post-recovery-worker"),
+                status: "running",
+                timelineBypass: true,
+                nativeTurn: {
+                  sessionId: "rotation-post-recovery-session",
+                  turnId: "rotation-post-recovery-turn",
+                  status: "running",
+                },
+              },
+            },
+          ]),
+        );
+        yield* harness.workflowDirector.associateWorker(
+          EnvironmentId.make("workflow-environment"),
+          third.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            associationToken: delegatedAfterRecovery.associationToken,
+            providerThreadId: "rotation-post-recovery-worker",
+          },
+        );
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "task.completed",
+              eventId: EventId.make("rotation-post-recovery-worker-closed"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: third.threadId,
+              createdAt: "2026-09-07T13:02:00.000Z",
+              payload: {
+                taskId: RuntimeTaskId.make("rotation-post-recovery-worker"),
+                status: "completed",
+                timelineBypass: true,
+                nativeLifecycle: "closed",
+                nativeTurn: {
+                  sessionId: "rotation-post-recovery-session",
+                  turnId: "rotation-post-recovery-turn",
+                  status: "completed",
+                },
+              },
+            },
+          ]),
+        );
+        harness.resolveDirectorTickets();
+        const completionInput = {
+          resultingHead: "b".repeat(40),
+          checks: [{ label: "combined", command: "vp test run workflow-rotation.test.ts" }],
+          receipts: [],
+        };
+        const registeredCompletion = yield* harness.workflowDirector.completeCapability(
+          EnvironmentId.make("workflow-environment"),
+          third.threadId,
+          ProviderInstanceId.make("codex"),
+          completionInput,
+        );
+        expect(registeredCompletion).toMatchObject({
+          disposition: "pending",
+          completion: { status: "checks-pending" },
+        });
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "item.started",
+              eventId: EventId.make("rotation-combined-check-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: third.threadId,
+              itemId: RuntimeItemId.make("rotation-combined-check"),
+              createdAt: "2099-09-07T13:03:00.000Z",
+              payload: {
+                itemType: "command_execution",
+                status: "inProgress",
+                data: {
+                  item: {
+                    type: "commandExecution",
+                    command: "vp test run workflow-rotation.test.ts",
+                    cwd: third.worktreePath,
+                  },
+                },
+              },
+            },
+            {
+              type: "item.completed",
+              eventId: EventId.make("rotation-combined-check-completed"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: third.threadId,
+              itemId: RuntimeItemId.make("rotation-combined-check"),
+              createdAt: "2099-09-07T13:03:01.000Z",
+              payload: {
+                itemType: "command_execution",
+                status: "completed",
+                data: {
+                  item: {
+                    type: "commandExecution",
+                    command: "vp test run workflow-rotation.test.ts",
+                    cwd: third.worktreePath,
+                    status: "completed",
+                    exitCode: 0,
+                    aggregatedOutput: "combined rotation acceptance passed",
+                  },
+                },
+              },
+            },
+          ]),
+        );
+        const completedCapability = yield* harness.workflowDirector.completeCapability(
+          EnvironmentId.make("workflow-environment"),
+          third.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            ...completionInput,
+            receipts: [{ label: "combined", toolCallId: "rotation-combined-check" }],
+          },
+        );
+        expect(completedCapability).toMatchObject({
+          disposition: "completed",
+          completion: { status: "completed", authority: "current", resultingHead: "b".repeat(40) },
+        });
       }),
   );
 

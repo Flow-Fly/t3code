@@ -199,6 +199,7 @@ function monitorLayer(input: {
       Layer.mock(WorkflowDirectorService.WorkflowDirectorService)({
         status: input.status ?? (() => Effect.succeed(directorStatus([]))),
         reassess: input.reassess ?? (() => Effect.void),
+        rotateReady: () => Effect.succeed(directorStatus([])),
       }),
     ),
     Layer.provideMerge(

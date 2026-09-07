@@ -62,7 +62,6 @@ export const recordWorkflowWorkerObservation = Effect.fn(
           SELECT director_id, ${identity.nativeSessionId}, ${identity.nativeTurnId}, ${status}, ${event.createdAt}
           FROM workflow_directors
           WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
-            AND is_current = 1
           ON CONFLICT(director_id) DO UPDATE SET
             native_session_id = excluded.native_session_id,
             native_turn_id = excluded.native_turn_id,
@@ -86,7 +85,6 @@ export const recordWorkflowWorkerObservation = Effect.fn(
               WHERE director_id IN (
                 SELECT director_id FROM workflow_directors
                 WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
-                  AND is_current = 1
               ) AND status != 'cleared'
             )
             AND (${rootStarted} OR (
@@ -138,7 +136,6 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       ${event.createdAt}, ${event.createdAt}
     FROM workflow_directors
     WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
-      AND is_current = 1
     ON CONFLICT(director_id, provider_thread_id) DO UPDATE SET
       parent_provider_thread_id = COALESCE(excluded.parent_provider_thread_id, parent_provider_thread_id),
       title = COALESCE(excluded.title, title),
@@ -212,7 +209,7 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       FROM workflow_reassessments r
       JOIN workflow_directors d ON d.director_id = r.director_id
       WHERE d.thread_id = ${event.threadId} AND d.requested_instance_id = ${event.providerInstanceId ?? ""}
-        AND d.is_current = 1 AND r.status != 'cleared'
+        AND r.status != 'cleared'
       ON CONFLICT(reassessment_id, subject_id) DO UPDATE SET
         subject_kind = excluded.subject_kind,
         parent_provider_thread_id = COALESCE(excluded.parent_provider_thread_id, parent_provider_thread_id),
@@ -254,7 +251,7 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       FROM workflow_reassessments r
       JOIN workflow_directors d ON d.director_id = r.director_id
       WHERE d.thread_id = ${event.threadId} AND d.requested_instance_id = ${event.providerInstanceId ?? ""}
-        AND d.is_current = 1 AND r.status != 'cleared'
+        AND r.status != 'cleared'
       ON CONFLICT(reassessment_id, subject_id) DO UPDATE SET
         parent_provider_thread_id = COALESCE(excluded.parent_provider_thread_id, parent_provider_thread_id),
         native_session_id = NULL, native_turn_id = NULL, interrupt_attempt_id = NULL,
@@ -296,7 +293,7 @@ export const recordWorkflowWorkerObservation = Effect.fn(
           JOIN workflow_directors d ON d.director_id = r.director_id
           WHERE d.thread_id = ${event.threadId}
             AND d.requested_instance_id = ${event.providerInstanceId ?? ""}
-            AND d.is_current = 1 AND r.status != 'cleared'
+            AND r.status != 'cleared'
         )
         AND native_session_id = ${interruption.sessionId}
         AND native_turn_id = ${interruption.turnId}
@@ -312,7 +309,7 @@ export const recordWorkflowWorkerObservation = Effect.fn(
           JOIN workflow_directors d ON d.director_id = r.director_id
           WHERE d.thread_id = ${event.threadId}
             AND d.requested_instance_id = ${event.providerInstanceId ?? ""}
-            AND d.is_current = 1 AND r.status != 'cleared'
+            AND r.status != 'cleared'
         )
     `;
       }

@@ -1,4 +1,6 @@
 import {
+  CommandId,
+  OrchestrationDispatchCommandError,
   WorkflowDirectorError,
   type ProjectId,
   type WorkflowChildrenInput,
@@ -29,6 +31,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
+import { dispatchCreatedThreadTurnStart } from "../orchestration/dispatchCreatedThreadTurnStart.ts";
 
 const REFRESH_INTERVAL = Duration.seconds(30);
 const MAX_BACKOFF = Duration.minutes(15);
@@ -102,6 +105,7 @@ interface ActiveDirectorRow {
   readonly repository: string;
   readonly capabilityNumber: number;
   readonly threadId: string;
+  readonly status: string;
   readonly projectionThreadId: string | null;
   readonly archivedAt: string | null;
   readonly deletedAt: string | null;
@@ -464,6 +468,47 @@ export const make = Effect.gen(function* () {
                     }),
                   ),
                 );
+              yield* directors
+                .rotateReady(
+                  {
+                    projectId: state.projectId,
+                    repository: state.repository,
+                    capabilityNumber: capability.number,
+                  },
+                  (command) => {
+                    const dispatch = (candidate: Parameters<typeof orchestration.dispatch>[0]) =>
+                      orchestration.dispatch(candidate).pipe(
+                        Effect.mapError(
+                          (error) =>
+                            new OrchestrationDispatchCommandError({
+                              message: "The successor director command could not be submitted.",
+                              cause: String(error),
+                            }),
+                        ),
+                      );
+                    const createThread = command.bootstrap?.createThread;
+                    if (!createThread) return dispatch(command);
+                    return dispatchCreatedThreadTurnStart({
+                      command: {
+                        ...command,
+                        bootstrap: { ...command.bootstrap, createThread },
+                      },
+                      createCommandId: Effect.succeed(
+                        CommandId.make(`workflow:successor:create:${command.commandId}`),
+                      ),
+                      dispatch,
+                      drainThreadDeletionThrough: () => Effect.void,
+                    });
+                  },
+                )
+                .pipe(
+                  Effect.catch((rotationError) =>
+                    Effect.logDebug("Workflow director rotation remains pending.", {
+                      capabilityNumber: capability.number,
+                      error: rotationError,
+                    }),
+                  ),
+                );
             }
             if (error !== null) {
               state.attemptedEpoch = capturedEpoch;
@@ -519,20 +564,29 @@ export const make = Effect.gen(function* () {
   const activeDirectors = Effect.fn("WorkflowMonitor.activeDirectors")(function* () {
     const rows = yield* sql<ActiveDirectorRow>`
       SELECT d.project_id AS "projectId", d.repository,
-        d.capability_number AS "capabilityNumber", d.thread_id AS "threadId",
+        d.capability_number AS "capabilityNumber", d.thread_id AS "threadId", d.status,
         t.thread_id AS "projectionThreadId",
         t.archived_at AS "archivedAt", t.deleted_at AS "deletedAt"
       FROM workflow_directors d
       LEFT JOIN projection_threads t ON t.thread_id = d.thread_id
       WHERE d.is_current = 1
-        AND (d.status = 'active' OR EXISTS (
+        AND ((d.status = 'active' AND d.initial_turn_disposition = 'accepted')
+          OR d.status = 'submitting'
+          OR (d.status = 'waiting' AND EXISTS (
+            SELECT 1 FROM workflow_director_handoffs h
+            WHERE h.source_director_id = d.director_id AND h.status = 'waiting-settlement'
+          ))
+          OR EXISTS (
           SELECT 1 FROM workflow_reassessments r
           WHERE r.director_id = d.director_id AND r.status != 'cleared'
         ))
-        AND d.initial_turn_disposition = 'accepted'
     `;
     const active = [];
     for (const row of rows) {
+      if (row.status === "submitting" || row.status === "waiting") {
+        active.push(row);
+        continue;
+      }
       if (row.projectionThreadId !== null && row.archivedAt === null && row.deletedAt === null) {
         active.push(row);
         continue;
@@ -642,6 +696,7 @@ export const make = Effect.gen(function* () {
   yield* Effect.forEach([0, 1, 2, 3], () => refreshWorker.pipe(Effect.forkScoped), {
     discard: true,
   });
+  yield* refreshDueRepositories().pipe(Effect.ignoreCause({ log: true }));
   yield* Effect.forever(
     Effect.sleep(REFRESH_INTERVAL).pipe(
       Effect.andThen(refreshDueRepositories),

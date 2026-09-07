@@ -534,6 +534,30 @@ function WorkflowDetails(props: {
             observed {director.observedProfile.model ?? "unknown"}/
             {director.observedProfile.effort ?? "unknown"} ({director.observedProfile.match})
           </p>
+          {director.handoff ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Director handoff</h4>
+              <p className="mt-1 text-xs">
+                Batch {director.handoff.sourceBatchId} · {director.handoff.status} ·{" "}
+                {director.handoff.admissionCount} admitted slots
+              </p>
+              <p className="mt-1 text-muted-foreground text-xs">
+                {director.handoff.requiredAction}
+              </p>
+              {director.handoff.implementationHead ? (
+                <p className="mt-1 break-all text-muted-foreground text-xs">
+                  Source head {director.handoff.implementationHead}
+                </p>
+              ) : null}
+              {director.handoff.unresolvedContext.length > 0 ? (
+                <ul className="mt-1 list-disc pl-4 text-muted-foreground text-xs">
+                  {director.handoff.unresolvedContext.map((entry) => (
+                    <li key={entry}>{entry}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
           {director.reassessment ? (
             <div className="mt-2 border-border border-t pt-2">
               <h4 className="font-medium text-xs">Reassessment</h4>

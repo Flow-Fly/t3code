@@ -2,6 +2,8 @@ import {
   WorkflowCapabilityCompleteInput,
   WorkflowCapabilityCompleteResult,
   WorkflowDirectorError,
+  WorkflowDirectorHandoffPrepareInput,
+  WorkflowDirectorHandoffStatus,
   WorkflowQueryError,
   WorkflowWorkerAssociateInput,
   WorkflowWorkerHandoffInput,
@@ -123,6 +125,15 @@ export const WorkflowCompleteCapabilityTool = Tool.make("workflow_complete_capab
   dependencies,
 });
 
+export const WorkflowPrepareDirectorHandoffTool = Tool.make("workflow_prepare_director_handoff", {
+  description:
+    "Record the current ten-slot director's useful lessons and unresolved context. T3 computes the authoritative admissions, outcomes, links, worktree, and implementation head, then automatically starts a successor only after live authority and exact native settlement are verified.",
+  parameters: WorkflowDirectorHandoffPrepareInput,
+  success: WorkflowDirectorHandoffStatus,
+  failure: WorkflowWorkerFailure,
+  dependencies,
+});
+
 export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowPrepareWorkerTool,
   WorkflowAssociateWorkerTool,
@@ -134,4 +145,5 @@ export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowRecordReviewDispositionsTool,
   WorkflowResolveTicketTool,
   WorkflowCompleteCapabilityTool,
+  WorkflowPrepareDirectorHandoffTool,
 );
