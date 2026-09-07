@@ -1419,7 +1419,7 @@ describe("ProviderCommandReactor", () => {
   );
 
   effectIt.effect(
-    "delivers a reassessment interrupt through the real reactor and rejects premature resume",
+    "recovers reassessment through the real reactor without clearing projected native activity",
     () =>
       Effect.gen(function* () {
         const harness = yield* Effect.promise(() => createHarness());
@@ -1857,6 +1857,66 @@ describe("ProviderCommandReactor", () => {
         yield* Effect.promise(() =>
           harness.emitProviderEvents([
             nativeEvents("conflicting-child", "interrupted", "conflicting-child-interrupted"),
+          ]),
+        );
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("unrelated-root-projection-before-writer"),
+          threadId: started.director.threadId,
+          session: {
+            threadId: started.director.threadId,
+            status: "running",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: TurnId.make("unrelated-native-turn"),
+            lastError: null,
+            updatedAt: "2026-09-07T12:04:01.000Z",
+          },
+          createdAt: "2026-09-07T12:04:01.000Z",
+        });
+        const heldForProjectedRoot = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(heldForProjectedRoot.status).toBe("held");
+        expect(heldForProjectedRoot.reassessment).not.toBeNull();
+
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("unrelated-native-turn-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("unrelated-native-turn"),
+              createdAt: "2026-09-07T12:04:02.000Z",
+              payload: {},
+              raw: {
+                payload: {
+                  threadId: "director-native-session",
+                  turn: { id: "unrelated-native-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("unrelated-native-turn-interrupted"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("unrelated-native-turn"),
+              createdAt: "2026-09-07T12:04:03.000Z",
+              payload: { reason: "Interrupted after projected activity was reconciled." },
+              raw: {
+                payload: {
+                  threadId: "director-native-session",
+                  turn: { id: "unrelated-native-turn" },
+                },
+              },
+            },
           ]),
         );
         const recovered = yield* harness.workflowDirector.status({

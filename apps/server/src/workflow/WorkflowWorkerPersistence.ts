@@ -54,44 +54,47 @@ export const recordWorkflowWorkerObservation = Effect.fn(
             ? "failed"
             : "completed";
     const rootStarted = status === "running" ? 1 : 0;
-    yield* sql`
-      INSERT INTO workflow_director_native_turns
-        (director_id, native_session_id, native_turn_id, status, updated_at)
-      SELECT director_id, ${identity.nativeSessionId}, ${identity.nativeTurnId}, ${status}, ${event.createdAt}
-      FROM workflow_directors
-      WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
-        AND is_current = 1
-      ON CONFLICT(director_id) DO UPDATE SET
-        native_session_id = excluded.native_session_id,
-        native_turn_id = excluded.native_turn_id,
-        status = excluded.status,
-        updated_at = excluded.updated_at
-      WHERE ${rootStarted}
-        OR (workflow_director_native_turns.native_session_id = excluded.native_session_id
-          AND workflow_director_native_turns.native_turn_id = excluded.native_turn_id)
-    `;
-    yield* sql`
-      UPDATE workflow_interruption_subjects
-      SET native_session_id = ${identity.nativeSessionId}, native_turn_id = ${identity.nativeTurnId},
-        interrupt_attempt_id = CASE WHEN ${rootStarted} THEN NULL ELSE interrupt_attempt_id END,
-        request_status = CASE WHEN ${rootStarted} THEN 'not-issued' ELSE request_status END,
-        outcome = ${status === "running" ? "resumed" : "stopped"},
-        detail = ${status === "interrupted" ? "The matching native director turn reported interrupted." : status === "running" ? "The director started another native turn while reassessment remains active." : `The matching native director turn ended with status ${status}.`},
-        updated_at = ${event.createdAt}
-      WHERE subject_kind = 'director'
-        AND reassessment_id IN (
-          SELECT reassessment_id FROM workflow_reassessments
-          WHERE director_id IN (
-            SELECT director_id FROM workflow_directors
-            WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
-              AND is_current = 1
-          ) AND status != 'cleared'
-        )
-        AND (${rootStarted} OR (
-          native_session_id = ${identity.nativeSessionId} AND native_turn_id = ${identity.nativeTurnId}
-        ))
-    `;
-    return;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`
+          INSERT INTO workflow_director_native_turns
+            (director_id, native_session_id, native_turn_id, status, updated_at)
+          SELECT director_id, ${identity.nativeSessionId}, ${identity.nativeTurnId}, ${status}, ${event.createdAt}
+          FROM workflow_directors
+          WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
+            AND is_current = 1
+          ON CONFLICT(director_id) DO UPDATE SET
+            native_session_id = excluded.native_session_id,
+            native_turn_id = excluded.native_turn_id,
+            status = excluded.status,
+            updated_at = excluded.updated_at
+          WHERE ${rootStarted}
+            OR (workflow_director_native_turns.native_session_id = excluded.native_session_id
+              AND workflow_director_native_turns.native_turn_id = excluded.native_turn_id)
+        `;
+        yield* sql`
+          UPDATE workflow_interruption_subjects
+          SET native_session_id = ${identity.nativeSessionId}, native_turn_id = ${identity.nativeTurnId},
+            interrupt_attempt_id = CASE WHEN ${rootStarted} THEN NULL ELSE interrupt_attempt_id END,
+            request_status = CASE WHEN ${rootStarted} THEN 'not-issued' ELSE request_status END,
+            outcome = ${status === "running" ? "resumed" : "stopped"},
+            detail = ${status === "interrupted" ? "The matching native director turn reported interrupted." : status === "running" ? "The director started another native turn while reassessment remains active." : `The matching native director turn ended with status ${status}.`},
+            updated_at = ${event.createdAt}
+          WHERE subject_kind = 'director'
+            AND reassessment_id IN (
+              SELECT reassessment_id FROM workflow_reassessments
+              WHERE director_id IN (
+                SELECT director_id FROM workflow_directors
+                WHERE thread_id = ${event.threadId} AND requested_instance_id = ${event.providerInstanceId ?? ""}
+                  AND is_current = 1
+              ) AND status != 'cleared'
+            )
+            AND (${rootStarted} OR (
+              native_session_id = ${identity.nativeSessionId} AND native_turn_id = ${identity.nativeTurnId}
+            ))
+        `;
+      }),
+    );
   }
   if (
     event.type !== "task.started" &&
@@ -120,7 +123,9 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       ? 1
       : 0;
 
-  yield* sql`
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* sql`
     INSERT INTO workflow_worker_observations (
       director_id, provider_thread_id, parent_provider_thread_id, title, role, agent_path,
       observed_model, observed_effort, provider_status, native_lifecycle, last_event_kind,
@@ -176,8 +181,8 @@ export const recordWorkflowWorkerObservation = Effect.fn(
     WHERE excluded.updated_at >= workflow_worker_observations.updated_at
   `;
 
-  if (nativeTurn) {
-    yield* sql`
+      if (nativeTurn) {
+        yield* sql`
       INSERT INTO workflow_interruption_subjects (
         reassessment_id, subject_id, subject_kind, provider_thread_id, parent_provider_thread_id,
         native_session_id, native_turn_id, interrupt_attempt_id, request_status, outcome, detail,
@@ -220,9 +225,9 @@ export const recordWorkflowWorkerObservation = Effect.fn(
       WHERE ${childStarted}
         OR (native_session_id = excluded.native_session_id AND native_turn_id = excluded.native_turn_id)
     `;
-  }
-  if (!nativeTurn && status === "running") {
-    yield* sql`
+      }
+      if (!nativeTurn && status === "running") {
+        yield* sql`
       INSERT INTO workflow_interruption_subjects (
         reassessment_id, subject_id, subject_kind, provider_thread_id, parent_provider_thread_id,
         request_status, outcome, detail, discovered_at, updated_at
@@ -257,19 +262,20 @@ export const recordWorkflowWorkerObservation = Effect.fn(
         updated_at = excluded.updated_at
       WHERE excluded.updated_at >= workflow_interruption_subjects.updated_at
     `;
-  }
-  const interruption = payload.nativeInterruption;
-  if (interruption) {
-    const confirmsStopped = interruption.completionStatus === "interrupted" ? 1 : 0;
-    const outcome =
-      interruption.completionStatus === "interrupted"
-        ? "stopped"
-        : interruption.requestStatus === "failed"
-          ? "failed"
-          : interruption.requestStatus === "unknown" || interruption.requestStatus === "not-issued"
-            ? "unknown"
-            : "stopping";
-    yield* sql`
+      }
+      const interruption = payload.nativeInterruption;
+      if (interruption) {
+        const confirmsStopped = interruption.completionStatus === "interrupted" ? 1 : 0;
+        const outcome =
+          interruption.completionStatus === "interrupted"
+            ? "stopped"
+            : interruption.requestStatus === "failed"
+              ? "failed"
+              : interruption.requestStatus === "unknown" ||
+                  interruption.requestStatus === "not-issued"
+                ? "unknown"
+                : "stopping";
+        yield* sql`
       UPDATE workflow_interruption_subjects
       SET interrupt_attempt_id = ${interruption.attemptId},
         request_status = ${interruption.requestStatus},
@@ -295,9 +301,9 @@ export const recordWorkflowWorkerObservation = Effect.fn(
         AND native_session_id = ${interruption.sessionId}
         AND native_turn_id = ${interruption.turnId}
     `;
-  }
-  if (nativeLifecycle === "closed") {
-    yield* sql`
+      }
+      if (nativeLifecycle === "closed") {
+        yield* sql`
       UPDATE workflow_interruption_subjects SET outcome = 'closed',
         detail = 'The native child thread closed.', updated_at = ${event.createdAt}
       WHERE subject_id = ${payload.taskId}
@@ -309,5 +315,7 @@ export const recordWorkflowWorkerObservation = Effect.fn(
             AND d.is_current = 1 AND r.status != 'cleared'
         )
     `;
-  }
+      }
+    }),
+  );
 });

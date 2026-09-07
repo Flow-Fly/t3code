@@ -59,6 +59,88 @@ function childEvent(
   };
 }
 
+it.effect("child identity and hold observation roll back together", () =>
+  Effect.gen(function* () {
+    const sql = yield* seed;
+    yield* sql`CREATE TRIGGER fail_child_subject BEFORE INSERT ON workflow_interruption_subjects
+      BEGIN SELECT RAISE(FAIL, 'injected child subject write failure'); END`;
+
+    const result = yield* recordWorkflowWorkerObservation({
+      type: "task.updated",
+      eventId: EventId.make("new-child"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      threadId: ThreadId.make("thread"),
+      createdAt: "2026-09-07T00:00:02Z",
+      payload: {
+        taskId: RuntimeTaskId.make("child"),
+        status: "running",
+        timelineBypass: true,
+        nativeTurn: {
+          sessionId: "native-child",
+          turnId: "new-turn",
+          status: "running",
+        },
+      },
+    }).pipe(Effect.result);
+
+    NodeAssert.equal(result._tag, "Failure");
+    const observations = yield* sql`
+      SELECT * FROM workflow_worker_observations WHERE provider_thread_id = 'child'
+    `;
+    const subjects = yield* sql`
+      SELECT * FROM workflow_interruption_subjects WHERE subject_id = 'child'
+    `;
+    NodeAssert.equal(subjects.length, 0);
+    NodeAssert.equal(
+      observations.length,
+      0,
+      "a committed running identity cannot exist without its hold observation",
+    );
+  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
+it.effect("root identity and hold observation roll back together", () =>
+  Effect.gen(function* () {
+    const sql = yield* seed;
+    yield* sql`INSERT INTO workflow_interruption_subjects
+      (reassessment_id,subject_id,subject_kind,native_session_id,native_turn_id,request_status,outcome,discovered_at,updated_at)
+      VALUES ('reassessment','director','director','native-session','old-turn','acknowledged','stopped','2026-09-07T00:00:01Z','2026-09-07T00:00:01Z')`;
+    yield* sql`CREATE TRIGGER fail_root_subject BEFORE UPDATE ON workflow_interruption_subjects
+      BEGIN SELECT RAISE(FAIL, 'injected root subject write failure'); END`;
+
+    const result = yield* recordWorkflowWorkerObservation({
+      type: "turn.started",
+      eventId: EventId.make("new-root"),
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      threadId: ThreadId.make("thread"),
+      turnId: TurnId.make("new-turn"),
+      createdAt: "2026-09-07T00:00:02Z",
+      payload: {},
+      raw: {
+        source: "codex.app-server.notification",
+        method: "turn/started",
+        payload: { threadId: "native-session", turn: { id: "new-turn" } },
+      },
+    }).pipe(Effect.result);
+
+    NodeAssert.equal(result._tag, "Failure");
+    const observations = yield* sql`
+      SELECT * FROM workflow_director_native_turns WHERE director_id = 'director'
+    `;
+    const subjects = yield* sql<{ outcome: string }>`
+      SELECT outcome FROM workflow_interruption_subjects WHERE subject_id = 'director'
+    `;
+    NodeAssert.equal(subjects[0]?.outcome, "stopped");
+    NodeAssert.equal(
+      observations.length,
+      0,
+      "a committed running root cannot coexist with its previous stopped hold observation",
+    );
+  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
 it.effect("a late old child completion cannot settle newer observed running work", () =>
   Effect.gen(function* () {
     const sql = yield* seed;

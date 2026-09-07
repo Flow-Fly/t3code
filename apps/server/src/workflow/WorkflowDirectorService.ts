@@ -5,6 +5,7 @@ import {
   MessageId,
   type OrchestrationCommand,
   type OrchestrationDispatchCommandError,
+  type OrchestrationThreadShell,
   ProjectId,
   ProviderInstanceId,
   ProviderDriverKind,
@@ -73,6 +74,16 @@ const WORKER_EFFORT = "high";
 const REVIEWER_MODEL = "gpt-6-astra";
 const REVIEWER_EFFORT = "medium";
 const REQUIRED_SKILLS = ["implement", "code-review"] as const;
+
+function rootTurnIsSettled(shell: OrchestrationThreadShell) {
+  return (
+    shell.latestTurn != null &&
+    shell.latestTurn.state !== "running" &&
+    shell.session?.activeTurnId == null &&
+    shell.session?.status !== "running" &&
+    shell.session?.status !== "starting"
+  );
+}
 
 type Dispatch = (
   command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
@@ -2034,13 +2045,7 @@ export const make = Effect.gen(function* () {
       );
     const actions: Array<WorkflowDirectorStatus["actions"][number]> = [];
     if (Option.isSome(shell)) actions.push("open");
-    const rootTurnIsSettled =
-      Option.isSome(shell) &&
-      shell.value.latestTurn != null &&
-      shell.value.latestTurn.state !== "running" &&
-      shell.value.session?.activeTurnId == null &&
-      shell.value.session?.status !== "running" &&
-      shell.value.session?.status !== "starting";
+    const hasSettledRoot = Option.isSome(shell) && rootTurnIsSettled(shell.value);
     if (
       (row.status === "held" || row.status === "preparing-worktree") &&
       row.initialTurnDisposition === "not-attempted"
@@ -2049,7 +2054,7 @@ export const make = Effect.gen(function* () {
     }
     if (
       reassessment &&
-      rootTurnIsSettled &&
+      hasSettledRoot &&
       reassessment.subjects.every(
         (subject) => subject.outcome === "stopped" || subject.outcome === "closed",
       )
@@ -2059,7 +2064,7 @@ export const make = Effect.gen(function* () {
       actions.push("stop");
     } else if (
       row.status === "active" &&
-      rootTurnIsSettled &&
+      hasSettledRoot &&
       Option.isSome(shell) &&
       (shell.value.latestTurn?.state === "interrupted" || shell.value.latestTurn?.state === "error")
     ) {
@@ -2935,6 +2940,7 @@ export const make = Effect.gen(function* () {
               readonly status: string;
               readonly triggerCount: number;
               readonly unsettledCount: number;
+              readonly projectedUnsettledCount: number;
             }>`
               SELECT r.status,
                 (SELECT COUNT(*) FROM workflow_reassessment_triggers t
@@ -2959,7 +2965,33 @@ export const make = Effect.gen(function* () {
                             WHERE resume_id = ${resume.resumeId}
                           )
                       )
-                    )) AS "unsettledCount"
+                    )) AS "unsettledCount",
+                (SELECT COUNT(*) FROM projection_thread_sessions session
+                  WHERE session.thread_id = (
+                    SELECT thread_id FROM workflow_directors
+                    WHERE director_id = ${resume.directorId}
+                  )
+                    AND (session.status IN ('running', 'starting')
+                      OR session.active_turn_id IS NOT NULL)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM projection_turns turn
+                      JOIN orchestration_command_receipts receipt
+                        ON receipt.command_id = ${resume.commandId}
+                          AND receipt.status = 'accepted'
+                      WHERE turn.thread_id = session.thread_id
+                        AND turn.pending_message_id = (
+                          SELECT message_id FROM workflow_director_resumes
+                          WHERE resume_id = ${resume.resumeId}
+                        )
+                        AND (
+                          (session.status = 'starting' AND session.active_turn_id IS NULL
+                            AND turn.turn_id IS NULL AND turn.state = 'pending'
+                            AND turn.checkpoint_turn_count IS NULL)
+                          OR (session.status = 'running'
+                            AND session.active_turn_id IS NOT NULL
+                            AND turn.turn_id = session.active_turn_id)
+                        )
+                    )) AS "projectedUnsettledCount"
               FROM workflow_reassessments r
               WHERE r.reassessment_id = ${resume.reassessmentId}
               LIMIT 1
@@ -2973,7 +3005,8 @@ export const make = Effect.gen(function* () {
               resume.admissionScopesJson !== null &&
               resume.reassessmentTriggerCount !== null &&
               reassessment.triggerCount === resume.reassessmentTriggerCount &&
-              reassessment.unsettledCount === 0;
+              reassessment.unsettledCount === 0 &&
+              reassessment.projectedUnsettledCount === 0;
             if (!canClear) {
               const detail =
                 "The accepted resume remains held because newer native activity or reassessment evidence needs interruption and review.";
@@ -3283,9 +3316,38 @@ export const make = Effect.gen(function* () {
       prepared.breakdownApproval.approvedContent ?? "",
     );
     const admissionScopesJson = encodeResumeAdmissionScopesJson(refreshedAdmissionScopes);
-    yield* persistence(
+    const resumeDecision = yield* persistence(
       sql.withTransaction(
         Effect.gen(function* () {
+          const currentShell = yield* projection.getThreadShellById(ThreadId.make(row.threadId));
+          if (Option.isNone(currentShell) || !rootTurnIsSettled(currentShell.value)) {
+            return "root-active" as const;
+          }
+          if (reassessment) {
+            const validationRows = yield* sql<{
+              readonly triggerCount: number;
+              readonly unsettledCount: number;
+            }>`
+              SELECT
+                (SELECT COUNT(*) FROM workflow_reassessment_triggers t
+                  WHERE t.reassessment_id = r.reassessment_id) AS "triggerCount",
+                (SELECT COUNT(*) FROM workflow_interruption_subjects s
+                  WHERE s.reassessment_id = r.reassessment_id
+                    AND s.outcome NOT IN ('stopped', 'closed')) AS "unsettledCount"
+              FROM workflow_reassessments r
+              WHERE r.reassessment_id = ${reassessment.reassessmentId}
+                AND r.director_id = ${row.directorId} AND r.status != 'cleared'
+              LIMIT 1
+            `;
+            const validation = validationRows[0];
+            if (
+              !validation ||
+              validation.triggerCount !== reassessmentTriggerCount ||
+              validation.unsettledCount > 0
+            ) {
+              return "reassessment-changed" as const;
+            }
+          }
           yield* sql`
             INSERT INTO workflow_director_resumes (
               resume_id, director_id, source_turn_id, command_id, message_id, status,
@@ -3296,38 +3358,25 @@ export const make = Effect.gen(function* () {
               ${breakdownFingerprint}, ${admissionScopesJson}, ${reassessmentTriggerCount},
               ${createdAt}, ${createdAt})
           `;
-          if (!reassessment) return;
-          const validationRows = yield* sql<{
-            readonly triggerCount: number;
-            readonly unsettledCount: number;
-          }>`
-            SELECT
-              (SELECT COUNT(*) FROM workflow_reassessment_triggers t
-                WHERE t.reassessment_id = r.reassessment_id) AS "triggerCount",
-              (SELECT COUNT(*) FROM workflow_interruption_subjects s
-                WHERE s.reassessment_id = r.reassessment_id
-                  AND s.outcome NOT IN ('stopped', 'closed')) AS "unsettledCount"
-            FROM workflow_reassessments r
-            WHERE r.reassessment_id = ${reassessment.reassessmentId}
-              AND r.director_id = ${row.directorId} AND r.status != 'cleared'
-            LIMIT 1
-          `;
-          const validation = validationRows[0];
-          if (
-            !validation ||
-            validation.triggerCount !== reassessmentTriggerCount ||
-            validation.unsettledCount > 0
-          ) {
-            return yield* directorError(
-              "not-ready",
-              "Native activity or reassessment evidence changed while Resume was being prepared.",
-              "Interrupt and settle every current subject, then reassess before retrying Resume.",
-            );
-          }
+          return "saved" as const;
         }),
       ),
       "The director resume decision could not be saved.",
     );
+    if (resumeDecision === "root-active") {
+      return yield* directorError(
+        "not-ready",
+        "The director thread started new work while Resume was being prepared.",
+        "Interrupt and settle the current root turn, then refresh before retrying Resume.",
+      );
+    }
+    if (resumeDecision === "reassessment-changed") {
+      return yield* directorError(
+        "not-ready",
+        "Native activity or reassessment evidence changed while Resume was being prepared.",
+        "Interrupt and settle every current subject, then reassess before retrying Resume.",
+      );
+    }
     const command = {
       type: "thread.turn.start" as const,
       commandId,

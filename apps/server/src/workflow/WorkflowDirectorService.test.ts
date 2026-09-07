@@ -2644,6 +2644,7 @@ describe("WorkflowDirectorService", () => {
       const githubCalls: ReadonlyArray<string>[] = [];
       let shell: Option.Option<unknown> = Option.none();
       let resumeThreadId: ThreadId | undefined;
+      let triggerProjectedRoot = false;
       let triggerLateChild = false;
       const test = harness({
         capability: liveCapability,
@@ -2652,7 +2653,14 @@ describe("WorkflowDirectorService", () => {
         githubExecute: ({ args }) =>
           Effect.gen(function* () {
             githubCalls.push(args);
-            if (triggerLateChild && args.includes("--remove-label")) {
+            if (triggerProjectedRoot && args.includes("--remove-label")) {
+              triggerProjectedRoot = false;
+              shell = Option.some({
+                id: resumeThreadId!,
+                latestTurn: { turnId: "projected-root", state: "active" },
+                session: { status: "running", activeTurnId: "projected-root" },
+              });
+            } else if (triggerLateChild && args.includes("--remove-label")) {
               triggerLateChild = false;
               yield* recordWorkflowWorkerObservation({
                 type: "task.updated",
@@ -2998,6 +3006,9 @@ describe("WorkflowDirectorService", () => {
           payload: { state: "completed" },
           raw: { payload: { threadId: "native-director", turn: { id: "native-root-turn" } } },
         } as ProviderRuntimeEvent);
+        yield* sql`UPDATE projection_thread_sessions
+          SET status = 'interrupted', active_turn_id = NULL
+          WHERE thread_id = ${started.director.threadId}`;
         yield* sql`UPDATE workflow_interruption_subjects SET outcome = 'stopped',
         request_status = 'acknowledged', detail = 'Matching native child turns ended.'
         WHERE reassessment_id = ${held.reassessment!.reassessmentId} AND subject_kind != 'director'`;
@@ -3008,6 +3019,35 @@ describe("WorkflowDirectorService", () => {
         });
         const resumable = yield* service.status({ projectId, repository, capabilityNumber: 17 });
         expect(resumable.actions).toContain("resume");
+
+        triggerProjectedRoot = true;
+        const projectedRootResume = yield* service
+          .resume(
+            {
+              projectId,
+              repository,
+              capabilityNumber: 17,
+              directorId: started.director.directorId,
+              observation: resumable.observation,
+              modelSelection,
+            },
+            test.dispatch,
+          )
+          .pipe(Effect.result);
+        expect(triggerProjectedRoot).toBe(false);
+        expect(projectedRootResume._tag).toBe("Failure");
+
+        shell = Option.some({
+          id: started.director.threadId,
+          latestTurn: { turnId: "orchestration-turn", state: "completed" },
+          session: { status: "interrupted", activeTurnId: null },
+        });
+        const resumableAfterProjectedRoot = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(resumableAfterProjectedRoot.actions).toContain("resume");
         triggerLateChild = true;
         const racedResume = yield* service
           .resume(
@@ -3016,7 +3056,7 @@ describe("WorkflowDirectorService", () => {
               repository,
               capabilityNumber: 17,
               directorId: started.director.directorId,
-              observation: resumable.observation,
+              observation: resumableAfterProjectedRoot.observation,
               modelSelection,
             },
             test.dispatch,
@@ -3076,48 +3116,56 @@ describe("WorkflowDirectorService", () => {
           repository,
           capabilityNumber: 17,
         });
-        const resumed = yield* service.resume(
-          {
-            projectId,
-            repository,
-            capabilityNumber: 17,
-            directorId: started.director.directorId,
-            observation: resumableAgain.observation,
-            modelSelection,
-          },
-          (command) =>
-            Effect.gen(function* () {
-              yield* sql`INSERT INTO orchestration_command_receipts (
+        const finalResumeInput = {
+          projectId,
+          repository,
+          capabilityNumber: 17,
+          directorId: started.director.directorId,
+          observation: resumableAgain.observation,
+          modelSelection,
+        };
+        let acceptedMessageId: MessageId | undefined;
+        const resumed = yield* service.resume(finalResumeInput, (command) =>
+          Effect.gen(function* () {
+            acceptedMessageId = command.message.messageId;
+            yield* sql`INSERT INTO orchestration_command_receipts (
                 command_id, aggregate_kind, aggregate_id, accepted_at,
                 result_sequence, status, error
               ) VALUES (${command.commandId}, 'thread', ${command.threadId},
                 '2026-09-07T12:03:03.000Z', 503, 'accepted', NULL)`;
-              yield* sql`INSERT INTO projection_turns (
+            yield* sql`INSERT INTO projection_turns (
                 thread_id, turn_id, pending_message_id, state, requested_at,
                 checkpoint_files_json
-              ) VALUES (${command.threadId}, 'native-resume-turn', ${command.message.messageId},
+              ) VALUES (${command.threadId}, 'unrelated-root', 'unrelated-message',
                 'running', '2026-09-07T12:03:03.000Z', '[]')`;
-              yield* recordWorkflowWorkerObservation({
-                type: "turn.started",
-                eventId: EventId.make("expected-resume-root-started"),
-                provider: ProviderDriverKind.make("codex"),
-                providerInstanceId: instanceId,
-                threadId: command.threadId,
-                turnId: TurnId.make("native-resume-turn"),
-                createdAt: "2026-09-07T12:03:03.000Z",
-                payload: {},
-                raw: {
-                  payload: {
-                    threadId: "native-director",
-                    turn: { id: "native-resume-turn" },
-                  },
-                },
-              } as ProviderRuntimeEvent);
-              return { sequence: 503 };
-            }),
+            yield* sql`UPDATE projection_thread_sessions
+                SET status = 'running', active_turn_id = 'unrelated-root'
+                WHERE thread_id = ${command.threadId}`;
+            return { sequence: 503 };
+          }),
         );
-        expect(resumed.status).toBe("active");
-        expect(resumed.reassessment).toBeNull();
+        expect(resumed.status).toBe("held");
+        expect(resumed.reassessment).not.toBeNull();
+
+        yield* sql`DELETE FROM projection_turns
+          WHERE thread_id = ${started.director.threadId}`;
+        yield* sql`INSERT INTO projection_turns (
+          thread_id, turn_id, pending_message_id, state, requested_at, checkpoint_files_json
+        ) VALUES (${started.director.threadId}, NULL, ${acceptedMessageId!}, 'pending',
+          '2026-09-07T12:03:03.000Z', '[]')`;
+        yield* sql`UPDATE projection_thread_sessions
+          SET status = 'starting', active_turn_id = NULL
+          WHERE thread_id = ${started.director.threadId}`;
+        shell = Option.some({
+          id: started.director.threadId,
+          latestTurn: { turnId: "orchestration-turn", state: "completed" },
+          session: { status: "starting", activeTurnId: null },
+        });
+
+        const reconciled = yield* service.resume(finalResumeInput, test.dispatch);
+        expect(reconciled.status).toBe("active");
+        expect(reconciled.reassessment).toBeNull();
+        expect(test.commands).toHaveLength(1);
       }).pipe(Effect.provide(test.layer));
     },
   );
