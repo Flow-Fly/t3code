@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
@@ -186,7 +193,58 @@ function layer(githubExecute: GitHubCli.GitHubCli["Service"]["execute"], gitStdo
   );
 }
 
+const actualProjectionLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
+  Layer.provide(ThreadBackgroundLiveness.layer),
+  Layer.provide(ThreadPlanProgress.layer),
+  Layer.provideMerge(RepositoryIdentityResolver.layer),
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(NodeServices.layer),
+);
+
 describe("WorkflowService", () => {
+  it.effect("validates current project existence without calling GitHub", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>(() =>
+      Effect.die("GitHub must not be called"),
+    );
+    const validationLayer = Layer.effect(
+      WorkflowService.WorkflowService,
+      WorkflowService.make,
+    ).pipe(
+      Layer.provideMerge(actualProjectionLayer),
+      Layer.provide(
+        Layer.mock(ProcessRunner.ProcessRunner)({
+          run: () => Effect.die("git must not be called"),
+        }),
+      ),
+      Layer.provide(Layer.mock(GitHubCli.GitHubCli)({ execute })),
+    );
+
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const service = yield* WorkflowService.WorkflowService;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        ) VALUES (
+          'project-1', 'Project 1', '/tmp/project-1', NULL,
+          '[]', '2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z', NULL
+        )
+      `;
+
+      yield* service.validateProject("project-1" as never);
+      yield* sql`
+        UPDATE projection_projects
+        SET deleted_at = '2026-09-07T00:01:00.000Z'
+        WHERE project_id = 'project-1'
+      `;
+      const deleted = yield* service.validateProject("project-1" as never).pipe(Effect.flip);
+
+      expect(deleted.failure).toBe("project-not-found");
+      expect(execute).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(validationLayer));
+  });
+
   it.effect("returns every GitHub remote so fork/upstream selection stays explicit", () =>
     Effect.gen(function* () {
       const service = yield* WorkflowService.WorkflowService;

@@ -340,6 +340,7 @@ function mapGitHubError(error: GitHubCli.GitHubCliError): WorkflowQueryError {
 export class WorkflowService extends Context.Service<
   WorkflowService,
   {
+    readonly validateProject: (projectId: ProjectId) => Effect.Effect<void, WorkflowQueryError>;
     readonly repositories: (
       input: WorkflowRepositoriesInput,
     ) => Effect.Effect<WorkflowRepositoriesResult, WorkflowQueryError>;
@@ -379,6 +380,12 @@ export const make = Effect.gen(function* () {
         Effect.fail(queryError("project-not-found", "This project is no longer available.")),
       onSome: Effect.succeed,
     });
+  });
+
+  const validateProject = Effect.fn("WorkflowService.validateProject")(function* (
+    projectId: ProjectId,
+  ) {
+    yield* project(projectId);
   });
 
   const executeGraphQl = Effect.fn("WorkflowService.executeGraphQl")(function* (input: {
@@ -1199,7 +1206,15 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkflowService.of({ repositories, roots, children, issueDetail, search, locate });
+  return WorkflowService.of({
+    validateProject,
+    repositories,
+    roots,
+    children,
+    issueDetail,
+    search,
+    locate,
+  });
 });
 
 export const layer = Layer.effect(WorkflowService, make).pipe(Layer.provide(GitHubCli.layer));

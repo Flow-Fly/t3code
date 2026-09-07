@@ -53,7 +53,56 @@ function roots(title: string): WorkflowRootsResult {
   };
 }
 
-function directorStatus(workers: WorkflowDirectorStatus["workers"]): WorkflowDirectorStatus {
+type ReviewStatus = NonNullable<WorkflowDirectorStatus["reviews"]>[number];
+
+function reviewStatus(input: {
+  readonly status: ReviewStatus["status"];
+  readonly association?: ReviewStatus["association"];
+  readonly providerThreadId?: string | null;
+  readonly settlementEvidence?: ReviewStatus["settlementEvidence"];
+  readonly axes?: ReviewStatus["axes"];
+}): ReviewStatus {
+  return {
+    reviewId: "review-1",
+    admissionId: "admission-review-1",
+    ticketNumber: 21,
+    implementationProviderThreadId: "implementation-thread",
+    fixedBase: "base",
+    implementationHead: "head",
+    status: input.status,
+    association: input.association ?? "unconfirmed",
+    providerThreadId: input.providerThreadId ?? null,
+    parentProviderThreadId: "implementation-thread",
+    providerStatus: "idle",
+    settlementEvidence: input.settlementEvidence ?? null,
+    requestedProfile: { model: "gpt-6-astra", effort: "high", skillPath: "/implement" },
+    observedProfile: { model: "gpt-6-astra", effort: "high", match: "match" },
+    checks: [],
+    axes: input.axes ?? [],
+    findings: [],
+    summary: null,
+    updatedAt: "2026-09-07T10:00:00.000Z",
+  };
+}
+
+function reviewAxis(
+  axis: "standards" | "spec",
+  settlementEvidence: "native-closed" | null,
+): ReviewStatus["axes"][number] {
+  return {
+    axis,
+    providerThreadId: `${axis}-thread`,
+    parentProviderThreadId: "review-thread",
+    providerStatus: settlementEvidence === "native-closed" ? "closed" : "idle",
+    settlementEvidence,
+    observedProfile: { model: "gpt-6-astra", effort: "high", match: "match" },
+  };
+}
+
+function directorStatus(
+  workers: WorkflowDirectorStatus["workers"],
+  reviews: WorkflowDirectorStatus["reviews"] = [],
+): WorkflowDirectorStatus {
   return {
     directorId: "director-1",
     batchId: "batch-1",
@@ -75,6 +124,7 @@ function directorStatus(workers: WorkflowDirectorStatus["workers"]): WorkflowDir
     admissionCount: 1,
     admissionLimit: 10,
     workers,
+    reviews,
     observation: "Director is active.",
     actions: ["open"],
     createdAt: "2026-09-07T10:00:00.000Z",
@@ -85,7 +135,14 @@ function directorStatus(workers: WorkflowDirectorStatus["workers"]): WorkflowDir
 
 function monitorLayer(input: {
   readonly loadRoots: WorkflowService.WorkflowService["Service"]["roots"];
-  readonly onRead?: ((operation: "children" | "detail", repository: string) => void) | undefined;
+  readonly onRead?:
+    | ((
+        operation: "children" | "detail",
+        repository: string,
+        projectId: ProjectId,
+      ) => Effect.Effect<void>)
+    | undefined;
+  readonly validProjects?: ReadonlySet<ProjectId> | undefined;
   readonly status?:
     | WorkflowDirectorService.WorkflowDirectorService["Service"]["status"]
     | undefined;
@@ -93,30 +150,42 @@ function monitorLayer(input: {
   return WorkflowMonitor.layer.pipe(
     Layer.provideMerge(
       Layer.mock(WorkflowService.WorkflowService)({
+        validateProject: (projectId) =>
+          (input.validProjects ?? new Set([projectOne, projectTwo])).has(projectId)
+            ? Effect.void
+            : Effect.fail(
+                new WorkflowQueryError({
+                  failure: "project-not-found",
+                  message: "This project is no longer available.",
+                }),
+              ),
         roots: input.loadRoots,
-        children: ({ repository, parentNumber }) => {
-          input.onRead?.("children", repository);
-          return Effect.succeed({
-            parentNumber,
-            children: [],
-            frontier: {
-              status: "empty",
-              message: "No immediate work is visible in this branch.",
-              readyIssueIds: [],
-            },
-          });
-        },
-        issueDetail: ({ repository, number }) => {
-          input.onRead?.("detail", repository);
-          const detail: WorkflowIssueDetail = {
-            ...roots("Capability").roots[0]!,
-            repository,
-            number,
-            body: "",
-            blockedBy: [],
-          };
-          return Effect.succeed(detail);
-        },
+        children: ({ projectId, repository, parentNumber }) =>
+          Effect.gen(function* () {
+            const result = {
+              parentNumber,
+              children: [],
+              frontier: {
+                status: "empty" as const,
+                message: "No immediate work is visible in this branch.",
+                readyIssueIds: [],
+              },
+            };
+            if (input.onRead) yield* input.onRead("children", repository, projectId);
+            return result;
+          }),
+        issueDetail: ({ projectId, repository, number }) =>
+          Effect.gen(function* () {
+            const detail: WorkflowIssueDetail = {
+              ...roots("Capability").roots[0]!,
+              repository,
+              number,
+              body: "",
+              blockedBy: [],
+            };
+            if (input.onRead) yield* input.onRead("detail", repository, projectId);
+            return detail;
+          }),
       }),
     ),
     Layer.provideMerge(
@@ -128,16 +197,15 @@ function monitorLayer(input: {
   );
 }
 
-const nextStatus = (
+const nextStatus = Effect.fn("WorkflowMonitorTest.nextStatus")(function* (
   queue: Queue.Queue<WorkflowSyncState>,
   predicate: (state: WorkflowSyncState) => boolean,
-) =>
-  Effect.gen(function* () {
-    while (true) {
-      const state = yield* Queue.take(queue);
-      if (predicate(state)) return state;
-    }
-  });
+) {
+  while (true) {
+    const state = yield* Queue.take(queue);
+    if (predicate(state)) return state;
+  }
+});
 
 describe("WorkflowMonitor", () => {
   it.effect("publishes invalidation after a failed director mutation", () =>
@@ -346,9 +414,10 @@ describe("WorkflowMonitor", () => {
                 }
                 return roots("shared root");
               }),
-            onRead: (operation) => {
-              if (operation === "detail") detailReads += 1;
-            },
+            onRead: (operation) =>
+              Effect.sync(() => {
+                if (operation === "detail") detailReads += 1;
+              }),
           }),
         ),
         Effect.scoped,
@@ -403,9 +472,412 @@ describe("WorkflowMonitor", () => {
     }),
   );
 
+  it.effect(
+    "backs off first-load failures across status-driven reads and recovers on cadence",
+    () =>
+      Effect.gen(function* () {
+        let calls = 0;
+        let recovered = false;
+        const program = Effect.gen(function* () {
+          const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+          const events = yield* Queue.unbounded<WorkflowSyncState>();
+          const watcher = yield* monitor.watch({ projectId: projectOne, repository }).pipe(
+            Stream.runForEach((state) => Queue.offer(events, state)),
+            Effect.forkScoped,
+          );
+
+          const limited = yield* nextStatus(events, (state) => state.status === "rate-limited");
+          expect(limited.lastSuccessfulAt).toBeNull();
+          expect(limited.retryAt).not.toBeNull();
+          for (let index = 0; index < 5; index += 1) {
+            const result = yield* monitor
+              .roots({ projectId: projectOne, repository })
+              .pipe(Effect.exit);
+            expect(result._tag).toBe("Failure");
+          }
+          expect(calls).toBe(1);
+
+          yield* TestClock.adjust("29 seconds");
+          expect(calls).toBe(1);
+          recovered = true;
+          yield* TestClock.adjust("1 second");
+          yield* nextStatus(events, (state) => state.status === "fresh");
+          expect(calls).toBe(2);
+          expect(
+            (yield* monitor.roots({ projectId: projectOne, repository })).roots[0]?.title,
+          ).toBe("recovered");
+          yield* Fiber.interrupt(watcher);
+        });
+        yield* program.pipe(
+          Effect.provide(
+            monitorLayer({
+              loadRoots: () => {
+                calls += 1;
+                return recovered
+                  ? Effect.succeed(roots("recovered"))
+                  : Effect.fail(
+                      new WorkflowQueryError({
+                        failure: "github-rate-limited",
+                        message: "GitHub API rate limit exceeded.",
+                      }),
+                    );
+              },
+            }),
+          ),
+          Effect.scoped,
+        );
+      }),
+  );
+
+  it.effect("rejects a deleted project before a cache hit can replace shared routing", () =>
+    Effect.gen(function* () {
+      const requestedProjects = new Array<ProjectId>();
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        const sql = yield* SqlClient.SqlClient;
+        const events = yield* Queue.unbounded<WorkflowSyncState>();
+        const watcher = yield* monitor.watch({ projectId: projectOne, repository }).pipe(
+          Stream.runForEach((state) => Queue.offer(events, state)),
+          Effect.forkScoped,
+        );
+        yield* nextStatus(events, (state) => state.status === "fresh");
+        const now = "2026-09-07T10:00:00.000Z";
+        yield* sql`
+          INSERT INTO projection_threads
+            (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
+          VALUES ('thread-invalid-route', ${projectTwo}, 'Invalid route', ${now}, ${now}, NULL, NULL)
+        `;
+        yield* sql`
+          INSERT INTO workflow_directors
+            (director_id, batch_id, environment_id, project_id, repository, root_number,
+             capability_number, thread_id, command_id, message_id, worktree_path,
+             worktree_branch, status, requested_model, requested_instance_id,
+             requested_effort, observed_model, observed_effort, observed_match, sequence,
+             initial_turn_disposition, is_current, created_at, updated_at)
+          VALUES ('director-invalid-route', 'batch', ${environmentId}, ${projectTwo}, ${repository}, 1,
+            10, 'thread-invalid-route', 'command-invalid-route', 'message-invalid-route',
+            '/tmp/worktree', 'branch', 'active', 'gpt-6-astra', 'codex-workflow', 'high',
+            'gpt-6-astra', 'high', 'match', 1, 'accepted', 1, ${now}, ${now})
+        `;
+
+        const rejected = yield* monitor
+          .roots({ projectId: projectTwo, repository })
+          .pipe(Effect.flip);
+        expect(rejected.failure).toBe("project-not-found");
+
+        yield* TestClock.adjust("30 seconds");
+        yield* nextStatus(events, (state) => state.status === "fresh" && state.revision > 2);
+        expect(requestedProjects).toEqual([projectOne, projectOne]);
+        yield* Fiber.interrupt(watcher);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            validProjects: new Set([projectOne]),
+            loadRoots: ({ projectId }) => {
+              requestedProjects.push(projectId);
+              return projectId === projectOne
+                ? Effect.succeed(roots("valid"))
+                : Effect.fail(
+                    new WorkflowQueryError({
+                      failure: "project-not-found",
+                      message: "This project is no longer available.",
+                    }),
+                  );
+            },
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("continues invalidating healthy repositories after a retained project is deleted", () =>
+    Effect.gen(function* () {
+      const validProjects = new Set([projectOne, projectTwo]);
+      const reads = new Map<string, number>();
+      const otherRepository = "Flow-Fly/other" as const;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        yield* monitor.roots({ projectId: projectOne, repository });
+        yield* monitor.roots({ projectId: projectTwo, repository: otherRepository });
+        const events = yield* Queue.unbounded<WorkflowSyncState>();
+        const watcher = yield* monitor
+          .watch({
+            projectId: projectTwo,
+            repository: otherRepository,
+          })
+          .pipe(
+            Stream.runForEach((state) => Queue.offer(events, state)),
+            Effect.forkScoped,
+          );
+        yield* nextStatus(events, (state) => state.status === "fresh");
+        expect(reads.get(otherRepository)).toBe(2);
+
+        validProjects.delete(projectOne);
+        yield* monitor.invalidateAll;
+        yield* nextStatus(events, (state) => state.status === "fresh");
+
+        expect(reads.get(repository)).toBe(1);
+        expect(reads.get(otherRepository)).toBe(3);
+        yield* Fiber.interrupt(watcher);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            validProjects,
+            loadRoots: ({ repository: requestedRepository }) =>
+              Effect.sync(() => {
+                reads.set(requestedRepository, (reads.get(requestedRepository) ?? 0) + 1);
+                return {
+                  ...roots(requestedRepository),
+                  repository: requestedRepository,
+                  roots: [],
+                };
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("isolates a deleted watched route while healthy repositories continue on cadence", () =>
+    Effect.gen(function* () {
+      const validProjects = new Set([projectOne, projectTwo]);
+      const reads = new Map<string, number>();
+      const otherRepository = "Flow-Fly/other" as const;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        const deletedEvents = yield* Queue.unbounded<WorkflowSyncState>();
+        const healthyEvents = yield* Queue.unbounded<WorkflowSyncState>();
+        const deletedWatcher = yield* monitor.watch({ projectId: projectOne, repository }).pipe(
+          Stream.runForEach((state) => Queue.offer(deletedEvents, state)),
+          Effect.forkScoped,
+        );
+        const healthyWatcher = yield* monitor
+          .watch({ projectId: projectTwo, repository: otherRepository })
+          .pipe(
+            Stream.runForEach((state) => Queue.offer(healthyEvents, state)),
+            Effect.forkScoped,
+          );
+        yield* nextStatus(deletedEvents, (state) => state.status === "fresh");
+        yield* nextStatus(healthyEvents, (state) => state.status === "fresh");
+
+        validProjects.delete(projectOne);
+        yield* TestClock.adjust("30 seconds");
+        const deleted = yield* nextStatus(deletedEvents, (state) => state.status === "unavailable");
+        yield* nextStatus(healthyEvents, (state) => state.status === "fresh");
+
+        expect(deleted.message).toContain("no longer available");
+        expect(deleted.retryAt).not.toBeNull();
+        expect(reads.get(repository)).toBe(1);
+        expect(reads.get(otherRepository)).toBe(2);
+        yield* Fiber.interrupt(deletedWatcher);
+        yield* Fiber.interrupt(healthyWatcher);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            validProjects,
+            loadRoots: ({ repository: requestedRepository }) =>
+              Effect.sync(() => {
+                reads.set(requestedRepository, (reads.get(requestedRepository) ?? 0) + 1);
+                return {
+                  ...roots(requestedRepository),
+                  repository: requestedRepository,
+                  roots: [],
+                };
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect(
+    "renews active paths through a retained valid route after the director project expires",
+    () =>
+      Effect.gen(function* () {
+        const pathReads = new Array<{ operation: string; projectId: ProjectId }>();
+        const cadenceCompleted = yield* Deferred.make<void>();
+        const program = Effect.gen(function* () {
+          const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+          const sql = yield* SqlClient.SqlClient;
+          yield* monitor.roots({ projectId: projectOne, repository });
+          const now = "2026-09-07T10:00:00.000Z";
+          yield* sql`
+          INSERT INTO projection_threads
+            (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
+          VALUES ('thread-expired-director', ${projectTwo}, 'Expired director', ${now}, ${now}, NULL, NULL)
+        `;
+          yield* sql`
+          INSERT INTO workflow_directors
+            (director_id, batch_id, environment_id, project_id, repository, root_number,
+             capability_number, thread_id, command_id, message_id, worktree_path,
+             worktree_branch, status, requested_model, requested_instance_id,
+             requested_effort, observed_model, observed_effort, observed_match, sequence,
+             initial_turn_disposition, is_current, created_at, updated_at)
+          VALUES ('director-expired-project', 'batch', ${environmentId}, ${projectTwo}, ${repository}, 1,
+            10, 'thread-expired-director', 'command-expired-project', 'message-expired-project',
+            '/tmp/worktree', 'branch', 'active', 'gpt-6-astra', 'codex-workflow', 'high',
+            'gpt-6-astra', 'high', 'match', 1, 'accepted', 1, ${now}, ${now})
+        `;
+
+          yield* TestClock.adjust("90 seconds");
+          yield* Deferred.await(cadenceCompleted);
+          expect(pathReads.filter(({ operation }) => operation === "detail")).toHaveLength(3);
+          expect(pathReads.filter(({ operation }) => operation === "children")).toHaveLength(3);
+          expect(pathReads.every(({ projectId }) => projectId === projectOne)).toBe(true);
+        });
+        yield* program.pipe(
+          Effect.provide(
+            monitorLayer({
+              validProjects: new Set([projectOne]),
+              loadRoots: () => Effect.succeed(roots("valid route")),
+              onRead: (operation, _repository, projectId) =>
+                Effect.gen(function* () {
+                  pathReads.push({ operation, projectId });
+                  if (pathReads.length === 6) yield* Deferred.succeed(cadenceCompleted, undefined);
+                }),
+            }),
+          ),
+          Effect.scoped,
+        );
+      }),
+  );
+
+  it.effect("refreshes a cached path that returns after an in-flight snapshot", () =>
+    Effect.gen(function* () {
+      const rootStarted = yield* Deferred.make<void>();
+      const releaseRoot = yield* Deferred.make<void>();
+      let rootReads = 0;
+      let detailReads = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+        yield* TestClock.adjust("61 seconds");
+
+        const refresh = yield* monitor
+          .refresh({ projectId: projectOne, repository })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(rootStarted);
+        expect(
+          (yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 })).number,
+        ).toBe(11);
+        yield* Deferred.succeed(releaseRoot, undefined);
+        yield* Fiber.join(refresh);
+        expect(rootReads).toBe(2);
+        expect(detailReads).toBe(2);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () =>
+              Effect.gen(function* () {
+                rootReads += 1;
+                yield* Deferred.succeed(rootStarted, undefined);
+                yield* Deferred.await(releaseRoot);
+                return roots("current");
+              }),
+            onRead: (operation) =>
+              Effect.sync(() => {
+                if (operation === "detail") detailReads += 1;
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("refreshes a cached path after each retirement in the same epoch", () =>
+    Effect.gen(function* () {
+      const firstCadenceRootStarted = yield* Deferred.make<void>();
+      const releaseFirstCadenceRoot = yield* Deferred.make<void>();
+      const secondCadenceRootStarted = yield* Deferred.make<void>();
+      const releaseSecondCadenceRoot = yield* Deferred.make<void>();
+      const firstReactivationCompleted = yield* Deferred.make<void>();
+      const secondReactivationCompleted = yield* Deferred.make<void>();
+      let rootReads = 0;
+      let detailReads = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        const events = yield* Queue.unbounded<WorkflowSyncState>();
+        const watcher = yield* monitor.watch({ projectId: projectOne, repository }).pipe(
+          Stream.runForEach((state) => Queue.offer(events, state)),
+          Effect.forkScoped,
+        );
+        yield* nextStatus(events, (state) => state.status === "fresh");
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+
+        yield* TestClock.adjust("121 seconds");
+        yield* Deferred.await(firstCadenceRootStarted);
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+        yield* Deferred.succeed(releaseFirstCadenceRoot, undefined);
+        yield* Deferred.await(firstReactivationCompleted);
+        expect(detailReads).toBe(4);
+
+        yield* TestClock.adjust("120 seconds");
+        yield* Deferred.await(secondCadenceRootStarted);
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+        const joinedRefresh = yield* monitor
+          .refresh({ projectId: projectOne, repository })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.succeed(releaseSecondCadenceRoot, undefined);
+        yield* Fiber.join(joinedRefresh);
+        yield* Deferred.await(secondReactivationCompleted);
+        expect(detailReads).toBe(7);
+        yield* Fiber.interrupt(watcher);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () =>
+              Effect.gen(function* () {
+                rootReads += 1;
+                if (rootReads === 6) {
+                  yield* Deferred.succeed(firstCadenceRootStarted, undefined);
+                  yield* Deferred.await(releaseFirstCadenceRoot);
+                }
+                if (rootReads === 11) {
+                  yield* Deferred.succeed(secondCadenceRootStarted, undefined);
+                  yield* Deferred.await(releaseSecondCadenceRoot);
+                }
+                return roots("current");
+              }),
+            onRead: (operation) =>
+              Effect.gen(function* () {
+                if (operation !== "detail") return;
+                detailReads += 1;
+                if (detailReads === 4) {
+                  yield* Deferred.succeed(firstReactivationCompleted, undefined);
+                }
+                if (detailReads === 7) {
+                  yield* Deferred.succeed(secondReactivationCompleted, undefined);
+                }
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("keeps archived directors only while durable child execution is unsettled", () =>
     Effect.gen(function* () {
       const reads = new Array<{ operation: string; repository: string }>();
+      const expected = [
+        "archived-held",
+        "missing-held",
+        "deleted-held",
+        "archived-review-issued",
+        "archived-review-descendant",
+        "archived-review-reported",
+        "open",
+      ] as const;
+      const cadenceReadsCompleted = yield* Deferred.make<void>();
       const program = Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const now = "2026-09-07T10:00:00.000Z";
@@ -452,6 +924,63 @@ describe("WorkflowMonitor", () => {
             disposition: "accepted",
           },
           {
+            suffix: "archived-worker-native-closed",
+            capability: 80,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "archived-review-issued",
+            capability: 90,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "archived-review-native-closed",
+            capability: 100,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "archived-review-descendant",
+            capability: 110,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "archived-review-never-issued",
+            capability: 120,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "archived-review-reported",
+            capability: 130,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+          },
+          {
+            suffix: "invalid-project",
+            capability: 140,
+            archived: now,
+            deleted: null,
+            status: "active",
+            disposition: "accepted",
+            projectId: projectTwo,
+          },
+          {
             suffix: "open",
             capability: 60,
             archived: null,
@@ -474,7 +1003,7 @@ describe("WorkflowMonitor", () => {
             yield* sql`
               INSERT INTO projection_threads
                 (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
-              VALUES (${`thread-${entry.suffix}`}, ${projectOne}, ${entry.suffix}, ${now}, ${now}, ${entry.archived}, ${entry.deleted})
+              VALUES (${`thread-${entry.suffix}`}, ${"projectId" in entry ? entry.projectId : projectOne}, ${entry.suffix}, ${now}, ${now}, ${entry.archived}, ${entry.deleted})
             `;
           }
           yield* sql`
@@ -484,7 +1013,7 @@ describe("WorkflowMonitor", () => {
                worktree_branch, status, requested_model, requested_instance_id,
                requested_effort, observed_model, observed_effort, observed_match, sequence,
                initial_turn_disposition, is_current, created_at, updated_at)
-            VALUES (${`director-${entry.suffix}`}, 'batch', ${environmentId}, ${projectOne}, ${repo}, 1,
+            VALUES (${`director-${entry.suffix}`}, 'batch', ${environmentId}, ${"projectId" in entry ? entry.projectId : projectOne}, ${repo}, 1,
               ${entry.capability}, ${`thread-${entry.suffix}`},
               ${`command-${entry.suffix}`}, ${`message-${entry.suffix}`}, '/tmp/worktree', 'branch', ${entry.status},
               'gpt-6-astra', 'codex-workflow', 'high', 'gpt-6-astra', 'high', 'match', 1,
@@ -492,52 +1021,130 @@ describe("WorkflowMonitor", () => {
           `;
         }
         yield* TestClock.adjust("30 seconds");
-        yield* Effect.yieldNow;
-        for (const suffix of ["archived-held", "missing-held", "deleted-held", "open"]) {
+        yield* Deferred.await(cadenceReadsCompleted);
+
+        for (const suffix of expected) {
           expect(reads.filter((read) => read.repository === `Flow-Fly/${suffix}`)).toHaveLength(2);
         }
-        for (const suffix of ["archived-closed", "deleted-closed", "failed-setup"]) {
+        for (const suffix of [
+          "archived-closed",
+          "deleted-closed",
+          "archived-worker-native-closed",
+          "archived-review-native-closed",
+          "archived-review-never-issued",
+          "invalid-project",
+          "failed-setup",
+        ]) {
           expect(reads.some((read) => read.repository === `Flow-Fly/${suffix}`)).toBe(false);
         }
       });
       yield* program.pipe(
         Effect.provide(
           monitorLayer({
+            validProjects: new Set([projectOne]),
             loadRoots: () => Effect.succeed(roots("unused")),
-            onRead: (operation, repo) => reads.push({ operation, repository: repo }),
+            onRead: (operation, repo) =>
+              Effect.gen(function* () {
+                reads.push({ operation, repository: repo });
+                if (
+                  expected.every(
+                    (suffix) =>
+                      reads.filter((read) => read.repository === `Flow-Fly/${suffix}`).length === 2,
+                  )
+                ) {
+                  yield* Deferred.succeed(cadenceReadsCompleted, undefined);
+                }
+              }),
             status: ({ capabilityNumber }) =>
-              Effect.succeed(
-                directorStatus(
-                  capabilityNumber !== undefined && [10, 30, 40].includes(capabilityNumber)
-                    ? [
-                        {
-                          dispatchId: "dispatch-1",
-                          admissionId: "admission-1",
-                          ticketNumber: 21,
-                          providerThreadId: null,
-                          parentProviderThreadId: null,
-                          ownership: "server",
-                          writePaths: ["apps/server"],
-                          writeReservation: "held",
-                          settlementEvidence: null,
-                          association: "unconfirmed",
-                          providerStatus: "prepared",
-                          requestedProfile: null,
-                          observedProfile: { model: null, effort: null, match: "unknown" },
-                          handoff: {
-                            outcome: "succeeded",
-                            summary: "Reported",
-                            commits: [],
-                            checks: [],
-                          },
-                          title: "Ticket 21",
-                          role: "implement",
-                          updatedAt: "2026-09-07T10:00:00.000Z",
-                        },
-                      ]
-                    : [],
-                ),
-              ),
+              Effect.sync(() => {
+                const heldWorker = {
+                  dispatchId: "dispatch-1",
+                  admissionId: "admission-1",
+                  ticketNumber: 21,
+                  providerThreadId: null,
+                  parentProviderThreadId: null,
+                  ownership: "server",
+                  writePaths: ["apps/server"],
+                  writeReservation: "held" as const,
+                  settlementEvidence: null,
+                  association: "unconfirmed" as const,
+                  providerStatus: "prepared",
+                  requestedProfile: null,
+                  observedProfile: { model: null, effort: null, match: "unknown" as const },
+                  handoff: null,
+                  title: "Ticket 21",
+                  role: "implement",
+                  updatedAt: "2026-09-07T10:00:00.000Z",
+                };
+                if (
+                  capabilityNumber !== undefined &&
+                  [10, 30, 40, 140].includes(capabilityNumber)
+                ) {
+                  return directorStatus([heldWorker]);
+                }
+                if (capabilityNumber === 80) {
+                  return directorStatus([
+                    {
+                      ...heldWorker,
+                      providerThreadId: "closed-worker",
+                      writeReservation: "released",
+                      settlementEvidence: "native-closed",
+                      association: "associated",
+                      providerStatus: "closed",
+                    },
+                  ]);
+                }
+                if (capabilityNumber === 90) {
+                  return directorStatus([], [reviewStatus({ status: "spawn-issued" })]);
+                }
+                if (capabilityNumber === 100) {
+                  return directorStatus(
+                    [],
+                    [
+                      reviewStatus({
+                        status: "reported",
+                        association: "associated",
+                        providerThreadId: "review-thread",
+                        settlementEvidence: "native-closed",
+                        axes: [
+                          reviewAxis("standards", "native-closed"),
+                          reviewAxis("spec", "native-closed"),
+                        ],
+                      }),
+                    ],
+                  );
+                }
+                if (capabilityNumber === 110) {
+                  return directorStatus(
+                    [],
+                    [
+                      reviewStatus({
+                        status: "reported",
+                        association: "associated",
+                        providerThreadId: "review-thread",
+                        settlementEvidence: "native-closed",
+                        axes: [reviewAxis("standards", "native-closed"), reviewAxis("spec", null)],
+                      }),
+                    ],
+                  );
+                }
+                if (capabilityNumber === 120) {
+                  return directorStatus([], [reviewStatus({ status: "prepared" })]);
+                }
+                if (capabilityNumber === 130) {
+                  return directorStatus(
+                    [],
+                    [
+                      reviewStatus({
+                        status: "reported",
+                        association: "associated",
+                        providerThreadId: "review-thread",
+                      }),
+                    ],
+                  );
+                }
+                return directorStatus([]);
+              }),
           }),
         ),
         Effect.scoped,
@@ -584,9 +1191,10 @@ describe("WorkflowMonitor", () => {
                 rootReads += 1;
                 return Effect.succeed(roots("current"));
               },
-              onRead: (operation) => {
-                if (operation === "detail") detailReads += 1;
-              },
+              onRead: (operation) =>
+                Effect.sync(() => {
+                  if (operation === "detail") detailReads += 1;
+                }),
             }),
           ),
           Effect.scoped,
@@ -596,7 +1204,6 @@ describe("WorkflowMonitor", () => {
 
   it.effect("coalesces repeated reads of old cached data and preserves outage backoff", () =>
     Effect.gen(function* () {
-      const scheduledFailure = yield* Deferred.make<void>();
       let outage = false;
       let repositoryReads = 0;
       let controlReads = 0;
@@ -621,14 +1228,11 @@ describe("WorkflowMonitor", () => {
           Stream.runForEach((state) => Queue.offer(failedEvents, state)),
           Effect.forkScoped,
         );
-        yield* nextStatus(
-          failedEvents,
-          (state) => state.status === "unavailable" && state.revision > firstFailure.revision,
-        );
+        yield* nextStatus(failedEvents, (state) => state.status === "unavailable");
         for (let index = 0; index < 5; index += 1) {
           yield* monitor.roots({ projectId: projectOne, repository });
         }
-        expect(repositoryReads).toBe(3);
+        expect(repositoryReads).toBe(2);
 
         const controlEvents = yield* Queue.unbounded<WorkflowSyncState>();
         const controlWatcher = yield* monitor
@@ -639,11 +1243,17 @@ describe("WorkflowMonitor", () => {
           );
         yield* nextStatus(controlEvents, (state) => state.status === "fresh");
         yield* TestClock.adjust("59 seconds");
+        yield* nextStatus(
+          failedEvents,
+          (state) => state.status === "unavailable" && state.revision > firstFailure.revision,
+        );
         yield* nextStatus(controlEvents, (state) => state.status === "fresh");
         expect(controlReads).toBeGreaterThan(1);
         expect(repositoryReads).toBe(3);
 
-        yield* TestClock.adjust("30 seconds");
+        yield* TestClock.adjust("59 seconds");
+        expect(repositoryReads).toBe(3);
+        yield* TestClock.adjust("1 second");
         yield* nextStatus(controlEvents, (state) => state.status === "fresh");
         expect(repositoryReads).toBe(4);
         yield* Fiber.interrupt(failedWatcher);
@@ -655,24 +1265,10 @@ describe("WorkflowMonitor", () => {
             loadRoots: ({ repository: requestedRepository }) => {
               if (requestedRepository.toLowerCase() === "flow-fly/control") {
                 controlReads += 1;
-                return (controlReads >= 3 ? Deferred.await(scheduledFailure) : Effect.void).pipe(
-                  Effect.as(roots("control")),
-                );
+                return Effect.succeed(roots("control"));
               }
               repositoryReads += 1;
               if (!outage) return Effect.succeed(roots("cached"));
-              if (repositoryReads === 4) {
-                return Deferred.succeed(scheduledFailure, undefined).pipe(
-                  Effect.andThen(
-                    Effect.fail(
-                      new WorkflowQueryError({
-                        failure: "request-failed",
-                        message: "GitHub is unavailable.",
-                      }),
-                    ),
-                  ),
-                );
-              }
               return Effect.fail(
                 new WorkflowQueryError({
                   failure: "request-failed",

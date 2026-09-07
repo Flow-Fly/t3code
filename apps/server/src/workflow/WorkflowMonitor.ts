@@ -43,7 +43,8 @@ type CacheEntry =
       error: WorkflowQueryError | null;
       lastRequestedAtMs?: number;
       lastRefreshedAtMs?: number;
-      refreshRequestedEpoch?: number;
+      refreshRequestedGeneration?: number;
+      refreshingGeneration?: number;
       pendingGeneration?: number;
     }
   | {
@@ -53,7 +54,8 @@ type CacheEntry =
       error: WorkflowQueryError | null;
       lastRequestedAtMs?: number;
       lastRefreshedAtMs?: number;
-      refreshRequestedEpoch?: number;
+      refreshRequestedGeneration?: number;
+      refreshingGeneration?: number;
       pendingGeneration?: number;
     }
   | {
@@ -63,7 +65,8 @@ type CacheEntry =
       error: WorkflowQueryError | null;
       lastRequestedAtMs?: number;
       lastRefreshedAtMs?: number;
-      refreshRequestedEpoch?: number;
+      refreshRequestedGeneration?: number;
+      refreshingGeneration?: number;
       pendingGeneration?: number;
     };
 
@@ -174,9 +177,13 @@ export class WorkflowMonitor extends Context.Service<
     readonly issueDetail: (
       input: WorkflowIssueDetailInput,
     ) => Effect.Effect<WorkflowIssueDetail, WorkflowQueryError>;
-    readonly watch: (input: WorkflowMonitorInput) => Stream.Stream<WorkflowSyncState>;
-    readonly refresh: (input: WorkflowMonitorInput) => Effect.Effect<WorkflowSyncState>;
-    readonly invalidate: (input: WorkflowMonitorInput) => Effect.Effect<void>;
+    readonly watch: (
+      input: WorkflowMonitorInput,
+    ) => Stream.Stream<WorkflowSyncState, WorkflowQueryError>;
+    readonly refresh: (
+      input: WorkflowMonitorInput,
+    ) => Effect.Effect<WorkflowSyncState, WorkflowQueryError>;
+    readonly invalidate: (input: WorkflowMonitorInput) => Effect.Effect<void, WorkflowQueryError>;
     readonly invalidateDirector: (input: {
       readonly environmentId: string;
       readonly threadId: string;
@@ -228,9 +235,26 @@ export const make = Effect.gen(function* () {
     yield* SubscriptionRef.set(state.sync, yield* snapshot(state));
   });
 
+  const rememberRoutingFailure = Effect.fn("WorkflowMonitor.rememberRoutingFailure")(function* (
+    state: RepositoryState,
+    error: WorkflowQueryError,
+  ) {
+    const failedAt = yield* Clock.currentTimeMillis;
+    state.lastAttemptAtMs = failedAt;
+    state.failureCount += 1;
+    state.nextRefreshAtMs = failedAt + backoffMillis(state.failureCount);
+    state.status = failureStatus(error);
+    state.message =
+      state.lastSuccessfulAtMs === null
+        ? error.message
+        : `${error.message} Showing the last successful Workflow data.`;
+    yield* publish(state);
+  });
+
   const ensureState = Effect.fn("WorkflowMonitor.ensureState")(function* (
     input: WorkflowMonitorInput,
   ) {
+    yield* workflow.validateProject(input.projectId);
     return yield* stateLock.withPermits(1)(
       Effect.gen(function* () {
         const key = repositoryKey(input.repository);
@@ -275,26 +299,25 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const remember = (entry: CacheEntry) =>
-    Effect.gen(function* () {
-      const now = yield* Clock.currentTimeMillis;
-      const key = cacheKey(entry);
-      const previous = cache.get(key);
-      if (previous) {
-        previous.lastRequestedAtMs = now;
-        if (previous.kind === "roots" && entry.kind === "roots") previous.input = entry.input;
-        if (previous.kind === "children" && entry.kind === "children") previous.input = entry.input;
-        if (previous.kind === "detail" && entry.kind === "detail") previous.input = entry.input;
-        return previous;
-      }
-      entry.lastRequestedAtMs = now;
-      cache.set(key, entry);
-      if (cache.size > CACHE_CAPACITY) {
-        const oldest = cache.keys().next().value;
-        if (typeof oldest === "string") cache.delete(oldest);
-      }
-      return entry;
-    });
+  const remember = Effect.fn("WorkflowMonitor.remember")(function* (entry: CacheEntry) {
+    const now = yield* Clock.currentTimeMillis;
+    const key = cacheKey(entry);
+    const previous = cache.get(key);
+    if (previous) {
+      previous.lastRequestedAtMs = now;
+      if (previous.kind === "roots" && entry.kind === "roots") previous.input = entry.input;
+      if (previous.kind === "children" && entry.kind === "children") previous.input = entry.input;
+      if (previous.kind === "detail" && entry.kind === "detail") previous.input = entry.input;
+      return previous;
+    }
+    entry.lastRequestedAtMs = now;
+    cache.set(key, entry);
+    if (cache.size > CACHE_CAPACITY) {
+      const oldest = cache.keys().next().value;
+      if (typeof oldest === "string") cache.delete(oldest);
+    }
+    return entry;
+  });
 
   const entriesFor = Effect.fn("WorkflowMonitor.entriesFor")(function* (state: RepositoryState) {
     const now = yield* Clock.currentTimeMillis;
@@ -306,50 +329,54 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const markEntriesRequested = Effect.fn("WorkflowMonitor.markEntriesRequested")(function* (
-    state: RepositoryState,
+  const refreshEntry = Effect.fn("WorkflowMonitor.refreshEntry")(function* (
+    entry: CacheEntry,
+    generation: number,
   ) {
-    for (const entry of yield* entriesFor(state)) {
-      entry.refreshRequestedEpoch = state.epoch;
-    }
-  });
-
-  const refreshEntry = Effect.fn("WorkflowMonitor.refreshEntry")(function* (entry: CacheEntry) {
-    switch (entry.kind) {
-      case "roots": {
-        const result = yield* workflow.roots(entry.input).pipe(Effect.result);
-        if (result._tag === "Failure") {
-          entry.error = result.failure;
-          return result.failure;
-        }
-        entry.value = result.success;
-        entry.error = null;
-        entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-        return null;
+    entry.refreshingGeneration = generation;
+    const finish = Effect.sync(() => {
+      if (entry.refreshingGeneration === generation) delete entry.refreshingGeneration;
+      if ((entry.refreshRequestedGeneration ?? Number.POSITIVE_INFINITY) <= generation) {
+        delete entry.refreshRequestedGeneration;
       }
-      case "children": {
-        const result = yield* workflow.children(entry.input).pipe(Effect.result);
-        if (result._tag === "Failure") {
-          entry.error = result.failure;
-          return result.failure;
+    });
+    return yield* Effect.gen(function* () {
+      switch (entry.kind) {
+        case "roots": {
+          const result = yield* workflow.roots(entry.input).pipe(Effect.result);
+          if (result._tag === "Failure") {
+            entry.error = result.failure;
+            return result.failure;
+          }
+          entry.value = result.success;
+          entry.error = null;
+          entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
+          return null;
         }
-        entry.value = result.success;
-        entry.error = null;
-        entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-        return null;
-      }
-      case "detail": {
-        const result = yield* workflow.issueDetail(entry.input).pipe(Effect.result);
-        if (result._tag === "Failure") {
-          entry.error = result.failure;
-          return result.failure;
+        case "children": {
+          const result = yield* workflow.children(entry.input).pipe(Effect.result);
+          if (result._tag === "Failure") {
+            entry.error = result.failure;
+            return result.failure;
+          }
+          entry.value = result.success;
+          entry.error = null;
+          entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
+          return null;
         }
-        entry.value = result.success;
-        entry.error = null;
-        entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-        return null;
+        case "detail": {
+          const result = yield* workflow.issueDetail(entry.input).pipe(Effect.result);
+          if (result._tag === "Failure") {
+            entry.error = result.failure;
+            return result.failure;
+          }
+          entry.value = result.success;
+          entry.error = null;
+          entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
+          return null;
+        }
       }
-    }
+    }).pipe(Effect.ensuring(finish));
   });
 
   const refreshRepository = Effect.fn("WorkflowMonitor.refreshRepository")(function* (
@@ -360,6 +387,8 @@ export const make = Effect.gen(function* () {
     return yield* state.refreshLock.withPermits(1)(
       Effect.gen(function* () {
         while (state.attemptedEpoch < targetEpoch || state.generation < minimumGeneration) {
+          const entries = yield* entriesFor(state);
+          if (entries.length === 0) return yield* snapshot(state);
           const capturedEpoch = state.epoch;
           state.generation += 1;
           state.status = "refreshing";
@@ -370,9 +399,11 @@ export const make = Effect.gen(function* () {
           yield* publish(state);
           const attemptAt = yield* Clock.currentTimeMillis;
           state.lastAttemptAtMs = attemptAt;
-          const errors = yield* Effect.forEach(yield* entriesFor(state), refreshEntry, {
-            concurrency: 4,
-          });
+          const errors = yield* Effect.forEach(
+            entries,
+            (entry) => refreshEntry(entry, state.generation),
+            { concurrency: 4 },
+          );
           const error = errors.find((candidate) => candidate !== null) ?? null;
           const completedAt = yield* Clock.currentTimeMillis;
           if (capturedEpoch !== state.epoch) {
@@ -382,6 +413,14 @@ export const make = Effect.gen(function* () {
             yield* publish(state);
             targetEpoch = state.epoch;
             minimumGeneration = state.generation + 1;
+            continue;
+          }
+          const requestedGeneration = Math.max(
+            0,
+            ...(yield* entriesFor(state)).map((entry) => entry.refreshRequestedGeneration ?? 0),
+          );
+          if (requestedGeneration > state.generation) {
+            minimumGeneration = requestedGeneration;
             continue;
           }
           if (error !== null) {
@@ -464,10 +503,22 @@ export const make = Effect.gen(function* () {
   const seedDirector = Effect.fn("WorkflowMonitor.seedDirector")(function* (
     row: ActiveDirectorRow,
   ) {
-    const state = yield* ensureState({
+    const input = {
       projectId: row.projectId as ProjectId,
       repository: row.repository as WorkflowRepositoryNameWithOwner,
-    });
+    };
+    const state = yield* ensureState(input).pipe(
+      Effect.catch((error) => {
+        const existing = states.get(repositoryKey(row.repository));
+        if (!existing) return error;
+        return workflow.validateProject(existing.projectId).pipe(
+          Effect.as(existing),
+          Effect.catch((fallbackError) =>
+            rememberRoutingFailure(existing, fallbackError).pipe(Effect.andThen(fallbackError)),
+          ),
+        );
+      }),
+    );
     yield* remember({
       kind: "detail",
       input: {
@@ -493,19 +544,31 @@ export const make = Effect.gen(function* () {
 
   const refreshDueRepositories = Effect.fn("WorkflowMonitor.refreshDueRepositories")(function* () {
     const activeRows = yield* activeDirectors();
-    const activeKeys = new Set(activeRows.map((row) => repositoryKey(row.repository)));
-    const activeStates = yield* Effect.forEach(activeRows, seedDirector);
+    const activeStates = (yield* Effect.forEach(activeRows, (row) =>
+      seedDirector(row).pipe(Effect.option),
+    )).flatMap(Option.toArray);
+    const activeKeys = new Set(activeStates.map((state) => state.key));
+    for (const row of activeRows) {
+      const key = repositoryKey(row.repository);
+      if (states.has(key)) activeKeys.add(key);
+    }
     const candidates = new Map(
       [...states.values(), ...activeStates]
         .filter((state) => state.watchers > 0 || activeKeys.has(state.key))
         .map((state) => [state.key, state]),
     );
+    const now = yield* Clock.currentTimeMillis;
     yield* Effect.forEach(
-      [...candidates.values()].filter((state) => state.watchers > 0),
-      seedRoots,
+      [...candidates.values()].filter(
+        (state) => state.watchers > 0 && (state.failureCount === 0 || state.nextRefreshAtMs <= now),
+      ),
+      (state) =>
+        workflow.validateProject(state.projectId).pipe(
+          Effect.andThen(seedRoots(state)),
+          Effect.catch((error) => rememberRoutingFailure(state, error)),
+        ),
       { discard: true },
     );
-    const now = yield* Clock.currentTimeMillis;
     yield* Effect.forEach(
       [...candidates.values()].filter((state) => state.nextRefreshAtMs <= now),
       (state) => refreshRepository(state, state.epoch, state.generation + 1),
@@ -551,31 +614,39 @@ export const make = Effect.gen(function* () {
         held.lastRefreshedAtMs === undefined ||
         now - held.lastRefreshedAtMs > Duration.toMillis(CACHE_REFRESH_RETENTION)
       ) {
-        if (held.refreshRequestedEpoch !== state.epoch) {
+        if (state.failureCount === 0 || state.nextRefreshAtMs <= now) {
+          const requestedGeneration =
+            held.refreshingGeneration === state.generation
+              ? state.generation
+              : state.generation + 1;
+          if ((held.refreshRequestedGeneration ?? 0) < requestedGeneration) {
+            held.refreshRequestedGeneration = requestedGeneration;
+          }
           if (state.status !== "refreshing" && state.status !== "stale") {
             state.epoch += 1;
             state.status = "stale";
             state.message = "Refreshing a previously viewed Workflow path from GitHub…";
             yield* publish(state);
           }
-          yield* markEntriesRequested(state);
-          yield* requestRefresh(
-            state,
-            state.epoch,
-            state.status === "refreshing" || state.status === "stale"
-              ? Math.max(1, state.generation)
-              : state.generation + 1,
-          );
+          yield* requestRefresh(state, state.epoch, requestedGeneration);
         }
       }
       return held.value as A;
+    }
+    if (held.error !== null && state.failureCount > 0 && state.nextRefreshAtMs > now) {
+      return yield* held.error;
     }
     const pendingGeneration = held.pendingGeneration;
     if (pendingGeneration !== undefined) {
       yield* refreshRepository(state, state.epoch, pendingGeneration);
     } else {
-      const requestedGeneration = state.generation + 1;
+      const requestedGeneration =
+        held.refreshingGeneration === state.generation ? state.generation : state.generation + 1;
       held.pendingGeneration = requestedGeneration;
+      held.refreshRequestedGeneration = Math.max(
+        held.refreshRequestedGeneration ?? 0,
+        requestedGeneration,
+      );
       yield* refreshRepository(state, state.epoch, requestedGeneration).pipe(
         Effect.ensuring(
           Effect.sync(() => {
@@ -605,20 +676,23 @@ export const make = Effect.gen(function* () {
           const state = yield* ensureState(input);
           state.watchers += 1;
           yield* seedRoots(state);
+          const now = yield* Clock.currentTimeMillis;
+          const backoffActive = state.failureCount > 0 && state.nextRefreshAtMs > now;
           if (state.status === "fresh") {
             state.epoch += 1;
             state.status = "stale";
             state.message = "Checking GitHub for Workflow updates…";
-            yield* markEntriesRequested(state);
             yield* publish(state);
           }
-          yield* requestRefresh(
-            state,
-            state.epoch,
-            state.status === "refreshing" || state.status === "stale"
-              ? Math.max(1, state.generation)
-              : state.generation + 1,
-          );
+          if (!backoffActive) {
+            yield* requestRefresh(
+              state,
+              state.epoch,
+              state.status === "refreshing" || state.status === "stale"
+                ? Math.max(1, state.generation)
+                : state.generation + 1,
+            );
+          }
           return state;
         }),
         (state) =>
@@ -636,7 +710,6 @@ export const make = Effect.gen(function* () {
         state.epoch += 1;
         state.status = state.lastSuccessfulAtMs === null ? "refreshing" : "stale";
         state.message = "Retrying Workflow sync with GitHub…";
-        yield* markEntriesRequested(state);
         yield* publish(state);
       }
       return yield* refreshRepository(
@@ -657,7 +730,6 @@ export const make = Effect.gen(function* () {
     state.epoch += 1;
     state.status = state.lastSuccessfulAtMs === null ? "refreshing" : "stale";
     state.message = "Workflow changed. Waiting for GitHub confirmation…";
-    yield* markEntriesRequested(state);
     yield* publish(state);
     yield* requestRefresh(state);
   });
@@ -686,7 +758,10 @@ export const make = Effect.gen(function* () {
   const invalidateAll: WorkflowMonitor["Service"]["invalidateAll"] = Effect.suspend(() =>
     Effect.forEach(
       [...states.values()],
-      (state) => invalidate({ projectId: state.projectId, repository: state.repository }),
+      (state) =>
+        invalidate({ projectId: state.projectId, repository: state.repository }).pipe(
+          Effect.ignore,
+        ),
       { discard: true },
     ),
   );
