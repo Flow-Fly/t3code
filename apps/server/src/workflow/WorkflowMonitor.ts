@@ -1,5 +1,4 @@
 import {
-  CommandId,
   OrchestrationDispatchCommandError,
   WorkflowDirectorError,
   type ProjectId,
@@ -494,7 +493,7 @@ export const make = Effect.gen(function* () {
                         bootstrap: { ...command.bootstrap, createThread },
                       },
                       createCommandId: Effect.succeed(
-                        CommandId.make(`workflow:successor:create:${command.commandId}`),
+                        WorkflowDirectorService.workflowSuccessorCreateCommandId(command.commandId),
                       ),
                       dispatch,
                       drainThreadDeletionThrough: () => Effect.void,

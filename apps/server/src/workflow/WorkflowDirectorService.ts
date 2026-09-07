@@ -18,6 +18,8 @@ import {
   type WorkflowDirectorAdmissionInput,
   type WorkflowDirectorAdmissionResult,
   type WorkflowDirectorHandoffPrepareInput,
+  type WorkflowDirectorHandoffReconcileInput,
+  type WorkflowDirectorHandoffReconciliation,
   type WorkflowDirectorHandoffStatus,
   type WorkflowDirectorResumeInput,
   type WorkflowDirectorReassessmentRetryInput,
@@ -79,6 +81,10 @@ const WORKER_EFFORT = "high";
 const REVIEWER_MODEL = "gpt-6-astra";
 const REVIEWER_EFFORT = "medium";
 const REQUIRED_SKILLS = ["implement", "code-review"] as const;
+
+export function workflowSuccessorCreateCommandId(commandId: CommandId): CommandId {
+  return CommandId.make(`workflow:successor:create:${commandId}`);
+}
 
 function rootTurnIsSettled(shell: OrchestrationThreadShell) {
   return (
@@ -408,6 +414,19 @@ const HandoffRow = Schema.Struct({
 });
 type HandoffRow = typeof HandoffRow.Type;
 const decodeHandoffRow = Schema.decodeUnknownEffect(HandoffRow);
+
+const HandoffReconciliationRow = Schema.Struct({
+  sequence: Schema.Number,
+  reconciliationId: Schema.String,
+  handoffId: Schema.String,
+  acknowledgedByDirectorId: Schema.String,
+  settlementsJson: Schema.String,
+  implementationHead: Schema.String,
+  summary: Schema.String,
+  createdAt: Schema.String,
+});
+type HandoffReconciliationRow = typeof HandoffReconciliationRow.Type;
+const decodeHandoffReconciliationRow = Schema.decodeUnknownEffect(HandoffReconciliationRow);
 
 const HandoffAdmission = Schema.Struct({
   admissionId: Schema.String,
@@ -810,6 +829,12 @@ export class WorkflowDirectorService extends Context.Service<
       threadId: ThreadId,
       providerInstanceId: ProviderInstanceId,
       input: WorkflowDirectorHandoffPrepareInput,
+    ) => Effect.Effect<WorkflowDirectorHandoffStatus, WorkflowQueryError | WorkflowDirectorError>;
+    readonly reconcileHandoff: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowDirectorHandoffReconcileInput,
     ) => Effect.Effect<WorkflowDirectorHandoffStatus, WorkflowQueryError | WorkflowDirectorError>;
     readonly rotateReady: (
       input: WorkflowDirectorStatusInput,
@@ -1535,6 +1560,7 @@ export const make = Effect.gen(function* () {
     options?: {
       readonly ownedClaims?: ReadonlyMap<number, string>;
       readonly admittedTicketNumbers?: ReadonlySet<number>;
+      readonly requireActionableUnfinishedTicket?: boolean;
     },
   ) {
     const capability = yield* workflow.issueDetail({
@@ -1581,9 +1607,11 @@ export const make = Effect.gen(function* () {
       );
     }
     let hasReadyTicket = false;
+    let hasActionableUnfinishedTicket = false;
     for (const ticket of tickets) {
       if (ticket.readiness?.status === "ready") {
         hasReadyTicket = true;
+        hasActionableUnfinishedTicket = true;
         break;
       }
       if (
@@ -1591,7 +1619,8 @@ export const make = Effect.gen(function* () {
         options?.admittedTicketNumbers?.has(ticket.number)
       ) {
         hasReadyTicket = true;
-        break;
+        if (!options.requireActionableUnfinishedTicket) break;
+        continue;
       }
       const claimLogin = options?.ownedClaims?.get(ticket.number);
       if (
@@ -1600,6 +1629,7 @@ export const make = Effect.gen(function* () {
         (yield* currentClaimIsOwned(cwd, input.repository, ticket.number, claimLogin))
       ) {
         hasReadyTicket = true;
+        hasActionableUnfinishedTicket = true;
         break;
       }
     }
@@ -1607,6 +1637,12 @@ export const make = Effect.gen(function* () {
       return yield* directorError(
         "not-ready",
         "No published delivery ticket is currently ready or owned by this capability.",
+      );
+    }
+    if (options?.requireActionableUnfinishedTicket && !hasActionableUnfinishedTicket) {
+      return yield* directorError(
+        "not-ready",
+        "No unfinished published delivery ticket is currently actionable for a successor batch.",
       );
     }
     const provider = yield* providerPreflight(cwd, input.modelSelection);
@@ -1760,6 +1796,106 @@ export const make = Effect.gen(function* () {
     return handoff?.sourceDirectorId === directorId ? handoff : null;
   });
 
+  const loadHandoffById = Effect.fn("WorkflowDirectorService.loadHandoffById")(function* (
+    handoffId: string,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT handoff_id AS "handoffId", source_director_id AS "sourceDirectorId",
+          successor_director_id AS "successorDirectorId", source_thread_id AS "sourceThreadId",
+          source_batch_id AS "sourceBatchId", admissions_json AS "admissionsJson",
+          settlements_json AS "settlementsJson", implementation_head AS "implementationHead",
+          worktree_path AS "worktreePath", worktree_branch AS "worktreeBranch",
+          specification_links_json AS "specificationLinksJson",
+          issue_links_json AS "issueLinksJson", review_links_json AS "reviewLinksJson",
+          commit_links_json AS "commitLinksJson", suggested_skills_json AS "suggestedSkillsJson",
+          suggested_staffing_json AS "suggestedStaffingJson", lessons_json AS "lessonsJson",
+          unresolved_context_json AS "unresolvedContextJson",
+          successor_thread_id AS "successorThreadId", successor_command_id AS "successorCommandId",
+          successor_message_id AS "successorMessageId", successor_prompt AS "successorPrompt",
+          status, detail, created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM workflow_director_handoffs WHERE handoff_id = ${handoffId} LIMIT 1
+      `,
+      "The requested director handoff could not be read.",
+    );
+    if (!rows[0]) {
+      return yield* directorError(
+        "not-ready",
+        "The requested predecessor handoff does not exist.",
+        handoffId,
+      );
+    }
+    return yield* decodeHandoffRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "The requested handoff record is invalid.",
+          String(error),
+        ),
+      ),
+    );
+  });
+
+  const latestHandoffReconciliation = Effect.fn(
+    "WorkflowDirectorService.latestHandoffReconciliation",
+  )(function* (handoffId: string) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT sequence, reconciliation_id AS "reconciliationId", handoff_id AS "handoffId",
+          acknowledged_by_director_id AS "acknowledgedByDirectorId",
+          settlements_json AS "settlementsJson", implementation_head AS "implementationHead",
+          summary, created_at AS "createdAt"
+        FROM workflow_director_handoff_reconciliations
+        WHERE handoff_id = ${handoffId} ORDER BY sequence DESC LIMIT 1
+      `,
+      "Handoff reconciliation evidence could not be read.",
+    );
+    if (!rows[0]) return null;
+    return yield* decodeHandoffReconciliationRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "The latest handoff reconciliation is invalid.",
+          String(error),
+        ),
+      ),
+    );
+  });
+
+  const handoffReconciliationStatus = Effect.fn(
+    "WorkflowDirectorService.handoffReconciliationStatus",
+  )(function* (row: HandoffReconciliationRow) {
+    const settlements = yield* decodeHandoffSettlementsJson(row.settlementsJson).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "The handoff reconciliation snapshot is invalid.",
+          String(error),
+        ),
+      ),
+    );
+    return {
+      reconciliationId: row.reconciliationId,
+      sequence: row.sequence,
+      acknowledgedByDirectorId: row.acknowledgedByDirectorId,
+      implementationHead: row.implementationHead,
+      settlementCount: settlements.length,
+      summary: row.summary,
+      createdAt: row.createdAt,
+    } satisfies WorkflowDirectorHandoffReconciliation;
+  });
+
+  const effectiveHandoffSettlement = Effect.fn(
+    "WorkflowDirectorService.effectiveHandoffSettlement",
+  )(function* (handoff: HandoffRow) {
+    const reconciliation = yield* latestHandoffReconciliation(handoff.handoffId);
+    return {
+      settlementsJson: reconciliation?.settlementsJson ?? handoff.settlementsJson,
+      implementationHead: reconciliation?.implementationHead ?? handoff.implementationHead,
+      reconciliation,
+    };
+  });
+
   const handoffStatusFromRow = Effect.fn("WorkflowDirectorService.handoffStatusFromRow")(function* (
     row: HandoffRow,
   ) {
@@ -1782,6 +1918,7 @@ export const make = Effect.gen(function* () {
         directorError("persistence-failed", "The handoff context is invalid.", String(error)),
       ),
     );
+    const reconciliation = yield* latestHandoffReconciliation(row.handoffId);
     const requiredAction =
       row.status === "submitted"
         ? "The successor owns the current batch and must reread live tracker authority before admitting work."
@@ -1802,6 +1939,9 @@ export const make = Effect.gen(function* () {
       admissionCount: new Set(admissions.map((admission) => admission.slotTicketNumber)).size,
       lessons,
       unresolvedContext,
+      latestReconciliation: reconciliation
+        ? yield* handoffReconciliationStatus(reconciliation)
+        : null,
       requiredAction,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
@@ -1829,6 +1969,22 @@ export const make = Effect.gen(function* () {
       Effect.mapError((error) =>
         directorError("persistence-failed", "The active reassessment is invalid.", String(error)),
       ),
+    );
+  });
+
+  const unclearedCapabilityReassessments = Effect.fn(
+    "WorkflowDirectorService.unclearedCapabilityReassessments",
+  )(function* (row: DirectorRow) {
+    return yield* persistence(
+      sql<{ readonly directorId: string }>`
+        SELECT r.director_id AS "directorId" FROM workflow_reassessments r
+        JOIN workflow_directors d ON d.director_id = r.director_id
+        WHERE d.environment_id = ${row.environmentId}
+          AND d.repository COLLATE NOCASE = ${row.repository}
+          AND d.capability_number = ${row.capabilityNumber}
+          AND r.status != 'cleared'
+      `,
+      "Capability reassessment history could not be read.",
     );
   });
 
@@ -2670,6 +2826,7 @@ export const make = Effect.gen(function* () {
       completion?.updatedAt ?? "no-completion",
       completion?.authority ?? "no-completion-authority",
       handoff?.updatedAt ?? "no-handoff",
+      handoff?.latestReconciliation?.sequence ?? "no-handoff-reconciliation",
     ].join("|");
     return {
       directorId: row.directorId,
@@ -4134,6 +4291,7 @@ export const make = Effect.gen(function* () {
         "The selected director does not own this project and repository.",
       );
     }
+    yield* ensurePredecessorExecutionSettled(row);
     if (yield* activeReassessment(row.directorId)) {
       return yield* directorError(
         "not-ready",
@@ -4799,20 +4957,24 @@ export const make = Effect.gen(function* () {
           child.associated !== 1 ||
           (child.nativeLifecycle !== "closed" && child.nativeTurnStatus !== "interrupted"),
       );
-      const unassociatedDispatches = yield* persistence(
-        sql<{ readonly dispatchId: string }>`
-          SELECT dispatch_id AS "dispatchId" FROM workflow_worker_dispatches
+      const unassociatedLaunches = yield* persistence(
+        sql<{ readonly launchId: string }>`
+          SELECT dispatch_id AS "launchId" FROM workflow_worker_dispatches
           WHERE director_id = ${row.directorId} AND provider_thread_id IS NULL
+          UNION ALL
+          SELECT review_id AS "launchId" FROM workflow_ticket_reviews
+          WHERE director_id = ${row.directorId} AND status = 'spawn-issued'
+            AND provider_thread_id IS NULL
         `,
-        "Source worker association evidence could not be read.",
+        "Source child association evidence could not be read.",
       );
-      if (unsettled.length > 0 || unassociatedDispatches.length > 0) {
+      if (unsettled.length > 0 || unassociatedLaunches.length > 0) {
         return yield* directorError(
           "not-ready",
           "Every source worker and reviewer must be associated and exactly closed or interrupted before succession.",
           [
             ...unsettled.map((child) => child.providerThreadId),
-            ...unassociatedDispatches.map((entry) => entry.dispatchId),
+            ...unassociatedLaunches.map((entry) => entry.launchId),
           ].join(", "),
         );
       }
@@ -4896,6 +5058,253 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const reconcileHandoffUnlocked = Effect.fn("WorkflowDirectorService.reconcileHandoff")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowDirectorHandoffReconcileInput,
+  ) {
+    const current = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    const handoff = yield* loadHandoffById(input.handoffId);
+    const source = yield* loadDirectorHistoryById(handoff.sourceDirectorId);
+    if (
+      source.directorId === current.directorId ||
+      source.environmentId !== current.environmentId ||
+      source.repository.toLocaleLowerCase() !== current.repository.toLocaleLowerCase() ||
+      source.capabilityNumber !== current.capabilityNumber ||
+      source.worktreePath !== current.worktreePath ||
+      source.worktreeBranch !== current.worktreeBranch ||
+      handoff.worktreePath !== current.worktreePath ||
+      handoff.worktreeBranch !== current.worktreeBranch
+    ) {
+      return yield* directorError(
+        "not-ready",
+        "Only an exact predecessor handoff in this director's capability worktree can be reconciled.",
+        input.handoffId,
+      );
+    }
+    const ancestry = yield* persistence(
+      sql<{ readonly count: number }>`
+        WITH RECURSIVE predecessor_handoffs(handoff_id, source_director_id) AS (
+          SELECT handoff_id, source_director_id FROM workflow_director_handoffs
+          WHERE successor_director_id = ${current.directorId}
+          UNION ALL
+          SELECT h.handoff_id, h.source_director_id FROM workflow_director_handoffs h
+          JOIN predecessor_handoffs p ON h.successor_director_id = p.source_director_id
+        )
+        SELECT count(*) AS count FROM predecessor_handoffs WHERE handoff_id = ${handoff.handoffId}
+      `,
+      "The predecessor handoff chain could not be verified.",
+    );
+    if (ancestry[0]?.count !== 1) {
+      return yield* directorError(
+        "not-ready",
+        "The requested handoff is not a predecessor of the current director.",
+        input.handoffId,
+      );
+    }
+    if (handoff.successorDirectorId === current.directorId) {
+      const receiptState = yield* successorReceiptState(handoff);
+      if (
+        receiptState.disposition === "rejected" ||
+        (receiptState.disposition !== "accepted" &&
+          current.initialTurnDisposition === "not-accepted")
+      ) {
+        return yield* directorError(
+          "not-ready",
+          "Handoff reconciliation cannot adopt a rejected successor with separate native activity.",
+          `Keep handoff ${handoff.handoffId} held until a maintainer explicitly adopts or recovers the unverified execution.`,
+        );
+      }
+    }
+    const unclearedReassessments = yield* unclearedCapabilityReassessments(current);
+    if (unclearedReassessments.length > 0) {
+      return yield* directorError(
+        "not-ready",
+        "Clear every capability director reassessment before acknowledging predecessor evidence.",
+        unclearedReassessments.map((entry) => entry.directorId).join(", "),
+      );
+    }
+    const capability = yield* workflow.issueDetail({
+      projectId: ProjectId.make(current.projectId),
+      repository: current.repository as WorkflowIssueSummary["repository"],
+      number: current.capabilityNumber,
+    });
+    if (capability.kind !== "capability" || capability.state !== "open") {
+      return yield* directorError(
+        "not-ready",
+        "The current capability must remain open before predecessor evidence can be acknowledged.",
+      );
+    }
+    const authorityTriggers = yield* reassessmentTriggers(current, {
+      projectId: ProjectId.make(current.projectId),
+      issue: capability,
+    });
+    if (authorityTriggers.length > 0) {
+      return yield* directorError(
+        "not-ready",
+        "Current capability authority requires reassessment before handoff reconciliation.",
+        authorityTriggers.map((trigger) => trigger.source).join(", "),
+      );
+    }
+    const specification = yield* currentApproval(capability, "specification");
+    const breakdown = yield* currentApproval(capability, "ticket-breakdown");
+    if (
+      !specification ||
+      !breakdown ||
+      workflowEvidenceBodyFingerprint(specification.approvedContent ?? "") !==
+        current.specificationFingerprint ||
+      workflowEvidenceBodyFingerprint(breakdown.approvedContent ?? "") !==
+        current.breakdownFingerprint
+    ) {
+      return yield* directorError(
+        "not-ready",
+        "Current approved capability scope changed and requires reassessment before handoff reconciliation.",
+      );
+    }
+    const snapshot = yield* settledHandoffSnapshot(source, handoff);
+    const reconciliationId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const createdAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO workflow_director_handoff_reconciliations (
+              reconciliation_id, handoff_id, acknowledged_by_director_id, settlements_json,
+              implementation_head, summary, created_at
+            ) VALUES (
+              ${reconciliationId}, ${handoff.handoffId}, ${current.directorId},
+              ${snapshot.settlementsJson}, ${snapshot.implementationHead}, ${input.summary}, ${createdAt}
+            )
+          `;
+          if (handoff.successorDirectorId === current.directorId && handoff.status === "held") {
+            yield* sql`UPDATE workflow_director_handoffs SET status = 'submitting', detail = NULL,
+              updated_at = ${createdAt} WHERE handoff_id = ${handoff.handoffId}`;
+            yield* sql`UPDATE workflow_directors SET status = 'submitting', detail = NULL,
+              updated_at = ${createdAt} WHERE director_id = ${current.directorId} AND is_current = 1`;
+          }
+        }),
+      ),
+      "The handoff reconciliation acknowledgement could not be saved.",
+    );
+    return yield* handoffStatusFromRow(yield* loadHandoffById(handoff.handoffId));
+  });
+
+  const successorReceiptState = Effect.fn("WorkflowDirectorService.successorReceiptState")(
+    function* (handoff: HandoffRow) {
+      if (!handoff.successorCommandId) {
+        return yield* directorError(
+          "persistence-failed",
+          "The successor submission command identity is incomplete.",
+        );
+      }
+      const readReceipt = (commandId: CommandId) =>
+        receipts
+          .getByCommandId({ commandId })
+          .pipe(
+            Effect.mapError((error) =>
+              directorError(
+                "persistence-failed",
+                "Successor command evidence could not be read.",
+                String(error),
+              ),
+            ),
+          );
+      const turnReceipt = yield* readReceipt(CommandId.make(handoff.successorCommandId));
+      const createReceipt = yield* readReceipt(
+        workflowSuccessorCreateCommandId(CommandId.make(handoff.successorCommandId)),
+      );
+      if (Option.isSome(turnReceipt) && turnReceipt.value.status === "accepted") {
+        return { disposition: "accepted" as const, sequence: turnReceipt.value.resultSequence };
+      }
+      if (
+        (Option.isSome(turnReceipt) && turnReceipt.value.status === "rejected") ||
+        (Option.isNone(turnReceipt) &&
+          Option.isSome(createReceipt) &&
+          createReceipt.value.status === "rejected")
+      ) {
+        return { disposition: "rejected" as const };
+      }
+      return { disposition: "unknown" as const };
+    },
+  );
+
+  const finalizeAcceptedSuccessor = Effect.fn("WorkflowDirectorService.finalizeAcceptedSuccessor")(
+    function* (current: DirectorRow, handoff: HandoffRow, sequence: number) {
+      const completedAt = DateTime.formatIso(yield* DateTime.now);
+      const reassessment = yield* activeReassessment(current.directorId);
+      yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            if (reassessment) {
+              yield* sql`UPDATE workflow_directors SET status = 'held', sequence = ${sequence},
+                initial_turn_disposition = 'accepted', updated_at = ${completedAt}
+                WHERE director_id = ${current.directorId} AND is_current = 1`;
+            } else {
+              yield* sql`UPDATE workflow_directors SET status = 'active', sequence = ${sequence},
+                initial_turn_disposition = 'accepted', detail = NULL, updated_at = ${completedAt}
+                WHERE director_id = ${current.directorId} AND is_current = 1`;
+            }
+            yield* sql`UPDATE workflow_director_handoffs SET status = 'submitted', detail = NULL,
+            updated_at = ${completedAt} WHERE handoff_id = ${handoff.handoffId}`;
+          }),
+        ),
+        "The accepted successor receipt could not be saved.",
+      );
+      return yield* statusFromRow(yield* loadDirectorById(current.directorId));
+    },
+  );
+
+  const restoreRejectedSuccessor = Effect.fn("WorkflowDirectorService.restoreRejectedSuccessor")(
+    function* (current: DirectorRow, handoff: HandoffRow) {
+      const source = yield* loadDirectorHistoryById(handoff.sourceDirectorId);
+      const restoredAt = DateTime.formatIso(yield* DateTime.now);
+      const nativeActivity = yield* persistence(
+        sql<{ readonly count: number }>`SELECT
+        (SELECT count(*) FROM workflow_director_native_turns WHERE director_id = ${current.directorId}) +
+        (SELECT count(*) FROM workflow_worker_observations WHERE director_id = ${current.directorId}) AS count`,
+        "Rejected successor native evidence could not be read.",
+      );
+      if (nativeActivity[0]?.count !== 0) {
+        const detail = `The saved successor command was rejected, but the successor has separate native activity. Keep handoff ${handoff.handoffId} held until a maintainer explicitly adopts or recovers that unverified execution.`;
+        yield* persistence(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`UPDATE workflow_directors SET status = 'held',
+              initial_turn_disposition = 'not-accepted', detail = ${detail},
+              updated_at = ${restoredAt} WHERE director_id = ${current.directorId} AND is_current = 1`;
+              yield* sql`UPDATE workflow_director_handoffs SET status = 'held', detail = ${detail},
+              updated_at = ${restoredAt} WHERE handoff_id = ${handoff.handoffId}`;
+            }),
+          ),
+          "The rejected successor with native activity could not be held.",
+        );
+        return yield* directorError(
+          "not-ready",
+          "The rejected successor cannot be abandoned.",
+          detail,
+        );
+      }
+      const detail =
+        "The successor turn was definitively rejected. Call workflow_prepare_director_handoff from the restored source to retry with a fresh identity.";
+      yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE workflow_directors SET is_current = 0, status = 'held',
+            initial_turn_disposition = 'not-accepted', detail = ${detail}, updated_at = ${restoredAt}
+            WHERE director_id = ${current.directorId} AND is_current = 1`;
+            yield* sql`UPDATE workflow_directors SET is_current = 1, status = 'waiting',
+            detail = ${detail}, updated_at = ${restoredAt}
+            WHERE director_id = ${source.directorId} AND is_current = 0`;
+            yield* sql`UPDATE workflow_director_handoffs SET status = 'held', detail = ${detail},
+            updated_at = ${restoredAt} WHERE handoff_id = ${handoff.handoffId}`;
+          }),
+        ),
+        "The definitively rejected successor could not restore its source director.",
+      );
+    },
+  );
+
   const rotateReadyUnlocked = Effect.fn("WorkflowDirectorService.rotateReady")(function* (
     input: WorkflowDirectorStatusInput,
     dispatch: Dispatch,
@@ -4930,6 +5339,50 @@ export const make = Effect.gen(function* () {
       selectedHandoff = incoming;
     }
     let handoff: HandoffRow = selectedHandoff;
+
+    if (
+      handoff.successorDirectorId !== null &&
+      handoff.successorDirectorId !== current.directorId
+    ) {
+      return yield* statusFromRow(current);
+    }
+    if (handoff.successorDirectorId === current.directorId) {
+      if (
+        !handoff.successorCommandId ||
+        !handoff.successorMessageId ||
+        !handoff.successorThreadId ||
+        !handoff.successorPrompt
+      ) {
+        return yield* directorError(
+          "persistence-failed",
+          "The successor submission identity is incomplete.",
+        );
+      }
+      const receiptState = yield* successorReceiptState(handoff);
+      if (receiptState.disposition === "accepted") {
+        return yield* finalizeAcceptedSuccessor(current, handoff, receiptState.sequence);
+      }
+      if (receiptState.disposition === "rejected") {
+        yield* restoreRejectedSuccessor(current, handoff);
+        return yield* directorError(
+          "dispatch-failed",
+          "The successor was definitively rejected. The source director was restored for explicit handoff retry.",
+        );
+      }
+    }
+
+    const unclearedReassessments = yield* unclearedCapabilityReassessments(current);
+    if (unclearedReassessments.length > 0) {
+      return yield* directorError(
+        "not-ready",
+        "Clear every capability director reassessment before dispatching the saved successor turn.",
+        unclearedReassessments.map((entry) => entry.directorId).join(", "),
+      );
+    }
+
+    if (handoff.successorDirectorId === null) {
+      yield* ensurePredecessorExecutionSettled(current);
+    }
 
     const capabilityAdmissionsRaw = yield* persistence(
       sql<Record<string, unknown>>`
@@ -4979,6 +5432,7 @@ export const make = Effect.gen(function* () {
         admittedTicketNumbers: new Set(
           capabilityAdmissions.map((admission) => admission.ticketNumber),
         ),
+        requireActionableUnfinishedTicket: handoff.successorDirectorId === null,
       },
     );
 
@@ -5093,32 +5547,25 @@ export const make = Effect.gen(function* () {
         "The successor submission identity is incomplete.",
       );
     }
-    const existingReceipt = yield* receipts
-      .getByCommandId({ commandId: CommandId.make(handoff.successorCommandId) })
-      .pipe(
-        Effect.mapError((error) =>
-          directorError(
-            "persistence-failed",
-            "Successor command evidence could not be read.",
-            String(error),
-          ),
-        ),
+    const receiptState = yield* successorReceiptState(handoff);
+    if (receiptState.disposition === "accepted") {
+      return yield* finalizeAcceptedSuccessor(current, handoff, receiptState.sequence);
+    }
+    if (receiptState.disposition === "rejected") {
+      yield* restoreRejectedSuccessor(current, handoff);
+      return yield* directorError(
+        "dispatch-failed",
+        "The successor was definitively rejected. The source director was restored for explicit handoff retry.",
       );
-    const acceptedSequence =
-      Option.isSome(existingReceipt) && existingReceipt.value.status === "accepted"
-        ? existingReceipt.value.resultSequence
-        : null;
+    }
     const source = yield* loadDirectorHistoryById(handoff.sourceDirectorId);
-    const currentSnapshot = yield* settledHandoffSnapshot(
-      source,
-      handoff,
-      acceptedSequence === null ? undefined : (handoff.implementationHead ?? undefined),
-    ).pipe(Effect.result);
+    const expectedSnapshot = yield* effectiveHandoffSettlement(handoff);
+    const currentSnapshot = yield* settledHandoffSnapshot(source, handoff).pipe(Effect.result);
     if (
       currentSnapshot._tag === "Failure" ||
       currentSnapshot.success.admissionsJson !== handoff.admissionsJson ||
-      currentSnapshot.success.settlementsJson !== handoff.settlementsJson ||
-      currentSnapshot.success.implementationHead !== handoff.implementationHead ||
+      currentSnapshot.success.settlementsJson !== expectedSnapshot.settlementsJson ||
+      currentSnapshot.success.implementationHead !== expectedSnapshot.implementationHead ||
       currentSnapshot.success.specificationLinksJson !== handoff.specificationLinksJson ||
       currentSnapshot.success.issueLinksJson !== handoff.issueLinksJson ||
       currentSnapshot.success.reviewLinksJson !== handoff.reviewLinksJson ||
@@ -5157,75 +5604,72 @@ export const make = Effect.gen(function* () {
         detail,
       );
     }
-    let sequence = acceptedSequence;
-    if (sequence === null) {
-      const submittedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* persistence(
-        sql`UPDATE workflow_directors SET initial_turn_disposition = 'unknown',
-          updated_at = ${submittedAt} WHERE director_id = ${current.directorId}
-            AND initial_turn_disposition = 'not-attempted'`,
-        "The successor dispatch attempt could not be marked before submission.",
-      );
-      current = { ...current, initialTurnDisposition: "unknown", updatedAt: submittedAt };
-      const dispatched = yield* dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make(handoff.successorCommandId),
-        threadId: ThreadId.make(handoff.successorThreadId),
-        message: {
-          messageId: MessageId.make(handoff.successorMessageId),
-          role: "user",
-          text: handoff.successorPrompt,
-          attachments: [],
+    const submittedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql`UPDATE workflow_directors SET initial_turn_disposition = 'unknown',
+        updated_at = ${submittedAt} WHERE director_id = ${current.directorId}
+          AND initial_turn_disposition = 'not-attempted'`,
+      "The successor dispatch attempt could not be marked before submission.",
+    );
+    current = { ...current, initialTurnDisposition: "unknown", updatedAt: submittedAt };
+    const dispatched = yield* dispatch({
+      type: "thread.turn.start",
+      commandId: CommandId.make(handoff.successorCommandId),
+      threadId: ThreadId.make(handoff.successorThreadId),
+      message: {
+        messageId: MessageId.make(handoff.successorMessageId),
+        role: "user",
+        text: handoff.successorPrompt,
+        attachments: [],
+      },
+      modelSelection,
+      runtimeMode: "approval-required",
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      bootstrap: {
+        createThread: {
+          projectId: ProjectId.make(current.projectId),
+          title: `Director: ${prepared.capability.title}`,
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          branch: current.worktreeBranch,
+          worktreePath: current.worktreePath,
+          createdAt: submittedAt,
         },
-        modelSelection,
-        runtimeMode: "approval-required",
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        bootstrap: {
-          createThread: {
-            projectId: ProjectId.make(current.projectId),
-            title: `Director: ${prepared.capability.title}`,
-            modelSelection,
-            runtimeMode: "approval-required",
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: current.worktreeBranch,
-            worktreePath: current.worktreePath,
-            createdAt: submittedAt,
-          },
-          runSetupScript: false,
-        },
-        createdAt: submittedAt,
-      }).pipe(Effect.result);
-      if (dispatched._tag === "Failure") {
-        if (dispatched.failure.bootstrapTurnDisposition === "not-accepted") {
-          yield* persistence(
-            sql`UPDATE workflow_directors SET initial_turn_disposition = 'not-accepted',
-              detail = 'The successor turn was definitively not accepted and may be explicitly retried.',
-              updated_at = ${submittedAt} WHERE director_id = ${current.directorId}`,
-            "The rejected successor disposition could not be saved.",
-          );
-        }
+        runSetupScript: false,
+      },
+      createdAt: submittedAt,
+    }).pipe(Effect.result);
+    if (dispatched._tag === "Failure") {
+      const afterFailure = yield* successorReceiptState(handoff).pipe(Effect.result);
+      if (afterFailure._tag === "Success" && afterFailure.success.disposition === "accepted") {
+        yield* finalizeAcceptedSuccessor(current, handoff, afterFailure.success.sequence);
         return yield* directorError(
           "dispatch-failed",
-          "The saved successor first turn remains pending receipt reconciliation.",
+          "The successor turn was accepted and reconciled after the local dispatch failure.",
           String(dispatched.failure),
         );
       }
-      sequence = dispatched.success.sequence;
+      if (
+        (afterFailure._tag === "Success" && afterFailure.success.disposition === "rejected") ||
+        dispatched.failure.bootstrapTurnDisposition === "not-accepted"
+      ) {
+        yield* restoreRejectedSuccessor(current, handoff);
+        return yield* directorError(
+          "dispatch-failed",
+          "The successor was definitively rejected. The source director was restored for explicit handoff retry.",
+          String(dispatched.failure),
+        );
+      }
+      return yield* directorError(
+        "dispatch-failed",
+        "The saved successor first turn remains pending receipt reconciliation.",
+        afterFailure._tag === "Failure"
+          ? `${String(dispatched.failure)} Receipt read failed: ${String(afterFailure.failure)}`
+          : String(dispatched.failure),
+      );
     }
-    const completedAt = DateTime.formatIso(yield* DateTime.now);
-    yield* persistence(
-      sql.withTransaction(
-        Effect.gen(function* () {
-          yield* sql`UPDATE workflow_directors SET status = 'active', sequence = ${sequence},
-            initial_turn_disposition = 'accepted', detail = NULL, updated_at = ${completedAt}
-            WHERE director_id = ${current.directorId} AND is_current = 1`;
-          yield* sql`UPDATE workflow_director_handoffs SET status = 'submitted', detail = NULL,
-            updated_at = ${completedAt} WHERE handoff_id = ${handoff.handoffId}`;
-        }),
-      ),
-      "The accepted successor receipt could not be saved.",
-    );
-    return yield* statusFromRow(yield* loadDirectorById(current.directorId));
+    return yield* finalizeAcceptedSuccessor(current, handoff, dispatched.success.sequence);
   });
 
   const verifyGitRange = Effect.fn("WorkflowDirectorService.verifyGitRange")(function* (
@@ -5476,7 +5920,8 @@ export const make = Effect.gen(function* () {
         if (directorId === row.directorId) continue;
         const handoff = yield* outgoingHandoff(directorId);
         if (!handoff || handoff.status !== "submitted") continue;
-        const settlements = yield* decodeHandoffSettlementsJson(handoff.settlementsJson).pipe(
+        const effective = yield* effectiveHandoffSettlement(handoff);
+        const settlements = yield* decodeHandoffSettlementsJson(effective.settlementsJson).pipe(
           Effect.mapError((error) =>
             directorError(
               "persistence-failed",
@@ -5520,7 +5965,8 @@ export const make = Effect.gen(function* () {
           unsettledRoots.push(root.directorId);
           continue;
         }
-        const settlements = yield* decodeHandoffSettlementsJson(handoff.settlementsJson).pipe(
+        const effective = yield* effectiveHandoffSettlement(handoff);
+        const settlements = yield* decodeHandoffSettlementsJson(effective.settlementsJson).pipe(
           Effect.mapError((error) =>
             directorError(
               "persistence-failed",
@@ -5634,7 +6080,8 @@ export const make = Effect.gen(function* () {
           predecessor.directorId,
         );
       }
-      const settlements = yield* decodeHandoffSettlementsJson(handoff.settlementsJson).pipe(
+      const effective = yield* effectiveHandoffSettlement(handoff);
+      const settlements = yield* decodeHandoffSettlementsJson(effective.settlementsJson).pipe(
         Effect.mapError((error) =>
           directorError(
             "persistence-failed",
@@ -5670,8 +6117,8 @@ export const make = Effect.gen(function* () {
       ) {
         return yield* directorError(
           "not-ready",
-          "New predecessor director activity requires explicit handoff recovery.",
-          predecessor.directorId,
+          "New predecessor director activity requires explicit handoff reconciliation.",
+          `Call workflow_reconcile_director_handoff with handoffId ${handoff.handoffId}.`,
         );
       }
       const children = yield* persistence(
@@ -5724,7 +6171,7 @@ export const make = Effect.gen(function* () {
         return yield* directorError(
           "not-ready",
           "New, unknown, or unsettled predecessor child activity blocks delegation.",
-          invalid?.providerThreadId ?? predecessor.directorId,
+          `Handoff ${handoff.handoffId}; call workflow_reconcile_director_handoff after ${invalid?.providerThreadId ?? predecessor.directorId} settles.`,
         );
       }
     }
@@ -5991,6 +6438,7 @@ export const make = Effect.gen(function* () {
       input: WorkflowTicketReviewPrepareInput,
     ) {
       const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      yield* ensurePredecessorExecutionSettled(row);
       const labels = input.checks.map((check) => check.label);
       if (new Set(labels).size !== labels.length) {
         return yield* directorError("checks-failed", "Agreed review check labels must be unique.");
@@ -7908,6 +8356,10 @@ export const make = Effect.gen(function* () {
     prepareHandoff: (environmentId, threadId, providerInstanceId, input) =>
       lock.withPermits(1)(
         prepareHandoffUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    reconcileHandoff: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        reconcileHandoffUnlocked(environmentId, threadId, providerInstanceId, input),
       ),
     rotateReady: (input, dispatch) => lock.withPermits(1)(rotateReadyUnlocked(input, dispatch)),
     prepareWorker: (environmentId, threadId, providerInstanceId, input) =>

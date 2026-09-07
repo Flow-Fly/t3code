@@ -800,8 +800,8 @@ describe("ProviderCommandReactor", () => {
         }),
       });
     };
-    const resolveDirectorTickets = () => {
-      for (const ticket of directorTickets) {
+    const resolveDirectorTickets = (count = directorTickets.length) => {
+      for (const ticket of directorTickets.slice(0, count)) {
         const resolution = {
           id: `resolution-${ticket.number}`,
           url: `${ticket.url}#issuecomment-resolution`,
@@ -840,6 +840,29 @@ describe("ProviderCommandReactor", () => {
           }),
         });
       }
+    };
+    const holdDirectorTicket = (index: number) => {
+      const ticket = directorTickets[index]!;
+      Object.assign(ticket, {
+        labels: ticket.labels.filter((label) => label !== "ready-for-agent"),
+        readiness: {
+          status: "blocked",
+          reasons: [
+            {
+              kind: "open-blocker",
+              message: "A required predecessor is still open.",
+              source: ticket.url,
+            },
+          ],
+        },
+      });
+    };
+    const readyDirectorTicket = (index: number) => {
+      const ticket = directorTickets[index]!;
+      Object.assign(ticket, {
+        labels: [...new Set([...ticket.labels, "ready-for-agent"])],
+        readiness: { status: "ready", reasons: [] },
+      });
     };
     const workflowAssignees = new Set<string>();
     const workflowDetail = (issue: WorkflowIssueSummary): WorkflowIssueDetail => {
@@ -1069,15 +1092,21 @@ describe("ProviderCommandReactor", () => {
       );
     const dispatchWorkflow = (
       command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
-    ) =>
-      command.bootstrap?.createThread
-        ? dispatchCreatedThreadTurnStart({
-            command: command as never,
-            createCommandId: Effect.succeed(CommandId.make(`workflow:create:${command.commandId}`)),
-            dispatch: dispatchForWorkflow,
-            drainThreadDeletionThrough: () => Effect.void,
-          })
-        : dispatchForWorkflow(command);
+    ) => {
+      const createThread = command.bootstrap?.createThread;
+      if (!createThread) return dispatchForWorkflow(command);
+      return dispatchCreatedThreadTurnStart({
+        command: {
+          ...command,
+          bootstrap: { ...command.bootstrap, createThread },
+        },
+        createCommandId: Effect.succeed(
+          WorkflowDirectorService.workflowSuccessorCreateCommandId(command.commandId),
+        ),
+        dispatch: dispatchForWorkflow,
+        drainThreadDeletionThrough: () => Effect.void,
+      });
+    };
     const sqlClient = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
     const makeWorkflowMonitor = () =>
       Effect.runPromise(
@@ -1255,6 +1284,7 @@ describe("ProviderCommandReactor", () => {
       stateDir,
       drain,
       runEffect,
+      sqlClient,
       emitProviderEvents,
       readWorkflowResumeRows,
       readDirectorRows,
@@ -1272,6 +1302,8 @@ describe("ProviderCommandReactor", () => {
       dispatchWorkflow,
       workflowAssignees,
       resolveDirectorTickets,
+      holdDirectorTicket,
+      readyDirectorTicket,
       get titleRegenerationCompletionDispatchAttempts() {
         return titleRegenerationCompletionDispatchAttempts;
       },
@@ -1637,6 +1669,47 @@ describe("ProviderCommandReactor", () => {
           }),
         ).toMatchObject({ disposition: "limit-reached", admissionCount: 10 });
 
+        const sourceWorker = yield* harness.workflowDirector.prepareWorker(
+          EnvironmentId.make("workflow-environment"),
+          started.director.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            ticketNumber: harness.directorTickets[0]!.number,
+            ownership: "source settlement worker",
+            writePaths: ["apps/server/src/workflow"],
+          },
+        );
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "task.started",
+              eventId: EventId.make("rotation-source-worker-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              createdAt: "2026-09-07T12:59:59.000Z",
+              payload: {
+                taskId: RuntimeTaskId.make("rotation-source-worker"),
+                timelineBypass: true,
+                nativeTurn: {
+                  sessionId: "rotation-source-worker-session",
+                  turnId: "rotation-source-worker-turn",
+                  status: "running",
+                },
+              },
+            },
+          ]),
+        );
+        yield* harness.workflowDirector.associateWorker(
+          EnvironmentId.make("workflow-environment"),
+          started.director.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            associationToken: sourceWorker.associationToken,
+            providerThreadId: "rotation-source-worker",
+          },
+        );
+
         yield* Effect.promise(() =>
           harness.emitProviderEvents([
             {
@@ -1649,6 +1722,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:00:00.000Z",
               payload: {},
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-source-session",
                   turn: { id: "rotation-source-turn" },
@@ -1665,6 +1739,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:00:01.000Z",
               payload: { reason: "Interrupted for durable handoff." },
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-source-session",
                   turn: { id: "rotation-source-turn" },
@@ -1696,6 +1771,255 @@ describe("ProviderCommandReactor", () => {
           ),
         ).toMatchObject({ handoffId: prepared.handoffId, status: "waiting-settlement" });
 
+        const heldForLiveSourceChild = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(heldForLiveSourceChild._tag).toBe("Failure");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "task.updated",
+              eventId: EventId.make("rotation-source-worker-interrupted"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              createdAt: "2026-09-07T13:00:01.500Z",
+              payload: {
+                taskId: RuntimeTaskId.make("rotation-source-worker"),
+                status: "interrupted",
+                timelineBypass: true,
+                nativeTurn: {
+                  sessionId: "rotation-source-worker-session",
+                  turnId: "rotation-source-worker-turn",
+                  status: "interrupted",
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`
+              INSERT INTO workflow_ticket_reviews (
+                review_id, association_token, director_id, batch_id, admission_id,
+                implementation_dispatch_id, repository, ticket_number, fixed_base,
+                implementation_head, scope_body, requested_model, requested_effort,
+                requested_skill_path, provider_thread_id, status, created_at, updated_at
+              ) VALUES (
+                'rotation-issued-review', 'rotation-issued-token',
+                ${started.director.directorId}, ${started.director.batchId},
+                ${sourceWorker.admission.admissionId}, ${sourceWorker.dispatchId},
+                'Flow-Fly/t3code', ${harness.directorTickets[0]!.number}, ${"a".repeat(40)},
+                ${harness.directorImplementationHead}, ${harness.directorTickets[0]!.body},
+                'gpt-6-astra', 'medium', '/skills/code-review/SKILL.md', NULL,
+                'spawn-issued', '2026-09-07T13:00:01.600Z', '2026-09-07T13:00:01.600Z'
+              )
+              `;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const heldForIssuedReviewer = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(heldForIssuedReviewer._tag).toBe("Failure");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_ticket_reviews SET status = 'prepared'
+                WHERE review_id = 'rotation-issued-review'`;
+              yield* sql`INSERT INTO workflow_reassessments (
+                reassessment_id, director_id, trigger_kind, trigger_issue_number, trigger_source,
+                status, required_action, stop_request_status, tracker_status, created_at, updated_at
+              ) VALUES (
+                'rotation-active-reassessment', ${started.director.directorId}, 'scope-change', 17,
+                'https://github.com/Flow-Fly/t3code/issues/17#reassessment', 'held',
+                'Clear this reassessment before rotation.', 'not-issued', 'confirmed',
+                '2026-09-07T13:00:01.650Z', '2026-09-07T13:00:01.650Z'
+              )`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+
+        const heldForCurrentReassessment = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(heldForCurrentReassessment._tag).toBe("Failure");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_reassessments SET status = 'cleared'
+                WHERE reassessment_id = 'rotation-active-reassessment'`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+
+        harness.resolveDirectorTickets(10);
+        harness.holdDirectorTicket(10);
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        for (const index of harness.directorTickets.keys()) harness.readyDirectorTicket(index);
+
+        const unknownBeforeDispatch = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            () =>
+              Effect.fail(
+                new OrchestrationDispatchCommandError({
+                  message: "Simulated failure with no definitive engine receipt.",
+                }),
+              ),
+          )
+          .pipe(Effect.result);
+        expect(unknownBeforeDispatch._tag).toBe("Failure");
+        const pendingRejection = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        const rejectionIdentity = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly successorThreadId: string;
+                readonly successorCommandId: string;
+              }>`SELECT successor_thread_id AS "successorThreadId",
+                successor_command_id AS "successorCommandId"
+                FROM workflow_director_handoffs WHERE handoff_id = ${prepared.handoffId}`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        expect(pendingRejection).toMatchObject({
+          status: "submitting",
+          handoff: { status: "submitting" },
+        });
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`INSERT INTO workflow_reassessments (
+                reassessment_id, director_id, trigger_kind, trigger_issue_number, trigger_source,
+                status, required_action, stop_request_status, tracker_status, created_at, updated_at
+              ) VALUES (
+                'rotation-pending-successor-reassessment', ${pendingRejection.directorId},
+                'scope-change', 17,
+                'https://github.com/Flow-Fly/t3code/issues/17#pending-successor-reassessment',
+                'held', 'Clear before redispatch.', 'not-issued', 'confirmed',
+                '2026-09-07T13:00:01.675Z', '2026-09-07T13:00:01.675Z'
+              )`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const pendingRedispatchHeldForReassessment = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(pendingRedispatchHeldForReassessment._tag).toBe("Failure");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_reassessments SET status = 'cleared'
+                WHERE reassessment_id = 'rotation-pending-successor-reassessment'`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("rotation-conflicting-thread-create"),
+          threadId: ThreadId.make(rejectionIdentity[0]!.successorThreadId),
+          projectId: ProjectId.make("project-1"),
+          title: "Conflicting successor thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-6-astra",
+          },
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-09-07T13:00:01.700Z",
+        });
+        yield* Effect.promise(() => harness.drain());
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+        const rejectedCreate = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(rejectedCreate).toMatchObject({
+          directorId: started.director.directorId,
+          status: "waiting",
+          handoff: { handoffId: prepared.handoffId, status: "held" },
+        });
+        const turnReceipt = yield* Effect.promise(() =>
+          harness.readCommandReceipt(CommandId.make(rejectionIdentity[0]!.successorCommandId)),
+        );
+        const createReceipt = yield* Effect.promise(() =>
+          harness.readCommandReceipt(
+            WorkflowDirectorService.workflowSuccessorCreateCommandId(
+              CommandId.make(rejectionIdentity[0]!.successorCommandId),
+            ),
+          ),
+        );
+        expect(Option.isNone(turnReceipt)).toBe(true);
+        expect(Option.getOrNull(createReceipt)).toMatchObject({ status: "rejected" });
+        expect(
+          yield* harness.workflowDirector.prepareHandoff(
+            EnvironmentId.make("workflow-environment"),
+            started.director.threadId,
+            ProviderInstanceId.make("codex"),
+            handoffInput,
+          ),
+        ).toMatchObject({
+          handoffId: prepared.handoffId,
+          status: "waiting-settlement",
+          successorDirectorId: null,
+        });
+
         const stoppedBeforeDispatch = yield* harness.workflowDirector
           .rotateReady(
             {
@@ -1725,6 +2049,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:00:02.000Z",
               payload: {},
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-source-session",
                   turn: { id: "rotation-source-late-turn" },
@@ -1741,6 +2066,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:00:03.000Z",
               payload: { reason: "Late source activity invalidated the frozen handoff." },
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-source-session",
                   turn: { id: "rotation-source-late-turn" },
@@ -1759,7 +2085,13 @@ describe("ProviderCommandReactor", () => {
             harness.dispatchWorkflow,
           )
           .pipe(Effect.result);
-        expect(heldForChangedSource._tag).toBe("Failure");
+        expect(heldForChangedSource._tag).toBe("Success");
+        if (heldForChangedSource._tag === "Success") {
+          expect(heldForChangedSource.success).toMatchObject({
+            directorId: started.director.directorId,
+            status: "waiting",
+          });
+        }
         const recoveredHandoff = yield* harness.workflowDirector.prepareHandoff(
           EnvironmentId.make("workflow-environment"),
           started.director.threadId,
@@ -1782,6 +2114,28 @@ describe("ProviderCommandReactor", () => {
             (command) =>
               harness.dispatchWorkflow(command).pipe(
                 Effect.flatMap(() =>
+                  Effect.promise(() =>
+                    harness.runEffect(
+                      Effect.gen(function* () {
+                        const sql = yield* SqlClient.SqlClient;
+                        yield* sql`INSERT INTO workflow_reassessments (
+                          reassessment_id, director_id, trigger_kind, trigger_issue_number,
+                          trigger_source, status, required_action, stop_request_status,
+                          tracker_status, created_at, updated_at
+                        ) SELECT
+                          'rotation-accepted-receipt-reassessment', director_id, 'scope-change', 17,
+                          'https://github.com/Flow-Fly/t3code/issues/17#accepted-receipt-reassessment',
+                          'held', 'Preserve this hold while reconciling the accepted receipt.',
+                          'not-issued', 'confirmed', '2026-09-07T13:00:03.500Z',
+                          '2026-09-07T13:00:03.500Z'
+                        FROM workflow_directors WHERE thread_id = ${command.threadId}`;
+                        yield* sql`UPDATE workflow_directors SET status = 'held',
+                          detail = 'Durable reassessment hold.' WHERE thread_id = ${command.threadId}`;
+                      }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+                    ),
+                  ),
+                ),
+                Effect.flatMap(() =>
                   Effect.fail(
                     new OrchestrationDispatchCommandError({
                       message: "Simulated crash after the engine accepted the successor turn.",
@@ -1793,6 +2147,43 @@ describe("ProviderCommandReactor", () => {
           .pipe(Effect.result);
         expect(crashedAfterReceipt._tag).toBe("Failure");
         yield* Effect.promise(() => harness.drain());
+        const acceptedDuringReassessment = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(acceptedDuringReassessment).toMatchObject({
+          status: "held",
+          reassessment: { reassessmentId: "rotation-accepted-receipt-reassessment" },
+          handoff: { handoffId: prepared.handoffId, status: "submitted" },
+        });
+        const heldReceiptRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly status: string;
+                readonly initialTurnDisposition: string;
+                readonly detail: string;
+              }>`SELECT status, initial_turn_disposition AS "initialTurnDisposition", detail
+                FROM workflow_directors WHERE director_id = ${acceptedDuringReassessment.directorId}`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        expect({ ...heldReceiptRows[0] }).toEqual({
+          status: "held",
+          initialTurnDisposition: "accepted",
+          detail: "Durable reassessment hold.",
+        });
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_reassessments SET status = 'cleared'
+                WHERE reassessment_id = 'rotation-accepted-receipt-reassessment'`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
         harness.advanceDirectorImplementationHead();
 
         yield* Effect.promise(() => harness.makeWorkflowMonitor());
@@ -1823,6 +2214,145 @@ describe("ProviderCommandReactor", () => {
           modelSelection: expect.objectContaining({ model: "gpt-6-astra" }),
         });
 
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_directors SET status = 'held'
+                WHERE director_id = ${rotated.directorId}`;
+              yield* sql`UPDATE workflow_director_handoffs SET status = 'held'
+                WHERE handoff_id = ${prepared.handoffId}`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const recoveredAcceptedHandoff = yield* harness.workflowDirector.reconcileHandoff(
+          EnvironmentId.make("workflow-environment"),
+          rotated.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            handoffId: prepared.handoffId,
+            summary: "Recovered the accepted successor without changing its identity.",
+          },
+        );
+        expect(recoveredAcceptedHandoff).toMatchObject({
+          status: "submitting",
+          successorDirectorId: rotated.directorId,
+          latestReconciliation: {
+            acknowledgedByDirectorId: rotated.directorId,
+            summary: "Recovered the accepted successor without changing its identity.",
+          },
+        });
+        const finalizedAcceptedHandoff = yield* harness.workflowDirector.rotateReady(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            capabilityNumber: 17,
+          },
+          harness.dispatchWorkflow,
+        );
+        expect(finalizedAcceptedHandoff).toMatchObject({
+          directorId: rotated.directorId,
+          status: "active",
+          handoff: { handoffId: prepared.handoffId, status: "submitted" },
+        });
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+
+        const originalHandoffRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{ readonly settlementsJson: string }>`
+                SELECT settlements_json AS "settlementsJson"
+                FROM workflow_director_handoffs WHERE handoff_id = ${prepared.handoffId}
+              `;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-retired-source-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-retired-source-turn"),
+              createdAt: "2026-09-07T13:00:04.000Z",
+              payload: {},
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-retired-source-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-retired-source-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-retired-source-turn"),
+              createdAt: "2026-09-07T13:00:05.000Z",
+              payload: { reason: "Retired source activity needs explicit acknowledgement." },
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-retired-source-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+        const blockedByRetiredActivity = yield* harness.workflowDirector
+          .admit({
+            projectId: ProjectId.make("project-1"),
+            directorId: rotated.directorId,
+            repository: "Flow-Fly/t3code",
+            ticketNumber: harness.directorTickets[10]!.number,
+            purpose: "implement",
+            ownership: "delivery-11",
+          })
+          .pipe(Effect.result);
+        expect(blockedByRetiredActivity._tag).toBe("Failure");
+        const reconciledHandoff = yield* harness.workflowDirector.reconcileHandoff(
+          EnvironmentId.make("workflow-environment"),
+          rotated.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            handoffId: prepared.handoffId,
+            summary: "Acknowledged the retired source's later terminal turn.",
+          },
+        );
+        expect(reconciledHandoff).toMatchObject({
+          handoffId: prepared.handoffId,
+          latestReconciliation: {
+            acknowledgedByDirectorId: rotated.directorId,
+            summary: "Acknowledged the retired source's later terminal turn.",
+          },
+        });
+        const reconciledRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly settlementsJson: string;
+                readonly reconciliationCount: number;
+              }>`SELECT h.settlements_json AS "settlementsJson",
+                (SELECT count(*) FROM workflow_director_handoff_reconciliations r
+                  WHERE r.handoff_id = h.handoff_id) AS "reconciliationCount"
+                FROM workflow_director_handoffs h WHERE h.handoff_id = ${prepared.handoffId}`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        expect({ ...reconciledRows[0] }).toEqual({
+          settlementsJson: originalHandoffRows[0]!.settlementsJson,
+          reconciliationCount: 2,
+        });
+
         const continued = yield* harness.workflowDirector.admit({
           projectId: ProjectId.make("project-1"),
           directorId: rotated.directorId,
@@ -1832,6 +2362,120 @@ describe("ProviderCommandReactor", () => {
           ownership: "delivery-11",
         });
         expect(continued).toMatchObject({ disposition: "admitted", admissionCount: 1 });
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-retired-source-newer-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-retired-source-newer-turn"),
+              createdAt: "2026-09-07T13:00:06.000Z",
+              payload: {},
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-retired-source-newer-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-retired-source-newer-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-retired-source-newer-turn"),
+              createdAt: "2026-09-07T13:00:07.000Z",
+              payload: { reason: "A newer retired source turn invalidates the acknowledgement." },
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-retired-source-newer-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+        const reviewBlockedByNewerActivity = yield* harness.workflowDirector
+          .prepareTicketReview(
+            EnvironmentId.make("workflow-environment"),
+            rotated.threadId,
+            ProviderInstanceId.make("codex"),
+            {
+              ticketNumber: harness.directorTickets[10]!.number,
+              implementationProviderThreadId: "not-reached-before-predecessor-gate",
+              fixedBase: "a".repeat(40),
+              implementationHead: harness.directorImplementationHead,
+              checks: [{ label: "focused", command: "vp test run workflow" }],
+            },
+          )
+          .pipe(Effect.result);
+        expect(reviewBlockedByNewerActivity._tag).toBe("Failure");
+        if (reviewBlockedByNewerActivity._tag === "Failure") {
+          expect(reviewBlockedByNewerActivity.failure).toMatchObject({ failure: "not-ready" });
+          expect(reviewBlockedByNewerActivity.failure.message).toContain(
+            "predecessor director activity",
+          );
+        }
+        const secondReconciliation = yield* harness.workflowDirector.reconcileHandoff(
+          EnvironmentId.make("workflow-environment"),
+          rotated.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            handoffId: prepared.handoffId,
+            summary: "Acknowledged the newer terminal source turn.",
+          },
+        );
+        expect(secondReconciliation.latestReconciliation).toMatchObject({
+          acknowledgedByDirectorId: rotated.directorId,
+          summary: "Acknowledged the newer terminal source turn.",
+        });
+        expect(secondReconciliation.latestReconciliation!.sequence).toBeGreaterThan(
+          reconciledHandoff.latestReconciliation!.sequence,
+        );
+        const reviewAfterReconciliation = yield* harness.workflowDirector
+          .prepareTicketReview(
+            EnvironmentId.make("workflow-environment"),
+            rotated.threadId,
+            ProviderInstanceId.make("codex"),
+            {
+              ticketNumber: harness.directorTickets[10]!.number,
+              implementationProviderThreadId: "not-reached-before-predecessor-gate",
+              fixedBase: "a".repeat(40),
+              implementationHead: harness.directorImplementationHead,
+              checks: [{ label: "focused", command: "vp test run workflow" }],
+            },
+          )
+          .pipe(Effect.result);
+        expect(reviewAfterReconciliation._tag).toBe("Failure");
+        if (reviewAfterReconciliation._tag === "Failure") {
+          expect(reviewAfterReconciliation.failure).toMatchObject({ failure: "review-incomplete" });
+        }
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_director_handoff_reconciliations
+                SET created_at = '2026-09-07T13:00:08.000Z'
+                WHERE handoff_id = ${prepared.handoffId}`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const equalTimeStatus = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(equalTimeStatus.handoff?.latestReconciliation).toMatchObject({
+          sequence: secondReconciliation.latestReconciliation!.sequence,
+          summary: "Acknowledged the newer terminal source turn.",
+          createdAt: "2026-09-07T13:00:08.000Z",
+        });
         const durableRows = yield* Effect.promise(() =>
           harness.runEffect(
             Effect.gen(function* () {
@@ -1840,17 +2484,20 @@ describe("ProviderCommandReactor", () => {
                 readonly currentCount: number;
                 readonly directorCount: number;
                 readonly handoffCount: number;
+                readonly reconciliationCount: number;
               }>`SELECT
                 (SELECT count(*) FROM workflow_directors WHERE is_current = 1) AS "currentCount",
                 (SELECT count(*) FROM workflow_directors WHERE capability_number = 17) AS "directorCount",
-                (SELECT count(*) FROM workflow_director_handoffs WHERE status = 'submitted') AS "handoffCount"`;
-            }),
+                (SELECT count(*) FROM workflow_director_handoffs WHERE status = 'submitted') AS "handoffCount",
+                (SELECT count(*) FROM workflow_director_handoff_reconciliations) AS "reconciliationCount"`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
           ),
         );
         expect({ ...durableRows[0] }).toEqual({
           currentCount: 1,
-          directorCount: 3,
+          directorCount: 4,
           handoffCount: 1,
+          reconciliationCount: 3,
         });
 
         for (const [index, ticket] of harness.directorTickets.slice(0, 9).entries()) {
@@ -1885,6 +2532,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:01:00.000Z",
               payload: {},
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-successor-session",
                   turn: { id: "rotation-successor-turn" },
@@ -1901,6 +2549,7 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:01:01.000Z",
               payload: { reason: "Second durable handoff." },
               raw: {
+                source: "codex.app-server.notification",
                 payload: {
                   threadId: "rotation-successor-session",
                   turn: { id: "rotation-successor-turn" },
@@ -1941,15 +2590,118 @@ describe("ProviderCommandReactor", () => {
                 (SELECT count(*) FROM workflow_directors WHERE is_current = 1) AS "currentCount",
                 (SELECT count(*) FROM workflow_directors WHERE capability_number = 17) AS "directorCount",
                 (SELECT count(*) FROM workflow_director_handoffs WHERE status = 'submitted') AS "handoffCount"`;
-            }),
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
           ),
         );
         expect({ ...repeatedRows[0] }).toEqual({
           currentCount: 1,
-          directorCount: 4,
+          directorCount: 5,
           handoffCount: 2,
         });
         harness.workflowAssignees.clear();
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-oldest-source-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-oldest-source-turn"),
+              createdAt: "2026-09-07T13:01:02.000Z",
+              payload: {},
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-oldest-source-turn" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-oldest-source-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("rotation-oldest-source-turn"),
+              createdAt: "2026-09-07T13:01:03.000Z",
+              payload: { reason: "The oldest predecessor changed after another rotation." },
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-source-session",
+                  turn: { id: "rotation-oldest-source-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.drain());
+        const olderPredecessorBlocked = yield* harness.workflowDirector
+          .prepareWorker(
+            EnvironmentId.make("workflow-environment"),
+            third.threadId,
+            ProviderInstanceId.make("codex"),
+            {
+              ticketNumber: harness.directorTickets[10]!.number,
+              ownership: "post-recovery worker",
+              writePaths: ["apps/server/src/workflow"],
+            },
+          )
+          .pipe(Effect.result);
+        expect(olderPredecessorBlocked._tag).toBe("Failure");
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`INSERT INTO workflow_reassessments (
+                reassessment_id, director_id, trigger_kind, trigger_issue_number, trigger_source,
+                status, required_action, stop_request_status, tracker_status, created_at, updated_at
+              ) VALUES (
+                'rotation-historical-reassessment', ${started.director.directorId},
+                'scope-change', 17,
+                'https://github.com/Flow-Fly/t3code/issues/17#historical-reassessment', 'held',
+                'Clear historical reassessment before acknowledgement.', 'not-issued', 'confirmed',
+                '2026-09-07T13:01:03.500Z', '2026-09-07T13:01:03.500Z'
+              )`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const reconciliationBlockedByHistoricalReassessment = yield* harness.workflowDirector
+          .reconcileHandoff(
+            EnvironmentId.make("workflow-environment"),
+            third.threadId,
+            ProviderInstanceId.make("codex"),
+            {
+              handoffId: prepared.handoffId,
+              summary: "This cannot acknowledge evidence while reassessment is active.",
+            },
+          )
+          .pipe(Effect.result);
+        expect(reconciliationBlockedByHistoricalReassessment._tag).toBe("Failure");
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE workflow_reassessments SET status = 'cleared'
+                WHERE reassessment_id = 'rotation-historical-reassessment'`;
+            }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
+          ),
+        );
+        const reconciledOlderPredecessor = yield* harness.workflowDirector.reconcileHandoff(
+          EnvironmentId.make("workflow-environment"),
+          third.threadId,
+          ProviderInstanceId.make("codex"),
+          {
+            handoffId: prepared.handoffId,
+            summary: "The current director acknowledged its oldest predecessor's terminal turn.",
+          },
+        );
+        expect(reconciledOlderPredecessor.latestReconciliation).toMatchObject({
+          acknowledgedByDirectorId: third.directorId,
+          summary: "The current director acknowledged its oldest predecessor's terminal turn.",
+        });
         const delegatedAfterRecovery = yield* harness.workflowDirector.prepareWorker(
           EnvironmentId.make("workflow-environment"),
           third.threadId,
@@ -1975,7 +2727,6 @@ describe("ProviderCommandReactor", () => {
               createdAt: "2026-09-07T13:01:59.000Z",
               payload: {
                 taskId: RuntimeTaskId.make("rotation-post-recovery-worker"),
-                status: "running",
                 timelineBypass: true,
                 nativeTurn: {
                   sessionId: "rotation-post-recovery-session",

@@ -3,6 +3,7 @@ import {
   WorkflowCapabilityCompleteResult,
   WorkflowDirectorError,
   WorkflowDirectorHandoffPrepareInput,
+  WorkflowDirectorHandoffReconcileInput,
   WorkflowDirectorHandoffStatus,
   WorkflowQueryError,
   WorkflowWorkerAssociateInput,
@@ -134,6 +135,18 @@ export const WorkflowPrepareDirectorHandoffTool = Tool.make("workflow_prepare_di
   dependencies,
 });
 
+export const WorkflowReconcileDirectorHandoffTool = Tool.make(
+  "workflow_reconcile_director_handoff",
+  {
+    description:
+      "Acknowledge newly settled native activity on one exact predecessor handoff. This appends evidence for the current director without changing the original handoff or creating another director turn.",
+    parameters: WorkflowDirectorHandoffReconcileInput,
+    success: WorkflowDirectorHandoffStatus,
+    failure: WorkflowWorkerFailure,
+    dependencies,
+  },
+);
+
 export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowPrepareWorkerTool,
   WorkflowAssociateWorkerTool,
@@ -146,4 +159,5 @@ export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowResolveTicketTool,
   WorkflowCompleteCapabilityTool,
   WorkflowPrepareDirectorHandoffTool,
+  WorkflowReconcileDirectorHandoffTool,
 );

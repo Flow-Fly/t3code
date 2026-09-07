@@ -549,6 +549,20 @@ function WorkflowDetails(props: {
                   Source head {director.handoff.implementationHead}
                 </p>
               ) : null}
+              {director.handoff.latestReconciliation ? (
+                <div className="mt-1 text-muted-foreground text-xs">
+                  <p>
+                    Latest acknowledgement{" "}
+                    <time dateTime={director.handoff.latestReconciliation.createdAt}>
+                      {new Date(director.handoff.latestReconciliation.createdAt).toLocaleString()}
+                    </time>
+                  </p>
+                  <p className="break-all">
+                    Acknowledged head {director.handoff.latestReconciliation.implementationHead}
+                  </p>
+                  <p>{director.handoff.latestReconciliation.summary}</p>
+                </div>
+              ) : null}
               {director.handoff.unresolvedContext.length > 0 ? (
                 <ul className="mt-1 list-disc pl-4 text-muted-foreground text-xs">
                   {director.handoff.unresolvedContext.map((entry) => (

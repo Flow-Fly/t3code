@@ -654,6 +654,25 @@ export const WorkflowDirectorHandoffPrepareInput = Schema.Struct({
 });
 export type WorkflowDirectorHandoffPrepareInput = typeof WorkflowDirectorHandoffPrepareInput.Type;
 
+export const WorkflowDirectorHandoffReconcileInput = Schema.Struct({
+  handoffId: TrimmedNonEmptyString,
+  summary: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorHandoffReconcileInput =
+  typeof WorkflowDirectorHandoffReconcileInput.Type;
+
+export const WorkflowDirectorHandoffReconciliation = Schema.Struct({
+  reconciliationId: TrimmedNonEmptyString,
+  sequence: PositiveInt,
+  acknowledgedByDirectorId: TrimmedNonEmptyString,
+  implementationHead: TrimmedNonEmptyString,
+  settlementCount: Schema.Number,
+  summary: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+});
+export type WorkflowDirectorHandoffReconciliation =
+  typeof WorkflowDirectorHandoffReconciliation.Type;
+
 export const WorkflowDirectorHandoffStatus = Schema.Struct({
   handoffId: TrimmedNonEmptyString,
   sourceDirectorId: TrimmedNonEmptyString,
@@ -666,6 +685,7 @@ export const WorkflowDirectorHandoffStatus = Schema.Struct({
   admissionCount: Schema.Number,
   lessons: Schema.Array(TrimmedNonEmptyString),
   unresolvedContext: Schema.Array(TrimmedNonEmptyString),
+  latestReconciliation: Schema.NullOr(WorkflowDirectorHandoffReconciliation),
   requiredAction: TrimmedNonEmptyString,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,

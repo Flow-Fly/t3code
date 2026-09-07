@@ -15,6 +15,15 @@ export const workflowDirectorHandlers = {
         .prepareHandoff(scope.environmentId, scope.threadId, scope.providerInstanceId, input)
         .pipe(Effect.ensuring(notifier.directorChanged(scope).pipe(Effect.ignore)));
     }),
+  workflow_reconcile_director_handoff: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const workflow = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const notifier = yield* WorkflowMonitor.WorkflowRefreshNotifier;
+      return yield* workflow
+        .reconcileHandoff(scope.environmentId, scope.threadId, scope.providerInstanceId, input)
+        .pipe(Effect.ensuring(notifier.directorChanged(scope).pipe(Effect.ignore)));
+    }),
   workflow_prepare_worker: (input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;
