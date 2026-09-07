@@ -1,5 +1,6 @@
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 type WorkerEvent = Extract<
@@ -7,20 +8,22 @@ type WorkerEvent = Extract<
   { readonly type: "task.started" | "task.updated" | "task.completed" }
 >;
 
+const NativeSessionPayload = Schema.Struct({ threadId: Schema.String });
+const NativeNestedTurnPayload = Schema.Struct({ turn: Schema.Struct({ id: Schema.String }) });
+const NativeFlatTurnPayload = Schema.Struct({ turnId: Schema.String });
+const isNativeSessionPayload = Schema.is(NativeSessionPayload);
+const isNativeNestedTurnPayload = Schema.is(NativeNestedTurnPayload);
+const isNativeFlatTurnPayload = Schema.is(NativeFlatTurnPayload);
+
 function nativeTurnIdentity(event: ProviderRuntimeEvent) {
   const raw = event.raw?.payload;
-  const payload = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : null;
-  const rawTurn =
-    payload && typeof payload.turn === "object" && payload.turn !== null
-      ? (payload.turn as Record<string, unknown>)
-      : null;
-  const nativeSessionId = typeof payload?.threadId === "string" ? payload.threadId : null;
-  const nativeTurnId =
-    typeof rawTurn?.id === "string"
-      ? rawTurn.id
-      : typeof payload?.turnId === "string"
-        ? payload.turnId
-        : (event.providerRefs?.providerTurnId ?? null);
+  if (!isNativeSessionPayload(raw)) return null;
+  const nativeSessionId = raw.threadId;
+  const nativeTurnId = isNativeNestedTurnPayload(raw)
+    ? raw.turn.id
+    : isNativeFlatTurnPayload(raw)
+      ? raw.turnId
+      : (event.providerRefs?.providerTurnId ?? null);
   return nativeSessionId && nativeTurnId ? { nativeSessionId, nativeTurnId } : null;
 }
 

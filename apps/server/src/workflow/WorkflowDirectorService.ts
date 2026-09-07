@@ -203,6 +203,31 @@ const decodeStringArrayJson = Schema.decodeUnknownEffect(StringArrayJson);
 const encodeStringArrayJson = Schema.encodeUnknownSync(StringArrayJson);
 const decodeStringArrayJsonSync = Schema.decodeUnknownSync(StringArrayJson);
 
+const ResumeAdmissionScope = Schema.Struct({
+  admissionId: Schema.String,
+  body: Schema.String,
+  fingerprint: Schema.String,
+});
+const ResumeAdmissionScopesJson = Schema.fromJsonString(Schema.Array(ResumeAdmissionScope));
+const decodeResumeAdmissionScopesJson = Schema.decodeUnknownEffect(ResumeAdmissionScopesJson);
+const encodeResumeAdmissionScopesJson = Schema.encodeUnknownSync(ResumeAdmissionScopesJson);
+
+const ResumeRow = Schema.Struct({
+  resumeId: Schema.String,
+  directorId: Schema.String,
+  sourceTurnId: Schema.String,
+  commandId: Schema.String,
+  status: Schema.String,
+  sequence: Schema.NullOr(Schema.Number),
+  reassessmentId: Schema.NullOr(Schema.String),
+  specificationFingerprint: Schema.NullOr(Schema.String),
+  breakdownFingerprint: Schema.NullOr(Schema.String),
+  admissionScopesJson: Schema.NullOr(Schema.String),
+  reassessmentTriggerCount: Schema.NullOr(Schema.Number),
+});
+type ResumeRow = typeof ResumeRow.Type;
+const decodeResumeRow = Schema.decodeUnknownEffect(ResumeRow);
+
 const ReviewRow = Schema.Struct({
   reviewId: Schema.String,
   associationToken: Schema.String,
@@ -408,6 +433,16 @@ function readinessDetail(issue: WorkflowIssueSummary): string {
     issue.readiness?.reasons.map((reason) => reason.message).join(" ") ||
     "Refresh Workflow to load current readiness evidence."
   );
+}
+
+function invalidatesPrerequisite(issue: WorkflowIssueSummary): boolean {
+  const status = issue.readiness?.status;
+  if (status === "resolved" || status === "closed-unverified") {
+    return false;
+  }
+  if (issue.state === "open") return true;
+  if (status === undefined) return false;
+  return status === "cancelled" || status === "out-of-scope" || status === "superseded";
 }
 
 function sourceIssueReferences(body: string) {
@@ -1159,7 +1194,10 @@ export const make = Effect.gen(function* () {
       "projectId" | "repository" | "capabilityNumber" | "modelSelection"
     >,
     cwd: string,
-    options?: { readonly ownedClaims?: ReadonlyMap<number, string> },
+    options?: {
+      readonly ownedClaims?: ReadonlyMap<number, string>;
+      readonly admittedTicketNumbers?: ReadonlySet<number>;
+    },
   ) {
     const capability = yield* workflow.issueDetail({
       projectId: input.projectId,
@@ -1200,6 +1238,13 @@ export const make = Effect.gen(function* () {
     let hasReadyTicket = false;
     for (const ticket of tickets) {
       if (ticket.readiness?.status === "ready") {
+        hasReadyTicket = true;
+        break;
+      }
+      if (
+        ticket.readiness?.status === "resolved" &&
+        options?.admittedTicketNumbers?.has(ticket.number)
+      ) {
         hasReadyTicket = true;
         break;
       }
@@ -2096,7 +2141,8 @@ export const make = Effect.gen(function* () {
         "No capability director is linked in this environment.",
       );
     }
-    return yield* statusFromRow(row);
+    yield* reconcileAcceptedResume(row.directorId);
+    return yield* statusFromRow(yield* loadDirectorById(row.directorId));
   });
 
   const reassessmentTriggers = Effect.fn("WorkflowDirectorService.reassessmentTriggers")(function* (
@@ -2150,9 +2196,7 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    for (const blocker of input.issue.blockedBy.filter(
-      (candidate) => candidate.state === "open" && candidate.readiness?.status !== "resolved",
-    )) {
+    for (const blocker of input.issue.blockedBy.filter(invalidatesPrerequisite)) {
       triggers.push({
         kind: "prerequisite",
         issueNumber: blocker.number,
@@ -2199,9 +2243,7 @@ export const make = Effect.gen(function* () {
           requiredAction: `Reapprove changed ticket #${admission.ticketNumber}, then record a cleared reassessment that supersedes its scope-change record.`,
         });
       }
-      for (const blocker of detail.success.blockedBy.filter(
-        (candidate) => candidate.state === "open" && candidate.readiness?.status !== "resolved",
-      )) {
+      for (const blocker of detail.success.blockedBy.filter(invalidatesPrerequisite)) {
         triggers.push({
           kind: "prerequisite",
           issueNumber: blocker.number,
@@ -2235,7 +2277,7 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const row = yield* loadDirectorByCapability(
+    const found = yield* loadDirectorByCapability(
       {
         projectId: input.projectId,
         repository: input.issue.repository,
@@ -2243,7 +2285,9 @@ export const make = Effect.gen(function* () {
       },
       environmentId,
     );
-    if (!row || (row.status !== "active" && row.status !== "held")) return;
+    if (!found || (found.status !== "active" && found.status !== "held")) return;
+    yield* reconcileAcceptedResume(found.directorId);
+    const row = yield* loadDirectorById(found.directorId);
     const liveIssue = yield* workflow
       .issueDetail({
         projectId: input.projectId,
@@ -2427,9 +2471,10 @@ export const make = Effect.gen(function* () {
             String(row.capabilityNumber),
             "--repo",
             row.repository,
-            "--body",
-            trackerBody,
+            "--body-file",
+            "-",
           ],
+          stdin: trackerBody,
           maxOutputBytes: 100_000,
         });
       }
@@ -2837,6 +2882,178 @@ export const make = Effect.gen(function* () {
     return yield* continueInitialDirector(row, input, project.workspaceRoot, dispatch);
   });
 
+  const loadResume = Effect.fn("WorkflowDirectorService.loadResume")(function* (
+    directorId: string,
+    sourceTurnId: string,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT resume_id AS "resumeId", director_id AS "directorId",
+          source_turn_id AS "sourceTurnId", command_id AS "commandId", status, sequence,
+          reassessment_id AS "reassessmentId",
+          specification_fingerprint AS "specificationFingerprint",
+          breakdown_fingerprint AS "breakdownFingerprint",
+          admission_scopes_json AS "admissionScopesJson",
+          reassessment_trigger_count AS "reassessmentTriggerCount"
+        FROM workflow_director_resumes
+        WHERE director_id = ${directorId} AND source_turn_id = ${sourceTurnId}
+        LIMIT 1
+      `,
+      "Director resume history could not be read.",
+    );
+    if (!rows[0]) return null;
+    return yield* decodeResumeRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "A director resume record is invalid.", String(error)),
+      ),
+    );
+  });
+
+  const finalizeAcceptedResume = Effect.fn("WorkflowDirectorService.finalizeAcceptedResume")(
+    function* (resume: ResumeRow, sequence: number) {
+      const admissionScopes = resume.admissionScopesJson
+        ? yield* decodeResumeAdmissionScopesJson(resume.admissionScopesJson).pipe(
+            Effect.mapError((error) =>
+              directorError(
+                "persistence-failed",
+                "The director resume authority record is invalid.",
+                String(error),
+              ),
+            ),
+          )
+        : [];
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      return yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE workflow_director_resumes SET status = 'submitted',
+              sequence = ${sequence}, detail = NULL, updated_at = ${updatedAt}
+              WHERE resume_id = ${resume.resumeId}`;
+            if (!resume.reassessmentId) return "cleared" as const;
+
+            const reassessmentRows = yield* sql<{
+              readonly status: string;
+              readonly triggerCount: number;
+              readonly unsettledCount: number;
+            }>`
+              SELECT r.status,
+                (SELECT COUNT(*) FROM workflow_reassessment_triggers t
+                  WHERE t.reassessment_id = r.reassessment_id) AS "triggerCount",
+                (SELECT COUNT(*) FROM workflow_interruption_subjects s
+                  WHERE s.reassessment_id = r.reassessment_id
+                    AND s.outcome NOT IN ('stopped', 'closed')
+                    AND NOT (
+                      s.subject_kind = 'director'
+                      AND EXISTS (
+                        SELECT 1 FROM projection_turns turn
+                        JOIN orchestration_command_receipts receipt
+                          ON receipt.command_id = ${resume.commandId}
+                            AND receipt.status = 'accepted'
+                        WHERE turn.thread_id = (
+                          SELECT thread_id FROM workflow_directors
+                          WHERE director_id = ${resume.directorId}
+                        )
+                          AND turn.turn_id = s.native_turn_id
+                          AND turn.pending_message_id = (
+                            SELECT message_id FROM workflow_director_resumes
+                            WHERE resume_id = ${resume.resumeId}
+                          )
+                      )
+                    )) AS "unsettledCount"
+              FROM workflow_reassessments r
+              WHERE r.reassessment_id = ${resume.reassessmentId}
+              LIMIT 1
+            `;
+            const reassessment = reassessmentRows[0];
+            if (!reassessment || reassessment.status === "cleared") return "cleared" as const;
+
+            const canClear =
+              resume.specificationFingerprint !== null &&
+              resume.breakdownFingerprint !== null &&
+              resume.admissionScopesJson !== null &&
+              resume.reassessmentTriggerCount !== null &&
+              reassessment.triggerCount === resume.reassessmentTriggerCount &&
+              reassessment.unsettledCount === 0;
+            if (!canClear) {
+              const detail =
+                "The accepted resume remains held because newer native activity or reassessment evidence needs interruption and review.";
+              yield* sql`UPDATE workflow_director_resumes SET detail = ${detail},
+                updated_at = ${updatedAt} WHERE resume_id = ${resume.resumeId}`;
+              yield* sql`UPDATE workflow_directors SET status = 'held', detail = ${detail},
+                updated_at = ${updatedAt} WHERE director_id = ${resume.directorId}`;
+              return "held" as const;
+            }
+
+            yield* sql`UPDATE workflow_reassessments SET status = 'cleared',
+              tracker_status = 'confirmed', updated_at = ${updatedAt}
+              WHERE reassessment_id = ${resume.reassessmentId}`;
+            yield* sql`UPDATE workflow_directors SET status = 'active', detail = NULL,
+              specification_fingerprint = ${resume.specificationFingerprint},
+              breakdown_fingerprint = ${resume.breakdownFingerprint},
+              updated_at = ${updatedAt} WHERE director_id = ${resume.directorId}`;
+            yield* Effect.forEach(
+              admissionScopes,
+              (scope) => sql`UPDATE workflow_director_admissions
+                SET current_scope_body = ${scope.body},
+                  current_scope_fingerprint = ${scope.fingerprint},
+                  updated_at = ${updatedAt}
+                WHERE admission_id = ${scope.admissionId} AND director_id = ${resume.directorId}`,
+              { discard: true },
+            );
+            return "cleared" as const;
+          }),
+        ),
+        "The accepted director resume could not be reconciled.",
+      );
+    },
+  );
+
+  const reconcileAcceptedResume = Effect.fn("WorkflowDirectorService.reconcileAcceptedResume")(
+    function* (directorId: string) {
+      const rows = yield* persistence(
+        sql<Record<string, unknown>>`
+          SELECT resume.resume_id AS "resumeId", resume.director_id AS "directorId",
+            resume.source_turn_id AS "sourceTurnId", resume.command_id AS "commandId",
+            resume.status, resume.sequence, resume.reassessment_id AS "reassessmentId",
+            resume.specification_fingerprint AS "specificationFingerprint",
+            resume.breakdown_fingerprint AS "breakdownFingerprint",
+            resume.admission_scopes_json AS "admissionScopesJson",
+            resume.reassessment_trigger_count AS "reassessmentTriggerCount"
+          FROM workflow_director_resumes resume
+          JOIN workflow_reassessments reassessment
+            ON reassessment.reassessment_id = resume.reassessment_id
+          WHERE resume.director_id = ${directorId} AND reassessment.status = 'clearing'
+          ORDER BY resume.created_at DESC LIMIT 1
+        `,
+        "Pending director resume recovery could not be read.",
+      );
+      if (!rows[0]) return;
+      const resume = yield* decodeResumeRow(rows[0]).pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "persistence-failed",
+            "A director resume record is invalid.",
+            String(error),
+          ),
+        ),
+      );
+      const receipt = yield* receipts
+        .getByCommandId({ commandId: CommandId.make(resume.commandId) })
+        .pipe(
+          Effect.mapError((error) =>
+            directorError(
+              "persistence-failed",
+              "Director resume evidence could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+        yield* finalizeAcceptedResume(resume, receipt.value.resultSequence);
+      }
+    },
+  );
+
   const resumeUnlocked = Effect.fn("WorkflowDirectorService.resume")(function* (
     input: WorkflowDirectorResumeInput,
     dispatch: Dispatch,
@@ -2870,25 +3087,10 @@ export const make = Effect.gen(function* () {
       observedSourceTurnId !== "no-turn" &&
       observedSourceTurnId !== "no-thread"
     ) {
-      const previous = yield* sql<{
-        readonly commandId: string;
-        readonly status: string;
-        readonly sequence: number | null;
-      }>`
-        SELECT command_id AS "commandId", status, sequence FROM workflow_director_resumes
-        WHERE director_id = ${row.directorId} AND source_turn_id = ${observedSourceTurnId} LIMIT 1
-      `.pipe(
-        Effect.mapError((error) =>
-          directorError(
-            "persistence-failed",
-            "Director resume history could not be read.",
-            String(error),
-          ),
-        ),
-      );
-      if (previous[0]) {
+      const previous = yield* loadResume(row.directorId, observedSourceTurnId);
+      if (previous) {
         const receipt = yield* receipts
-          .getByCommandId({ commandId: CommandId.make(previous[0].commandId) })
+          .getByCommandId({ commandId: CommandId.make(previous.commandId) })
           .pipe(
             Effect.mapError((error) =>
               directorError(
@@ -2900,9 +3102,13 @@ export const make = Effect.gen(function* () {
           );
         if (
           (Option.isSome(receipt) && receipt.value.status === "accepted") ||
-          (previous[0].status === "submitted" && previous[0].sequence !== null)
+          (previous.status === "submitted" && previous.sequence !== null)
         ) {
-          return yield* statusFromRow(row);
+          const sequence = Option.isSome(receipt)
+            ? receipt.value.resultSequence
+            : previous.sequence!;
+          yield* finalizeAcceptedResume(previous, sequence);
+          return yield* statusFromRow(yield* loadDirectorById(row.directorId));
         }
         return yield* directorError(
           "dispatch-failed",
@@ -2928,6 +3134,7 @@ export const make = Effect.gen(function* () {
       );
     }
     const reassessment = current.reassessment;
+    let reassessmentTriggerCount: number | null = null;
     if (reassessment) {
       const unsettled = reassessment.subjects.filter(
         (subject) => subject.outcome !== "stopped" && subject.outcome !== "closed",
@@ -2939,9 +3146,14 @@ export const make = Effect.gen(function* () {
         );
       }
       const triggerRows = yield* persistence(
-        sql<{ readonly latestAt: string; readonly scopeChanges: number }>`
+        sql<{
+          readonly latestAt: string;
+          readonly scopeChanges: number;
+          readonly triggerCount: number;
+        }>`
           SELECT MAX(discovered_at) AS "latestAt",
-            SUM(CASE WHEN trigger_kind = 'scope-change' THEN 1 ELSE 0 END) AS "scopeChanges"
+            SUM(CASE WHEN trigger_kind = 'scope-change' THEN 1 ELSE 0 END) AS "scopeChanges",
+            COUNT(*) AS "triggerCount"
           FROM workflow_reassessment_triggers
           WHERE reassessment_id = ${reassessment.reassessmentId}
         `,
@@ -2949,6 +3161,7 @@ export const make = Effect.gen(function* () {
       );
       const latestTriggerAt = triggerRows[0]?.latestAt ?? reassessment.createdAt;
       const hasScopeChange = (triggerRows[0]?.scopeChanges ?? 0) > 0;
+      reassessmentTriggerCount = triggerRows[0]?.triggerCount ?? 0;
       const live = yield* workflow.issueDetail({
         projectId: ProjectId.make(row.projectId),
         repository: row.repository as WorkflowIssueSummary["repository"],
@@ -3012,7 +3225,8 @@ export const make = Effect.gen(function* () {
       }
     }
     const project = yield* selectedProject(ProjectId.make(row.projectId));
-    const ownedClaims = ownedClaimLogins(yield* admissions(row.directorId));
+    const resumeAdmissions = yield* admissions(row.directorId);
+    const ownedClaims = ownedClaimLogins(resumeAdmissions);
     const prepared = yield* prepareCapability(
       {
         projectId: ProjectId.make(row.projectId),
@@ -3021,9 +3235,11 @@ export const make = Effect.gen(function* () {
         modelSelection: input.modelSelection,
       },
       row.worktreePath,
-      { ownedClaims },
+      {
+        ownedClaims,
+        admittedTicketNumbers: new Set(resumeAdmissions.map((admission) => admission.ticketNumber)),
+      },
     );
-    const resumeAdmissions = yield* admissions(row.directorId);
     const legacyAdmission = resumeAdmissions.find(
       (admission) => !(admission.currentScopeFingerprint ?? admission.scopeFingerprint),
     );
@@ -3041,8 +3257,14 @@ export const make = Effect.gen(function* () {
           repository: row.repository as WorkflowIssueSummary["repository"],
           number: admission.ticketNumber,
         });
-        yield* requireDeliveryReadiness(row, issue, admission, true);
-        return { admissionId: admission.admissionId, body: issue.body };
+        if (issue.readiness?.status !== "resolved") {
+          yield* requireDeliveryReadiness(row, issue, admission, true);
+        }
+        return {
+          admissionId: admission.admissionId,
+          body: issue.body,
+          fingerprint: workflowEvidenceBodyFingerprint(issue.body),
+        };
       }),
     );
     yield* ensureWorktree(row, project.workspaceRoot);
@@ -3054,18 +3276,57 @@ export const make = Effect.gen(function* () {
     const resumeId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
     const commandId = CommandId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
     const messageId = MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie));
-    yield* sql`
-      INSERT INTO workflow_director_resumes (
-        resume_id, director_id, source_turn_id, command_id, message_id, status, created_at, updated_at
-      ) VALUES (${resumeId}, ${row.directorId}, ${sourceTurnId}, ${commandId}, ${messageId}, 'submitting', ${createdAt}, ${createdAt})
-    `.pipe(
-      Effect.mapError((error) =>
-        directorError(
-          "persistence-failed",
-          "The director resume intent could not be saved.",
-          String(error),
-        ),
+    const specificationFingerprint = workflowEvidenceBodyFingerprint(
+      prepared.specificationApproval.approvedContent ?? "",
+    );
+    const breakdownFingerprint = workflowEvidenceBodyFingerprint(
+      prepared.breakdownApproval.approvedContent ?? "",
+    );
+    const admissionScopesJson = encodeResumeAdmissionScopesJson(refreshedAdmissionScopes);
+    yield* persistence(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO workflow_director_resumes (
+              resume_id, director_id, source_turn_id, command_id, message_id, status,
+              reassessment_id, specification_fingerprint, breakdown_fingerprint,
+              admission_scopes_json, reassessment_trigger_count, created_at, updated_at
+            ) VALUES (${resumeId}, ${row.directorId}, ${sourceTurnId}, ${commandId}, ${messageId},
+              'submitting', ${reassessment?.reassessmentId ?? null}, ${specificationFingerprint},
+              ${breakdownFingerprint}, ${admissionScopesJson}, ${reassessmentTriggerCount},
+              ${createdAt}, ${createdAt})
+          `;
+          if (!reassessment) return;
+          const validationRows = yield* sql<{
+            readonly triggerCount: number;
+            readonly unsettledCount: number;
+          }>`
+            SELECT
+              (SELECT COUNT(*) FROM workflow_reassessment_triggers t
+                WHERE t.reassessment_id = r.reassessment_id) AS "triggerCount",
+              (SELECT COUNT(*) FROM workflow_interruption_subjects s
+                WHERE s.reassessment_id = r.reassessment_id
+                  AND s.outcome NOT IN ('stopped', 'closed')) AS "unsettledCount"
+            FROM workflow_reassessments r
+            WHERE r.reassessment_id = ${reassessment.reassessmentId}
+              AND r.director_id = ${row.directorId} AND r.status != 'cleared'
+            LIMIT 1
+          `;
+          const validation = validationRows[0];
+          if (
+            !validation ||
+            validation.triggerCount !== reassessmentTriggerCount ||
+            validation.unsettledCount > 0
+          ) {
+            return yield* directorError(
+              "not-ready",
+              "Native activity or reassessment evidence changed while Resume was being prepared.",
+              "Interrupt and settle every current subject, then reassess before retrying Resume.",
+            );
+          }
+        }),
       ),
+      "The director resume decision could not be saved.",
     );
     const command = {
       type: "thread.turn.start" as const,
@@ -3083,6 +3344,7 @@ export const make = Effect.gen(function* () {
       createdAt,
     } satisfies Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
     const dispatched = yield* dispatch(command).pipe(Effect.result);
+    let acceptedSequence: number;
     if (dispatched._tag === "Failure") {
       const receipt = yield* receipts
         .getByCommandId({ commandId })
@@ -3096,67 +3358,25 @@ export const make = Effect.gen(function* () {
           ),
         );
       const accepted = Option.isSome(receipt) && receipt.value.status === "accepted";
-      yield* sql`
-        UPDATE workflow_director_resumes SET status = ${accepted ? "submitted" : "held"},
-          sequence = ${accepted ? receipt.value.resultSequence : null},
-          detail = ${accepted ? null : "The director resume is uncertain and will not be sent again automatically."},
-          updated_at = ${createdAt} WHERE resume_id = ${resumeId}
-      `.pipe(
-        Effect.mapError((error) =>
-          directorError(
-            "persistence-failed",
-            "The director resume outcome could not be saved.",
-            String(error),
-          ),
-        ),
-      );
-      if (!accepted)
+      if (!accepted) {
+        yield* persistence(
+          sql`UPDATE workflow_director_resumes SET status = 'held', sequence = NULL,
+            detail = 'The director resume is uncertain and will not be sent again automatically.',
+            updated_at = ${createdAt} WHERE resume_id = ${resumeId}`,
+          "The director resume outcome could not be saved.",
+        );
         return yield* directorError(
           "dispatch-failed",
           "The director resume is uncertain and will not be sent again automatically.",
         );
+      }
+      acceptedSequence = receipt.value.resultSequence;
     } else {
-      yield* sql`
-        UPDATE workflow_director_resumes SET status = 'submitted', sequence = ${dispatched.success.sequence},
-          detail = NULL, updated_at = ${createdAt} WHERE resume_id = ${resumeId}
-      `.pipe(
-        Effect.mapError((error) =>
-          directorError(
-            "persistence-failed",
-            "The accepted director resume could not be saved.",
-            String(error),
-          ),
-        ),
-      );
+      acceptedSequence = dispatched.success.sequence;
     }
-    if (reassessment) {
-      const resumedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* persistence(
-        sql.withTransaction(
-          Effect.gen(function* () {
-            yield* sql`UPDATE workflow_reassessments SET status = 'cleared',
-              tracker_status = 'confirmed', updated_at = ${resumedAt}
-              WHERE reassessment_id = ${reassessment.reassessmentId}`;
-            yield* sql`UPDATE workflow_directors SET status = 'active', detail = NULL,
-              specification_fingerprint = ${workflowEvidenceBodyFingerprint(prepared.specificationApproval.approvedContent ?? "")},
-              breakdown_fingerprint = ${workflowEvidenceBodyFingerprint(prepared.breakdownApproval.approvedContent ?? "")},
-              updated_at = ${resumedAt} WHERE director_id = ${row.directorId}`;
-            yield* Effect.forEach(
-              refreshedAdmissionScopes,
-              (scope) => sql`UPDATE workflow_director_admissions
-                SET current_scope_body = ${scope.body},
-                  current_scope_fingerprint = ${workflowEvidenceBodyFingerprint(scope.body)},
-                  updated_at = ${resumedAt}
-                WHERE admission_id = ${scope.admissionId}`,
-              { discard: true },
-            );
-          }),
-        ),
-        "The cleared reassessment could not be saved.",
-      );
-      return yield* statusFromRow(yield* loadDirectorById(row.directorId));
-    }
-    return yield* statusFromRow(row);
+    const persistedResume = (yield* loadResume(row.directorId, sourceTurnId))!;
+    yield* finalizeAcceptedResume(persistedResume, acceptedSequence);
+    return yield* statusFromRow(yield* loadDirectorById(row.directorId));
   });
 
   const requireDeliveryReadiness = Effect.fn("WorkflowDirectorService.requireDeliveryReadiness")(

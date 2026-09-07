@@ -91,7 +91,10 @@ import * as GitHubCli from "../../sourceControl/GitHubCli.ts";
 import * as WorkflowService from "../../workflow/WorkflowService.ts";
 import * as WorkflowStartService from "../../workflow/WorkflowStartService.ts";
 import * as WorkflowDirectorService from "../../workflow/WorkflowDirectorService.ts";
-import { interpretWorkflowEvidence } from "../../workflow/WorkflowEvidence.ts";
+import {
+  interpretWorkflowEvidence,
+  workflowEvidenceBodyFingerprint,
+} from "../../workflow/WorkflowEvidence.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
@@ -291,10 +294,11 @@ describe("ProviderCommandReactor", () => {
       );
     });
     const sentTurnId = asTurnId("turn-1");
+    let sentTurnCount = 0;
     const sendTurn = vi.fn((_: unknown) =>
       Effect.succeed({
         threadId: ThreadId.make("thread-1"),
-        turnId: sentTurnId,
+        turnId: asTurnId(`turn-${++sentTurnCount}`),
       }),
     );
     const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
@@ -1474,9 +1478,13 @@ describe("ProviderCommandReactor", () => {
               const sql = yield* SqlClient.SqlClient;
               yield* sql`INSERT INTO workflow_director_admissions (
               admission_id,director_id,batch_id,repository,ticket_id,ticket_number,
-              slot_ticket_number,purpose,ownership,claim_status,created_at,updated_at
+              slot_ticket_number,purpose,ownership,claim_status,scope_body,scope_fingerprint,
+              current_scope_body,current_scope_fingerprint,created_at,updated_at
             ) SELECT 'admission-reassess',director_id,batch_id,repository,'ticket-100',100,
-              100,'implement','worker','confirmed',${now},${now}
+              100,'implement','worker','confirmed',${harness.directorTicket.body},
+              ${workflowEvidenceBodyFingerprint(harness.directorTicket.body)},
+              ${harness.directorTicket.body},
+              ${workflowEvidenceBodyFingerprint(harness.directorTicket.body)},${now},${now}
               FROM workflow_directors WHERE director_id = ${started.director.directorId}`;
               yield* sql`INSERT INTO workflow_worker_dispatches (
               dispatch_id,association_token,director_id,batch_id,admission_id,repository,
@@ -1505,6 +1513,7 @@ describe("ProviderCommandReactor", () => {
             }),
           ),
         );
+        const approvedCapability = structuredClone(harness.directorCapability);
         const changedApproval = harness.directorCapability.evidence!.records.map((record) =>
           record.kind === "approval" && record.approvalKind === "specification"
             ? { ...record, scope: "changed" as const }
@@ -1606,6 +1615,258 @@ describe("ProviderCommandReactor", () => {
         yield* Effect.promise(() => harness.drain());
         expect(retried.actions).toContain("stop");
         expect(harness.interruptTurn).toHaveBeenCalledTimes(2);
+
+        const nativeEvents = (
+          taskId: string,
+          status: "running" | "interrupted",
+          eventId: string,
+        ): ProviderRuntimeEvent => ({
+          type: "task.updated",
+          eventId: EventId.make(eventId),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          threadId: started.director.threadId,
+          createdAt: status === "running" ? "2026-09-07T12:01:00.000Z" : "2026-09-07T12:01:01.000Z",
+          payload: {
+            taskId,
+            status,
+            timelineBypass: true,
+            nativeTurn: { sessionId: taskId, turnId: `${taskId}-turn`, status },
+          },
+        });
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("director-native-settlement-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("director-native-settlement-turn"),
+              createdAt: "2026-09-07T12:01:00.000Z",
+              payload: {},
+              raw: {
+                payload: {
+                  threadId: "director-native-session",
+                  turn: { id: "director-native-settlement-turn" },
+                },
+              },
+            },
+            nativeEvents("native-worker", "running", "worker-native-running"),
+            nativeEvents("native-worker", "interrupted", "worker-native-interrupted"),
+            nativeEvents("native-reviewer", "running", "reviewer-native-running"),
+            nativeEvents("native-reviewer", "interrupted", "reviewer-native-interrupted"),
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("director-native-settlement-interrupted"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: started.director.threadId,
+              turnId: TurnId.make("director-native-settlement-turn"),
+              createdAt: "2026-09-07T12:01:01.000Z",
+              payload: { reason: "Interrupted for reassessment." },
+              raw: {
+                payload: {
+                  threadId: "director-native-session",
+                  turn: { id: "director-native-settlement-turn" },
+                },
+              },
+            },
+          ]),
+        );
+        Object.assign(harness.directorCapability, {
+          ...approvedCapability,
+          evidence: {
+            ...approvedCapability.evidence!,
+            records: [
+              ...approvedCapability.evidence!.records,
+              {
+                id: "integrated-scope-change",
+                url: `${approvedCapability.url}#issuecomment-integrated-scope-change`,
+                createdAt: "2026-09-07T12:00:00.000Z",
+                kind: "reassessment" as const,
+                state: "superseded" as const,
+                sourceAccess: "verified" as const,
+                scope: "current" as const,
+                summary: "Scope changed while delivery was active.",
+                source: approvedCapability.url,
+                outcome: "scope-change" as const,
+              },
+              {
+                id: "integrated-reassessment-cleared",
+                url: `${approvedCapability.url}#issuecomment-integrated-reassessment-cleared`,
+                createdAt: "2099-09-07T12:02:00.000Z",
+                kind: "reassessment" as const,
+                state: "current" as const,
+                sourceAccess: "verified" as const,
+                scope: "current" as const,
+                summary: "Reassessment cleared with renewed approval.",
+                source: `${approvedCapability.url}#issuecomment-integrated-scope-change`,
+                outcome: "cleared" as const,
+              },
+            ],
+          },
+        });
+        const resumable = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(resumable.actions).toContain("resume");
+        const resumeWithPersistenceFailure = yield* harness.workflowDirector
+          .resume(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+              directorId: started.director.directorId,
+              observation: resumable.observation,
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-6-astra",
+                options: [{ id: "reasoningEffort", value: "high" }],
+              },
+            },
+            (command) =>
+              harness.engine.dispatch(command).pipe(
+                Effect.tap(() =>
+                  Effect.promise(async () => {
+                    await harness.drain();
+                    await harness.emitProviderEvents([
+                      {
+                        type: "turn.started",
+                        eventId: EventId.make("accepted-resume-native-root"),
+                        provider: ProviderDriverKind.make("codex"),
+                        providerInstanceId: ProviderInstanceId.make("codex"),
+                        threadId: started.director.threadId,
+                        turnId: TurnId.make("turn-2"),
+                        createdAt: "2026-09-07T12:02:01.000Z",
+                        payload: {},
+                        raw: {
+                          payload: {
+                            threadId: "director-native-session",
+                            turn: { id: "turn-2" },
+                          },
+                        },
+                      },
+                      nativeEvents("conflicting-child", "running", "conflicting-child-running"),
+                    ]);
+                    await harness.runEffect(
+                      Effect.gen(function* () {
+                        const sql = yield* SqlClient.SqlClient;
+                        yield* sql`
+                          CREATE TRIGGER fail_director_resume_finalize
+                          BEFORE UPDATE ON workflow_director_resumes
+                          BEGIN
+                            SELECT RAISE(FAIL, 'injected accepted Resume persistence failure');
+                          END
+                        `;
+                      }),
+                    );
+                  }),
+                ),
+                Effect.mapError(
+                  (error) =>
+                    new OrchestrationDispatchCommandError({
+                      message: "Workflow Resume dispatch failed.",
+                      cause: error,
+                    }),
+                ),
+              ),
+          )
+          .pipe(Effect.result);
+        expect(resumeWithPersistenceFailure._tag).toBe("Failure");
+        const resumeRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{
+                readonly commandId: string;
+                readonly directorStatus: string;
+                readonly reassessmentStatus: string;
+                readonly status: string;
+              }>`
+                SELECT resume.command_id AS "commandId", resume.status,
+                  director.status AS "directorStatus",
+                  reassessment.status AS "reassessmentStatus"
+                FROM workflow_director_resumes resume
+                JOIN workflow_directors director
+                  ON director.director_id = resume.director_id
+                JOIN workflow_reassessments reassessment
+                  ON reassessment.reassessment_id = resume.reassessment_id
+                WHERE resume.director_id = ${started.director.directorId}
+              `;
+            }),
+          ),
+        );
+        expect(resumeRows).toEqual([
+          expect.objectContaining({
+            status: "submitting",
+            directorStatus: "held",
+            reassessmentStatus: "clearing",
+          }),
+        ]);
+        expect(
+          Option.getOrNull(
+            yield* Effect.promise(() =>
+              harness.readCommandReceipt(CommandId.make(resumeRows[0]!.commandId)),
+            ),
+          ),
+        ).toMatchObject({ status: "accepted" });
+        const interruptedDuringFailure = yield* harness.workflowDirector
+          .status({
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            capabilityNumber: 17,
+          })
+          .pipe(Effect.result);
+        expect(interruptedDuringFailure._tag).toBe("Failure");
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`DROP TRIGGER fail_director_resume_finalize`;
+            }),
+          ),
+        );
+        const resumedWithConflict = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(resumedWithConflict).toMatchObject({
+          status: "held",
+          actions: expect.arrayContaining(["stop"]),
+          reassessment: {
+            status: "clearing",
+            subjects: expect.arrayContaining([
+              expect.objectContaining({ kind: "director", outcome: "resumed" }),
+              expect.objectContaining({
+                providerThreadId: "conflicting-child",
+                outcome: "resumed",
+              }),
+            ]),
+          },
+        });
+        const reconnectedWhileHeld = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(reconnectedWhileHeld.status).toBe("held");
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            nativeEvents("conflicting-child", "interrupted", "conflicting-child-interrupted"),
+          ]),
+        );
+        const recovered = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(recovered.status).toBe("active");
+        expect(recovered.reassessment).toBeNull();
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
       }),
   );
 

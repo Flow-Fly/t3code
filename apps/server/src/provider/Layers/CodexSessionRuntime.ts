@@ -2474,11 +2474,11 @@ export const makeCodexSessionRuntime = (
             liveChildren,
             ([childThreadId, childTurnId]) =>
               Effect.gen(function* () {
-                const updateStatus = (
-                  requestStatus: "requested" | "acknowledged" | "failed" | "unknown",
-                  detail?: string,
-                ) =>
-                  Effect.gen(function* () {
+                const updateStatus = Effect.fn("CodexSessionRuntime.updateInterruptStatus")(
+                  function* (
+                    requestStatus: "requested" | "acknowledged" | "failed" | "unknown",
+                    detail?: string,
+                  ) {
                     yield* Ref.update(collabChildInterruptsRef, (current) => {
                       const next = new Map(current);
                       next.set(childThreadId, {
@@ -2508,7 +2508,8 @@ export const makeCodexSessionRuntime = (
                           ...(detail ? { interruptDetail: detail } : {}),
                         },
                       });
-                  });
+                  },
+                );
                 yield* updateStatus("requested");
                 const result = yield* client
                   .request("turn/interrupt", {

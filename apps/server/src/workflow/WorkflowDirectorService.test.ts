@@ -11,6 +11,7 @@ import {
   type OrchestrationCommand,
   type ServerProvider,
   type ThreadId,
+  TurnId,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
 } from "@t3tools/contracts";
@@ -2642,13 +2643,52 @@ describe("WorkflowDirectorService", () => {
       const liveCapability = structuredClone(fixture.capability);
       const githubCalls: ReadonlyArray<string>[] = [];
       let shell: Option.Option<unknown> = Option.none();
+      let resumeThreadId: ThreadId | undefined;
+      let triggerLateChild = false;
       const test = harness({
         capability: liveCapability,
         ticketDetails: fixture.ticketDetails,
         threadShell: () => Effect.succeed(shell as never),
         githubExecute: ({ args }) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             githubCalls.push(args);
+            if (triggerLateChild && args.includes("--remove-label")) {
+              triggerLateChild = false;
+              yield* recordWorkflowWorkerObservation({
+                type: "task.updated",
+                eventId: EventId.make("late-child-during-resume"),
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: instanceId,
+                threadId: resumeThreadId!,
+                createdAt: "2026-09-07T12:03:01.000Z",
+                payload: {
+                  taskId: RuntimeTaskId.make("late-resume-child"),
+                  status: "running",
+                  timelineBypass: true,
+                  nativeTurn: {
+                    sessionId: "late-resume-child",
+                    turnId: "late-resume-turn",
+                    status: "running",
+                  },
+                },
+              });
+              yield* recordWorkflowWorkerObservation({
+                type: "turn.started",
+                eventId: EventId.make("late-root-during-resume"),
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: instanceId,
+                threadId: resumeThreadId!,
+                turnId: TurnId.make("late-root-turn"),
+                createdAt: "2026-09-07T12:03:01.000Z",
+                payload: {},
+                raw: {
+                  payload: {
+                    threadId: "native-director",
+                    turn: { id: "late-root-turn" },
+                  },
+                },
+              } as ProviderRuntimeEvent);
+            }
             return output(args[0] === "api" ? "Flow-Fly\n" : "");
           }),
       });
@@ -2659,6 +2699,7 @@ describe("WorkflowDirectorService", () => {
           { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
           test.dispatch,
         );
+        resumeThreadId = started.director.threadId;
         yield* seedDirectorProviderIdentity(sql, started.director.directorId);
         yield* recordWorkflowWorkerObservation({
           type: "turn.started",
@@ -2967,16 +3008,113 @@ describe("WorkflowDirectorService", () => {
         });
         const resumable = yield* service.status({ projectId, repository, capabilityNumber: 17 });
         expect(resumable.actions).toContain("resume");
+        triggerLateChild = true;
+        const racedResume = yield* service
+          .resume(
+            {
+              projectId,
+              repository,
+              capabilityNumber: 17,
+              directorId: started.director.directorId,
+              observation: resumable.observation,
+              modelSelection,
+            },
+            test.dispatch,
+          )
+          .pipe(Effect.result);
+        expect(racedResume._tag).toBe("Failure");
+        const racedStatus = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(racedStatus.reassessment?.subjects).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "director", outcome: "resumed" }),
+            expect.objectContaining({
+              providerThreadId: "late-resume-child",
+              outcome: "resumed",
+            }),
+          ]),
+        );
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("late-child-settled-before-retry"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:03:02.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("late-resume-child"),
+            status: "interrupted",
+            timelineBypass: true,
+            nativeTurn: {
+              sessionId: "late-resume-child",
+              turnId: "late-resume-turn",
+              status: "interrupted",
+            },
+          },
+        });
+        yield* recordWorkflowWorkerObservation({
+          type: "turn.completed",
+          eventId: EventId.make("late-root-settled-before-retry"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          turnId: TurnId.make("late-root-turn"),
+          createdAt: "2026-09-07T12:03:02.000Z",
+          payload: { state: "completed" },
+          raw: {
+            payload: {
+              threadId: "native-director",
+              turn: { id: "late-root-turn" },
+            },
+          },
+        } as ProviderRuntimeEvent);
+        const resumableAgain = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
         const resumed = yield* service.resume(
           {
             projectId,
             repository,
             capabilityNumber: 17,
             directorId: started.director.directorId,
-            observation: resumable.observation,
+            observation: resumableAgain.observation,
             modelSelection,
           },
-          test.dispatch,
+          (command) =>
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO orchestration_command_receipts (
+                command_id, aggregate_kind, aggregate_id, accepted_at,
+                result_sequence, status, error
+              ) VALUES (${command.commandId}, 'thread', ${command.threadId},
+                '2026-09-07T12:03:03.000Z', 503, 'accepted', NULL)`;
+              yield* sql`INSERT INTO projection_turns (
+                thread_id, turn_id, pending_message_id, state, requested_at,
+                checkpoint_files_json
+              ) VALUES (${command.threadId}, 'native-resume-turn', ${command.message.messageId},
+                'running', '2026-09-07T12:03:03.000Z', '[]')`;
+              yield* recordWorkflowWorkerObservation({
+                type: "turn.started",
+                eventId: EventId.make("expected-resume-root-started"),
+                provider: ProviderDriverKind.make("codex"),
+                providerInstanceId: instanceId,
+                threadId: command.threadId,
+                turnId: TurnId.make("native-resume-turn"),
+                createdAt: "2026-09-07T12:03:03.000Z",
+                payload: {},
+                raw: {
+                  payload: {
+                    threadId: "native-director",
+                    turn: { id: "native-resume-turn" },
+                  },
+                },
+              } as ProviderRuntimeEvent);
+              return { sequence: 503 };
+            }),
         );
         expect(resumed.status).toBe("active");
         expect(resumed.reassessment).toBeNull();
@@ -2984,67 +3122,97 @@ describe("WorkflowDirectorService", () => {
     },
   );
 
-  it.effect("does not interrupt on unverified invalidation evidence", () => {
-    const fixture = interpretedCapabilityFixture(1);
-    const liveCapability = structuredClone(fixture.capability);
-    const test = harness({ capability: liveCapability, ticketDetails: fixture.ticketDetails });
-    return Effect.gen(function* () {
-      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
-      const started = yield* service.start(
-        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
-        test.dispatch,
-      );
-      let interrupts = 0;
-      Object.assign(liveCapability, {
-        ...fixture.capability,
-        evidence: {
-          ...fixture.capability.evidence!,
-          records: fixture.capability.evidence!.records.map((record) =>
-            record.kind === "approval" && record.approvalKind === "specification"
-              ? { ...record, scope: "changed" as const, authority: "reported" as const }
-              : record,
-          ),
-        },
-      });
-      yield* service.reassess({ projectId, issue: liveCapability }, () =>
-        Effect.sync(() => {
-          interrupts += 1;
-          return { sequence: 1 };
-        }),
-      );
-      expect(interrupts).toBe(0);
+  it.effect(
+    "interrupts cancelled prerequisites but retains unavailable evidence as uncertainty",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const liveCapability = structuredClone(fixture.capability);
+      const test = harness({ capability: liveCapability, ticketDetails: fixture.ticketDetails });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        let interrupts = 0;
+        Object.assign(liveCapability, {
+          ...fixture.capability,
+          evidence: {
+            ...fixture.capability.evidence!,
+            records: fixture.capability.evidence!.records.map((record) =>
+              record.kind === "approval" && record.approvalKind === "specification"
+                ? { ...record, scope: "changed" as const, authority: "reported" as const }
+                : record,
+            ),
+          },
+        });
+        yield* service.reassess({ projectId, issue: liveCapability }, () =>
+          Effect.sync(() => {
+            interrupts += 1;
+            return { sequence: 1 };
+          }),
+        );
+        expect(interrupts).toBe(0);
 
-      const unavailableClosedBlocker = {
-        ...issue(999, "Closed prerequisite", "task", null),
-        state: "closed" as const,
-        stateReason: "completed" as const,
-        readiness: {
-          status: "closed-unverified" as const,
-          reasons: [
+        const unavailableClosedBlocker = {
+          ...issue(999, "Closed prerequisite", "task", null),
+          state: "closed" as const,
+          stateReason: "completed" as const,
+          readiness: {
+            status: "closed-unverified" as const,
+            reasons: [
+              {
+                kind: "missing-resolution" as const,
+                message: "Resolution evidence is unavailable.",
+                source: `https://github.com/${repository}/issues/999`,
+              },
+            ],
+          },
+        };
+        Object.assign(liveCapability, {
+          ...fixture.capability,
+          blockedBy: [unavailableClosedBlocker],
+        });
+        yield* service.reassess({ projectId, issue: liveCapability }, () =>
+          Effect.sync(() => {
+            interrupts += 1;
+            return { sequence: 2 };
+          }),
+        );
+        expect(interrupts).toBe(0);
+        const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        expect(status.directorId).toBe(started.director.directorId);
+        expect(status.reassessment).toBeNull();
+
+        Object.assign(liveCapability, {
+          ...fixture.capability,
+          blockedBy: [
             {
-              kind: "missing-resolution" as const,
-              message: "Resolution evidence is unavailable.",
-              source: `https://github.com/${repository}/issues/999`,
+              ...unavailableClosedBlocker,
+              stateReason: "not_planned" as const,
+              readiness: {
+                status: "cancelled" as const,
+                reasons: [
+                  {
+                    kind: "cancelled" as const,
+                    message: "This work was cancelled; it does not satisfy dependents.",
+                    source: unavailableClosedBlocker.url,
+                  },
+                ],
+              },
             },
           ],
-        },
-      };
-      Object.assign(liveCapability, {
-        ...fixture.capability,
-        blockedBy: [unavailableClosedBlocker],
-      });
-      yield* service.reassess({ projectId, issue: liveCapability }, () =>
-        Effect.sync(() => {
-          interrupts += 1;
-          return { sequence: 2 };
-        }),
-      );
-      expect(interrupts).toBe(0);
-      const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
-      expect(status.directorId).toBe(started.director.directorId);
-      expect(status.reassessment).toBeNull();
-    }).pipe(Effect.provide(test.layer));
-  });
+        });
+        yield* service.reassess({ projectId, issue: liveCapability }, () =>
+          Effect.sync(() => {
+            interrupts += 1;
+            return { sequence: 3 };
+          }),
+        );
+        expect(interrupts).toBe(1);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
 
   it.effect("holds legacy admissions that have no durable scope baseline", () => {
     const fixture = interpretedCapabilityFixture(1);
@@ -3244,6 +3412,22 @@ describe("WorkflowDirectorService", () => {
                 source: scopeRecordUrl,
                 outcome: "cleared" as const,
                 evidence: `Supersedes: ${scopeRecordUrl}`,
+              },
+            ],
+          },
+        });
+        Object.assign(liveTicket, {
+          ...liveTicket,
+          state: "closed" as const,
+          stateReason: "completed" as const,
+          labels: liveTicket.labels.filter((label) => label !== "ready-for-agent"),
+          readiness: {
+            status: "resolved" as const,
+            reasons: [
+              {
+                kind: "resolution" as const,
+                message: "Completed with current resolution evidence.",
+                source: `${liveTicket.url}#issuecomment-current-resolution`,
               },
             ],
           },

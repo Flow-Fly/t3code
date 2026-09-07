@@ -79,6 +79,37 @@ const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
 );
 const isCodexResumeCursorSchema = Schema.is(CodexResumeCursorSchema);
 
+const CollabAgentIdentity = Schema.Struct({ agentThreadId: Schema.String });
+const isCollabAgentIdentity = Schema.is(CollabAgentIdentity);
+const CollabNativeInterruption = Schema.Struct({
+  interruptAttemptId: Schema.String,
+  nativeSessionId: Schema.String,
+  nativeTurnId: Schema.String,
+  interruptRequestStatus: Schema.Literals([
+    "not-issued",
+    "requested",
+    "acknowledged",
+    "failed",
+    "unknown",
+  ]),
+  interruptCompletionStatus: Schema.optionalKey(Schema.Literal("interrupted")),
+  interruptDetail: Schema.optionalKey(Schema.String),
+});
+const isCollabNativeInterruption = Schema.is(CollabNativeInterruption);
+const CollabNativeTurn = Schema.Struct({
+  nativeSessionId: Schema.String,
+  nativeTurnId: Schema.String,
+  nativeTurnStatus: Schema.Literals(["running", "completed", "failed", "interrupted"]),
+});
+const isCollabNativeTurn = Schema.is(CollabNativeTurn);
+const CollabCompletedTurn = Schema.Struct({
+  turn: Schema.Struct({
+    id: Schema.optionalKey(Schema.String),
+    status: Schema.optionalKey(Schema.String),
+  }),
+});
+const isCollabCompletedTurn = Schema.is(CollabCompletedTurn);
+
 const PROVIDER = ProviderDriverKind.make("codex");
 
 export interface CodexAdapterLiveOptions {
@@ -1040,14 +1071,11 @@ function mapCollabAgentEvent(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
 ): ReadonlyArray<ProviderRuntimeEvent> {
-  const payload =
-    typeof event.payload === "object" && event.payload !== null
-      ? (event.payload as Record<string, unknown>)
-      : undefined;
-  const agentThreadId = typeof payload?.agentThreadId === "string" ? payload.agentThreadId : "";
-  if (!payload || agentThreadId.length === 0) {
+  if (!isCollabAgentIdentity(event.payload) || event.payload.agentThreadId.length === 0) {
     return [];
   }
+  const payload = event.payload as Record<string, unknown>;
+  const agentThreadId = event.payload.agentThreadId;
   const base = runtimeEventBase(event, canonicalThreadId);
   const taskId = RuntimeTaskId.make(agentThreadId);
   const agentPath = typeof payload.agentPath === "string" ? payload.agentPath : undefined;
@@ -1063,59 +1091,27 @@ function mapCollabAgentEvent(
   const model = typeof payload.model === "string" ? payload.model.trim() : "";
   const effort = typeof payload.effort === "string" ? payload.effort.trim() : "";
   const nativeInterruption = (() => {
-    const attemptId =
-      typeof payload.interruptAttemptId === "string" ? payload.interruptAttemptId : "";
-    const sessionId = typeof payload.nativeSessionId === "string" ? payload.nativeSessionId : "";
-    const turnId = typeof payload.nativeTurnId === "string" ? payload.nativeTurnId : "";
-    const requestStatus:
-      | "not-issued"
-      | "requested"
-      | "acknowledged"
-      | "failed"
-      | "unknown"
-      | undefined =
-      payload.interruptRequestStatus === "not-issued" ||
-      payload.interruptRequestStatus === "requested" ||
-      payload.interruptRequestStatus === "acknowledged" ||
-      payload.interruptRequestStatus === "failed" ||
-      payload.interruptRequestStatus === "unknown"
-        ? payload.interruptRequestStatus
-        : undefined;
-    if (!attemptId || !sessionId || !turnId || !requestStatus) return undefined;
+    if (!isCollabNativeInterruption(event.payload)) return undefined;
     return {
-      attemptId,
-      sessionId,
-      turnId,
-      requestStatus,
-      ...(payload.interruptCompletionStatus === "interrupted"
+      attemptId: event.payload.interruptAttemptId,
+      sessionId: event.payload.nativeSessionId,
+      turnId: event.payload.nativeTurnId,
+      requestStatus: event.payload.interruptRequestStatus,
+      ...(event.payload.interruptCompletionStatus === "interrupted"
         ? { completionStatus: "interrupted" as const }
         : {}),
-      ...(typeof payload.interruptDetail === "string" && payload.interruptDetail.trim()
-        ? { detail: payload.interruptDetail.trim() }
+      ...(event.payload.interruptDetail?.trim()
+        ? { detail: event.payload.interruptDetail.trim() }
         : {}),
     };
   })();
   const nativeTurn = (() => {
-    const sessionId = typeof payload.nativeSessionId === "string" ? payload.nativeSessionId : "";
-    const turnId = typeof payload.nativeTurnId === "string" ? payload.nativeTurnId : "";
-    const status: "running" | "completed" | "failed" | "interrupted" | undefined =
-      payload.nativeTurnStatus === "running" ||
-      payload.nativeTurnStatus === "completed" ||
-      payload.nativeTurnStatus === "failed" ||
-      payload.nativeTurnStatus === "interrupted"
-        ? payload.nativeTurnStatus
-        : undefined;
-    if (
-      !sessionId ||
-      !turnId ||
-      (status !== "running" &&
-        status !== "completed" &&
-        status !== "failed" &&
-        status !== "interrupted")
-    ) {
-      return undefined;
-    }
-    return { sessionId, turnId, status };
+    if (!isCollabNativeTurn(event.payload)) return undefined;
+    return {
+      sessionId: event.payload.nativeSessionId,
+      turnId: event.payload.nativeTurnId,
+      status: event.payload.nativeTurnStatus,
+    };
   })();
   // Identity repeated on every status patch so rows are self-describing when
   // the start row ages out of activity retention (review finding: a
@@ -1209,11 +1205,8 @@ function mapCollabAgentEvent(
       ];
     case "collabAgent/turnCompleted": {
       // Idle, not terminal: the identity is resumable via sendInput/resume.
-      const turn =
-        typeof payload.turn === "object" && payload.turn !== null
-          ? (payload.turn as Record<string, unknown>)
-          : undefined;
-      const turnStatus = typeof turn?.status === "string" ? turn.status : undefined;
+      const turn = isCollabCompletedTurn(event.payload) ? event.payload.turn : undefined;
+      const turnStatus = turn?.status;
       const status =
         turnStatus === "failed"
           ? ("failed" as const)

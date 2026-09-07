@@ -13,7 +13,6 @@ export default Effect.gen(function* () {
   yield* sql`ALTER TABLE workflow_worker_observations ADD COLUMN native_session_id TEXT`;
   yield* sql`ALTER TABLE workflow_worker_observations ADD COLUMN native_turn_id TEXT`;
   yield* sql`ALTER TABLE workflow_worker_observations ADD COLUMN native_turn_status TEXT`;
-
   yield* sql`
     CREATE TABLE workflow_reassessments (
       reassessment_id TEXT PRIMARY KEY,
@@ -35,6 +34,11 @@ export default Effect.gen(function* () {
       updated_at TEXT NOT NULL
     )
   `;
+  yield* sql`ALTER TABLE workflow_director_resumes ADD COLUMN reassessment_id TEXT REFERENCES workflow_reassessments(reassessment_id)`;
+  yield* sql`ALTER TABLE workflow_director_resumes ADD COLUMN specification_fingerprint TEXT`;
+  yield* sql`ALTER TABLE workflow_director_resumes ADD COLUMN breakdown_fingerprint TEXT`;
+  yield* sql`ALTER TABLE workflow_director_resumes ADD COLUMN admission_scopes_json TEXT`;
+  yield* sql`ALTER TABLE workflow_director_resumes ADD COLUMN reassessment_trigger_count INTEGER`;
   yield* sql`
     CREATE UNIQUE INDEX idx_workflow_reassessments_open
     ON workflow_reassessments(director_id)
