@@ -92,6 +92,15 @@ export const workflowDirectorHandlers = {
         .resolveTicket(scope.environmentId, scope.threadId, scope.providerInstanceId, input)
         .pipe(Effect.ensuring(notifier.directorChanged(scope).pipe(Effect.ignore)));
     }),
+  workflow_complete_capability: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const workflow = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const notifier = yield* WorkflowMonitor.WorkflowRefreshNotifier;
+      return yield* workflow
+        .completeCapability(scope.environmentId, scope.threadId, scope.providerInstanceId, input)
+        .pipe(Effect.ensuring(notifier.directorChanged(scope).pipe(Effect.ignore)));
+    }),
 } satisfies Parameters<typeof WorkflowDirectorToolkit.toLayer>[0];
 
 export const WorkflowDirectorToolkitHandlersLive =

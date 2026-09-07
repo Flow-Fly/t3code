@@ -746,6 +746,48 @@ function WorkflowDetails(props: {
               </ul>
             </div>
           ) : null}
+          {director.completion ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Capability acceptance</h4>
+              <p className="mt-1 break-all text-xs">
+                {director.completion.status} · {director.completion.authority} ·{" "}
+                {director.completion.resultingHead}
+              </p>
+              <p className="mt-1 text-muted-foreground text-xs">
+                {director.completion.requiredAction}
+              </p>
+              {director.completion.checks.length > 0 ? (
+                <ul className="mt-1 space-y-1 text-xs">
+                  {director.completion.checks.map((check) => (
+                    <li key={check.label} className="rounded-sm bg-muted/50 p-1.5">
+                      <p>
+                        {check.label} · {check.status}
+                      </p>
+                      <p className="mt-0.5 break-all text-muted-foreground">{check.command}</p>
+                      {check.verificationError ? (
+                        <p className="mt-0.5 text-destructive">{check.verificationError}</p>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {director.completion.evidenceUrl ? (
+                <a
+                  className="mt-1 inline-flex items-center gap-1 text-info text-xs hover:underline"
+                  href={director.completion.evidenceUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  Integrated evidence <ExternalLink className="size-3" />
+                </a>
+              ) : null}
+              {director.completion.lastError ? (
+                <p className="mt-1 text-destructive text-xs" role="alert">
+                  {director.completion.lastError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
           {startMessage ? (
             <p className="mt-1 text-destructive text-xs" role="alert">
               {startMessage}

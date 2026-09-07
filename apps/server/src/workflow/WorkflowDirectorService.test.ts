@@ -705,6 +705,7 @@ interface HarnessOptions {
   readonly worktreeCapability?: WorkflowIssueDetail;
   readonly ticketDetails?: ReadonlyArray<WorkflowIssueDetail>;
   readonly extraDetails?: ReadonlyArray<WorkflowIssueDetail>;
+  readonly children?: WorkflowService.WorkflowService["Service"]["children"];
   readonly locate?: WorkflowService.WorkflowService["Service"]["locate"];
   readonly threadShell?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadShellById"];
   readonly threadRuntimeContext?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadRuntimeContext"];
@@ -767,21 +768,23 @@ function harness(options: HarnessOptions = {}) {
             ) ?? ticketDetail,
           );
         },
-        children: ({ parentNumber }) =>
-          Effect.succeed({
-            parentNumber,
-            children: parentNumber === testCapability.number ? ticketDetails : [],
-            frontier:
-              parentNumber === testCapability.number
-                ? {
-                    status: "available",
-                    message: `${ticketDetails.length} items can proceed.`,
-                    readyIssueIds: ticketDetails
-                      .filter((candidate) => candidate.readiness?.status === "ready")
-                      .map((candidate) => candidate.id),
-                  }
-                : { status: "empty", message: "No work.", readyIssueIds: [] },
-          }),
+        children:
+          options.children ??
+          (({ parentNumber }) =>
+            Effect.succeed({
+              parentNumber,
+              children: parentNumber === testCapability.number ? ticketDetails : [],
+              frontier:
+                parentNumber === testCapability.number
+                  ? {
+                      status: "available",
+                      message: `${ticketDetails.length} items can proceed.`,
+                      readyIssueIds: ticketDetails
+                        .filter((candidate) => candidate.readiness?.status === "ready")
+                        .map((candidate) => candidate.id),
+                    }
+                  : { status: "empty", message: "No work.", readyIssueIds: [] },
+            })),
         locate:
           options.locate ??
           (() =>
@@ -5014,4 +5017,513 @@ describe("delivery ticket review resolution", () => {
       }).pipe(Effect.provide(test.layer));
     },
   );
+});
+
+describe("capability combined acceptance", () => {
+  it("keeps completion limits outside authoritative evidence", () => {
+    const body = WorkflowDirectorService.workflowCapabilityCompletionBody({
+      completionId: "completion-1",
+      repository,
+      capabilityNumber: capability.number,
+      resultingHead: reviewHead,
+      requiredIssues: [ticketDetail],
+      checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+    });
+    const parsed = interpretWorkflowEvidence({
+      issue: {
+        id: capability.id,
+        url: capability.url,
+        number: capability.number,
+        title: capability.title,
+        kind: capability.kind,
+        state: "closed",
+        stateReason: "completed",
+        labels: capability.labels,
+        assignees: ["Flow-Fly"],
+        body: capability.body,
+        comments: [
+          {
+            id: "completion-comment",
+            url: `${capability.url}#issuecomment-completion`,
+            body,
+            createdAt: "2026-09-07T10:00:00.000Z",
+            author: "Flow-Fly",
+            authorAssociation: "OWNER",
+          },
+        ],
+        reopenedAt: [],
+      },
+    });
+    expect(parsed.readiness.status).toBe("resolved");
+    expect(parsed.evidence.records[0]).toMatchObject({
+      sourceAccess: "reported",
+      scope: "current",
+      bodyFingerprint: workflowEvidenceBodyFingerprint(body),
+    });
+    expect(parsed.evidence.records[0]?.evidence).toContain(
+      "workflow-capability-completion:completion-1",
+    );
+  });
+
+  it.effect(
+    "completes one batch only after resolved nested work and exact native acceptance receipts",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const completed = interpretedCapabilityFixture(1, new Set([1]));
+      const deliveryTicket = fixture.ticketDetails[0]!;
+      const completedTicket = completed.ticketDetails[0]!;
+      const nestedTask: WorkflowIssueDetail = {
+        ...completedTicket,
+        id: "issue-200",
+        number: 200,
+        title: "Nested delivery task",
+        url: `https://github.com/${repository}/issues/200`,
+        kind: "task",
+        parentNumber: completedTicket.number,
+        childCount: 0,
+        labels: [],
+      };
+      let commentWrites = 0;
+      let closeWrites = 0;
+      let completionBody: string | null = null;
+      let directorThreadId: string | null = null;
+      const completionComments: WorkflowEvidenceComment[] = [];
+      const refreshCapability = (state: "open" | "closed") => {
+        Object.assign(fixture.capability, {
+          state,
+          stateReason: state === "closed" ? "completed" : null,
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: fixture.capability.id,
+              url: fixture.capability.url,
+              number: fixture.capability.number,
+              title: fixture.capability.title,
+              kind: fixture.capability.kind,
+              state,
+              stateReason: state === "closed" ? "completed" : null,
+              labels: fixture.capability.labels,
+              assignees: [],
+              body: fixture.capability.body,
+              comments: [
+                fixture.source,
+                fixture.specification,
+                fixture.breakdownRecord,
+                ...completionComments,
+              ],
+              reopenedAt: [],
+            },
+          }),
+        });
+      };
+      const test = harness({
+        ...fixture,
+        extraDetails: [nestedTask],
+        children: ({ parentNumber }) =>
+          Effect.succeed({
+            parentNumber,
+            children:
+              parentNumber === fixture.capability.number
+                ? [deliveryTicket]
+                : parentNumber === deliveryTicket.number
+                  ? [nestedTask]
+                  : [],
+            frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+          }),
+        processRunner: reviewProcessRunner(),
+        threadRuntimeContext: (threadId) =>
+          Effect.succeed(
+            threadId === directorThreadId
+              ? Option.some({ id: threadId, title: "Capability director", session: null })
+              : Option.none(),
+          ),
+        githubExecute: ({ args, stdin }) => {
+          if (args[0] === "issue" && args[1] === "comment") {
+            commentWrites += 1;
+            completionBody = stdin ?? null;
+            completionComments.push({
+              id: "capability-completion",
+              url: `${fixture.capability.url}#issuecomment-completion`,
+              body: completionBody!,
+              createdAt: "2026-09-07T11:00:00.000Z",
+              author: "Flow-Fly",
+              authorAssociation: "OWNER",
+            });
+            refreshCapability("open");
+            return Effect.succeed(output("commented\n"));
+          }
+          if (args[0] === "issue" && args[1] === "close") {
+            closeWrites += 1;
+            refreshCapability("closed");
+            return Effect.succeed(output("closed\n"));
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const controlled = yield* controlledProviderService();
+        const joinedLayer = ProviderRuntimeIngestionLive.pipe(
+          Layer.provide(Layer.succeed(ProviderService, controlled.service)),
+          Layer.provide(
+            Layer.mock(OrchestrationEngineService)({
+              dispatch: () => Effect.succeed({ sequence: 1 }),
+              streamDomainEvents: Stream.empty,
+            }),
+          ),
+          Layer.provide(test.projectionLayer),
+          Layer.provide(ThreadBackgroundLiveness.layer),
+          Layer.provide(ThreadPlanProgress.layer),
+          Layer.provide(Layer.mock(CheckpointStore.CheckpointStore)({})),
+          Layer.provide(ServerSettingsService.layerTest()),
+          Layer.provideMerge(test.layer),
+          Layer.provideMerge(NodeServices.layer),
+        );
+        return yield* Effect.scoped(
+          Effect.gen(function* () {
+            const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+            const ingestion = yield* ProviderRuntimeIngestionService;
+            yield* ingestion.start();
+            const started = yield* service.start(
+              { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+              test.dispatch,
+            );
+            directorThreadId = started.director.threadId;
+            Object.assign(deliveryTicket, completedTicket, { childCount: 1 });
+            const sql = yield* SqlClient.SqlClient;
+            yield* seedReportedReview(sql, {
+              directorId: started.director.directorId,
+              batchId: started.director.batchId,
+              ticketNumber: deliveryTicket.number,
+              scopeBody: deliveryTicket.body,
+              suffix: "capability-completion",
+            });
+            const invocation: McpInvocationContext.McpInvocationScope = {
+              environmentId,
+              threadId: started.director.threadId,
+              providerInstanceId: instanceId,
+              providerSessionId: "provider-session-director",
+              capabilities: new Set(["preview"]),
+              issuedAt: 1,
+            };
+            const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+              workflowDirectorHandlers
+                .workflow_complete_capability({
+                  resultingHead: reviewHead,
+                  checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+                  receipts,
+                })
+                .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+            const registered = yield* complete([]);
+            expect(registered.disposition).toBe("pending");
+            expect(registered.completion.status).toBe("checks-pending");
+            expect(commentWrites).toBe(0);
+            expect(closeWrites).toBe(0);
+
+            const nativeCommand = {
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: instanceId,
+              threadId: started.director.threadId,
+              itemId: RuntimeItemId.make("combined-tool-call"),
+            } as const;
+            yield* controlled.emitAndWaitForEnqueue([
+              {
+                ...nativeCommand,
+                type: "item.started",
+                eventId: EventId.make("combined-check-started"),
+                createdAt: "2099-09-07T10:00:00.000Z",
+                payload: {
+                  itemType: "command_execution",
+                  status: "inProgress",
+                  data: {
+                    item: {
+                      type: "commandExecution",
+                      command: "vp test run combined.test.ts",
+                      cwd: started.director.worktreePath,
+                    },
+                  },
+                },
+              },
+              {
+                ...nativeCommand,
+                type: "item.completed",
+                eventId: EventId.make("combined-check-completed"),
+                createdAt: "2099-09-07T10:00:01.000Z",
+                payload: {
+                  itemType: "command_execution",
+                  status: "completed",
+                  data: {
+                    item: {
+                      type: "commandExecution",
+                      command: "vp test run combined.test.ts",
+                      cwd: started.director.worktreePath,
+                      status: "completed",
+                      exitCode: 0,
+                      aggregatedOutput: "combined acceptance passed",
+                    },
+                  },
+                },
+              },
+            ]);
+            yield* ingestion.drain;
+            const completedResult = yield* complete([
+              { label: "combined", toolCallId: "combined-tool-call" },
+            ]);
+            expect(completedResult.disposition).toBe("completed");
+            expect(completedResult.completion).toMatchObject({
+              status: "completed",
+              authority: "current",
+              resultingHead: reviewHead,
+            });
+            expect(commentWrites).toBe(1);
+            expect(closeWrites).toBe(1);
+            expect(completionBody).toContain("workflow-capability-completion:");
+            expect(completionBody).toContain(reviewHead);
+
+            const status = yield* service.status({
+              projectId,
+              repository,
+              capabilityNumber: 17,
+            });
+            expect(status.status).toBe("completed");
+            expect(status.completion).toMatchObject({ status: "completed", authority: "current" });
+            const repeated = yield* complete([]);
+            expect(repeated.disposition).toBe("completed");
+            expect(commentWrites).toBe(1);
+            expect(closeWrites).toBe(1);
+          }),
+        ).pipe(Effect.provide(joinedLayer));
+      });
+    },
+  );
+
+  it.effect("keeps a failed combined check open and registers a fresh immutable retry", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const completed = interpretedCapabilityFixture(1, new Set([1]));
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    let trackerWrites = 0;
+    const test = harness({
+      ...fixture,
+      processRunner: reviewProcessRunner(),
+      githubExecute: ({ args }) => {
+        if (args[0] === "issue") trackerWrites += 1;
+        return Effect.succeed(output(""));
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      Object.assign(deliveryTicket, completed.ticketDetails[0]);
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: deliveryTicket.number,
+        scopeBody: deliveryTicket.body,
+        suffix: "capability-failed",
+      });
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+        workflowDirectorHandlers
+          .workflow_complete_capability({
+            resultingHead: reviewHead,
+            checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+            receipts,
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+      const registered = yield* complete([]);
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "failed-combined",
+        command: "vp test run combined.test.ts",
+        cwd: started.director.worktreePath,
+        startedAt: "2099-09-07T11:00:00.000Z",
+        completedAt: "2099-09-07T11:00:01.000Z",
+        exitCode: 1,
+      });
+      const failed = yield* complete([{ label: "combined", toolCallId: "failed-combined" }]);
+      expect(failed.disposition).toBe("held");
+      expect(failed.completion).toMatchObject({
+        status: "checks-failed",
+        authority: "historical",
+      });
+      expect(failed.completion.checks[0]).toMatchObject({ status: "failed", exitCode: 1 });
+      expect(fixture.capability.state).toBe("open");
+      expect(trackerWrites).toBe(0);
+
+      const retried = yield* complete([]);
+      expect(retried.disposition).toBe("pending");
+      expect(retried.completion.status).toBe("checks-pending");
+      expect(retried.completion.completionId).not.toBe(registered.completion.completionId);
+      const history = yield* sql<{ readonly status: string }>`
+        SELECT status FROM workflow_capability_completions ORDER BY created_at, rowid
+      `;
+      expect(history.map((row) => row.status)).toEqual(["invalidated", "checks-pending"]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("invalidates registered acceptance when required nested work reopens", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const completed = interpretedCapabilityFixture(1, new Set([1]));
+    const reopened = interpretedCapabilityFixture(1);
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    const completedTicket = completed.ticketDetails[0]!;
+    const nestedTask: WorkflowIssueDetail = {
+      ...completedTicket,
+      id: "issue-201",
+      number: 201,
+      title: "Nested task",
+      url: `https://github.com/${repository}/issues/201`,
+      kind: "task",
+      parentNumber: deliveryTicket.number,
+      childCount: 0,
+      labels: [],
+    };
+    let trackerWrites = 0;
+    const test = harness({
+      ...fixture,
+      extraDetails: [nestedTask],
+      children: ({ parentNumber }) =>
+        Effect.succeed({
+          parentNumber,
+          children:
+            parentNumber === fixture.capability.number
+              ? [deliveryTicket]
+              : parentNumber === deliveryTicket.number
+                ? [nestedTask]
+                : [],
+          frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+        }),
+      processRunner: reviewProcessRunner(),
+      githubExecute: ({ args }) => {
+        if (args[0] === "issue") trackerWrites += 1;
+        return Effect.succeed(output(""));
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      Object.assign(deliveryTicket, completedTicket, { childCount: 1 });
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: deliveryTicket.number,
+        scopeBody: deliveryTicket.body,
+        suffix: "capability-reopened",
+      });
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+        workflowDirectorHandlers
+          .workflow_complete_capability({
+            resultingHead: reviewHead,
+            checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+            receipts,
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+      yield* complete([]);
+      Object.assign(nestedTask, {
+        ...reopened.ticketDetails[0],
+        id: "issue-201",
+        number: 201,
+        title: "Nested task",
+        url: `https://github.com/${repository}/issues/201`,
+        kind: "task",
+        parentNumber: deliveryTicket.number,
+        childCount: 0,
+        labels: [],
+      });
+      const result = yield* complete([]);
+      expect(result.disposition).toBe("held");
+      expect(result.completion).toMatchObject({
+        status: "invalidated",
+        authority: "historical",
+      });
+      expect(result.completion.requiredAction).toContain("current resolution evidence");
+      expect(fixture.capability.state).toBe("open");
+      expect(trackerWrites).toBe(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("does not treat an empty frontier or confirmed interruption as completion", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const completed = interpretedCapabilityFixture(1, new Set([1]));
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    const test = harness({
+      ...fixture,
+      children: ({ parentNumber }) =>
+        Effect.succeed({
+          parentNumber,
+          children: parentNumber === fixture.capability.number ? [deliveryTicket] : [],
+          frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+        }),
+      processRunner: reviewProcessRunner(),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      Object.assign(deliveryTicket, completed.ticketDetails[0]);
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: deliveryTicket.number,
+        scopeBody: deliveryTicket.body,
+        suffix: "capability-interrupted",
+        workerClosed: false,
+      });
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const result = yield* workflowDirectorHandlers
+        .workflow_complete_capability({
+          resultingHead: reviewHead,
+          checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+          receipts: [],
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.result,
+        );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure.failure).toBe("completion-pending");
+        expect(result.failure.message).toContain("exactly closed");
+      }
+      const attempts = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM workflow_capability_completions
+      `;
+      expect(attempts[0]?.count).toBe(0);
+      expect(fixture.capability.state).toBe("open");
+    }).pipe(Effect.provide(test.layer));
+  });
 });

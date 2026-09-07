@@ -424,6 +424,7 @@ export const WorkflowDirectorLifecycleStatus = Schema.Literals([
   "active",
   "held",
   "waiting",
+  "completed",
 ]);
 export type WorkflowDirectorLifecycleStatus = typeof WorkflowDirectorLifecycleStatus.Type;
 
@@ -622,6 +623,31 @@ export const WorkflowReassessmentStatus = Schema.Struct({
 });
 export type WorkflowReassessmentStatus = typeof WorkflowReassessmentStatus.Type;
 
+export const WorkflowCapabilityCompletionStatus = Schema.Struct({
+  completionId: TrimmedNonEmptyString,
+  resultingHead: TrimmedNonEmptyString,
+  status: Schema.Literals([
+    "checks-pending",
+    "checks-failed",
+    "comment-pending",
+    "comment-uncertain",
+    "close-pending",
+    "close-uncertain",
+    "reopen-pending",
+    "reopen-uncertain",
+    "invalidated",
+    "completed",
+  ]),
+  authority: Schema.Literals(["current", "historical", "unknown"]),
+  checks: Schema.Array(WorkflowReviewCheck),
+  evidenceUrl: Schema.NullOr(TrimmedNonEmptyString),
+  requiredAction: TrimmedNonEmptyString,
+  lastError: Schema.NullOr(TrimmedNonEmptyString),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkflowCapabilityCompletionStatus = typeof WorkflowCapabilityCompletionStatus.Type;
+
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
   batchId: TrimmedNonEmptyString,
@@ -642,6 +668,7 @@ export const WorkflowDirectorStatus = Schema.Struct({
   reviews: Schema.optionalKey(Schema.Array(WorkflowTicketReviewStatus)),
   resolutions: Schema.optionalKey(Schema.Array(WorkflowTicketResolutionStatus)),
   reassessment: Schema.optionalKey(Schema.NullOr(WorkflowReassessmentStatus)),
+  completion: Schema.optionalKey(Schema.NullOr(WorkflowCapabilityCompletionStatus)),
   observation: TrimmedNonEmptyString,
   actions: Schema.Array(Schema.Literals(["open", "resume", "retry", "stop"])),
   createdAt: IsoDateTime,
@@ -829,6 +856,24 @@ export const WorkflowTicketResolveResult = Schema.Struct({
 });
 export type WorkflowTicketResolveResult = typeof WorkflowTicketResolveResult.Type;
 
+export const WorkflowCapabilityCompleteInput = Schema.Struct({
+  resultingHead: TrimmedNonEmptyString,
+  checks: Schema.Array(WorkflowReviewCheckInput).check(Schema.isMinLength(1)),
+  receipts: Schema.Array(
+    Schema.Struct({
+      label: TrimmedNonEmptyString,
+      toolCallId: TrimmedNonEmptyString,
+    }),
+  ),
+});
+export type WorkflowCapabilityCompleteInput = typeof WorkflowCapabilityCompleteInput.Type;
+
+export const WorkflowCapabilityCompleteResult = Schema.Struct({
+  disposition: Schema.Literals(["pending", "held", "completed"]),
+  completion: WorkflowCapabilityCompletionStatus,
+});
+export type WorkflowCapabilityCompleteResult = typeof WorkflowCapabilityCompleteResult.Type;
+
 export const WorkflowDirectorFailure = Schema.Literals([
   "not-ready",
   "approval-unavailable",
@@ -848,6 +893,7 @@ export const WorkflowDirectorFailure = Schema.Literals([
   "stale-review",
   "checks-failed",
   "resolution-pending",
+  "completion-pending",
 ]);
 export type WorkflowDirectorFailure = typeof WorkflowDirectorFailure.Type;
 

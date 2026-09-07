@@ -11,6 +11,9 @@ import {
   ProviderDriverKind,
   ThreadId,
   WorkflowDirectorError,
+  type WorkflowCapabilityCompleteInput,
+  type WorkflowCapabilityCompleteResult,
+  type WorkflowCapabilityCompletionStatus,
   type WorkflowDirectorAdmission,
   type WorkflowDirectorAdmissionInput,
   type WorkflowDirectorAdmissionResult,
@@ -322,6 +325,44 @@ const ResolutionRow = Schema.Struct({
 type ResolutionRow = typeof ResolutionRow.Type;
 const decodeResolutionRow = Schema.decodeUnknownEffect(ResolutionRow);
 
+const CompletionRow = Schema.Struct({
+  completionId: Schema.String,
+  directorId: Schema.String,
+  repository: Schema.String,
+  capabilityNumber: Schema.Number,
+  resultingHead: Schema.String,
+  specificationFingerprint: Schema.String,
+  breakdownFingerprint: Schema.String,
+  commentBody: Schema.String,
+  status: Schema.String,
+  commentUrl: Schema.NullOr(Schema.String),
+  closeConfirmed: Schema.Number,
+  requiredAction: Schema.String,
+  lastError: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+type CompletionRow = typeof CompletionRow.Type;
+const decodeCompletionRow = Schema.decodeUnknownEffect(CompletionRow);
+
+const CompletionCheckRow = Schema.Struct({
+  completionId: Schema.String,
+  label: Schema.String,
+  command: Schema.String,
+  toolCallId: Schema.NullOr(Schema.String),
+  exitCode: Schema.NullOr(Schema.Number),
+  output: Schema.String,
+  startedHead: Schema.String,
+  finishedHead: Schema.NullOr(Schema.String),
+  startedClean: Schema.Number,
+  finishedClean: Schema.NullOr(Schema.Number),
+  verificationStatus: Schema.String,
+  verificationError: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+});
+type CompletionCheckRow = typeof CompletionCheckRow.Type;
+const decodeCompletionCheckRow = Schema.decodeUnknownEffect(CompletionCheckRow);
+
 const NativeCommandRow = Schema.Struct({
   lifecycle: Schema.String,
   command: Schema.String,
@@ -400,6 +441,13 @@ function directorError(
   detail?: string,
 ) {
   return new WorkflowDirectorError({ failure, message, ...(detail ? { detail } : {}) });
+}
+
+function completionEvidenceChanged(error: WorkflowDirectorError | WorkflowQueryError) {
+  return (
+    error._tag === "WorkflowDirectorError" &&
+    (error.failure === "completion-pending" || error.failure === "breakdown-incomplete")
+  );
 }
 
 function sameContent(left: string, right: string): boolean {
@@ -544,6 +592,7 @@ export function workflowDirectorInstructions(input: {
     "After a successful implementation handoff, immediately call workflow_prepare_ticket_review with the fixed base, exact final implementation head and agreed command checks. Run its registered checks through the normal Codex command and approval path, bind their exact native item ids with workflow_record_review_checks, then repeat preparation. The host never runs those checks for you.",
     "Use the prepared instructions to spawn one fresh Astra/medium $code-review coordinator, associate its exact child identity with workflow_associate_ticket_review, and require it to delegate fresh independent Standards and Spec axes. Report the coordinator and both exact axis identities with workflow_report_ticket_review.",
     "Validate every reported finding against the source. Record each director judgment separately with workflow_record_review_dispositions. A fixed finding cites the later fresh review of its changed head. For owner acceptance, first send a readable decision prompt that includes the returned review and finding references, then cite the owner's exact user reply. Close the implementation and review child trees natively, then call workflow_resolve_ticket; retry a pending result so its stable GitHub evidence and closure can reconcile before treating the ticket as resolved.",
+    "After every approved ticket and nested task has current resolution evidence and every native child is closed, call workflow_complete_capability with the exact clean result head, the combined acceptance commands, and no receipts. Run those registered commands through the normal provider path, then repeat the call with each exact native toolCallId. Retry pending tracker results so saved comment, close, or compensating reopen intent can reconcile; only completed/current is present completion authority.",
     `This batch admits at most ${ADMISSION_LIMIT} distinct delivery slices. Failed or blocked admitted slices keep their slot; retry and review reuse it; nested tasks reuse their parent slice. At the limit, stop new admissions, finish or settle admitted work, and wait for a successor.`,
     "Re-read live tracker state before each admission. Do not infer approval from labels, assignment, closure, silence or unavailable evidence.",
     "GitHub assignment is observational and is not a cross-environment atomic lock.",
@@ -594,6 +643,44 @@ export function workflowTicketResolutionBody(input: {
     "",
     "### Limits and staffing",
     `Requested reviewer ${input.review.requestedProfile.model}/${input.review.requestedProfile.effort}; observed ${input.review.observedProfile.model ?? "unavailable"}/${input.review.observedProfile.effort ?? "unavailable"} (${input.review.observedProfile.match}).`,
+  ].join("\n");
+}
+
+export function workflowCapabilityCompletionBody(input: {
+  readonly completionId: string;
+  readonly repository: string;
+  readonly capabilityNumber: number;
+  readonly resultingHead: string;
+  readonly requiredIssues: ReadonlyArray<WorkflowIssueDetail>;
+  readonly checks: WorkflowCapabilityCompleteInput["checks"];
+}) {
+  return [
+    "## Resolution",
+    "<!-- t3-workflow:v1 resolution -->",
+    "Outcome: resolved",
+    `Source: https://github.com/${input.repository}/issues/${input.capabilityNumber}`,
+    "",
+    "### Summary",
+    `The complete approved delivery hierarchy passed combined acceptance at ${input.resultingHead}.`,
+    "",
+    "### Evidence",
+    `- [Integrated implementation](https://github.com/${input.repository}/commit/${input.resultingHead})`,
+    `- artifact: \`workflow-capability-completion:${input.completionId}\``,
+    ...input.checks.map(
+      (check) =>
+        `- artifact: \`workflow-capability-completion:${input.completionId}/check/${check.label}\``,
+    ),
+    "",
+    "### Required delivery",
+    ...input.requiredIssues.map(
+      (issue) => `- [#${issue.number} — ${issue.title}](${issue.url}): resolved`,
+    ),
+    "",
+    "### Combined acceptance",
+    ...input.checks.map((check) => `- ${check.label}: \`${check.command}\``),
+    "",
+    "### Limits",
+    "This records capability acceptance only. Merge and release remain separate actions.",
   ].join("\n");
 }
 
@@ -679,6 +766,15 @@ export class WorkflowDirectorService extends Context.Service<
       providerInstanceId: ProviderInstanceId,
       input: WorkflowTicketResolveInput,
     ) => Effect.Effect<WorkflowTicketResolveResult, WorkflowQueryError | WorkflowDirectorError>;
+    readonly completeCapability: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowCapabilityCompleteInput,
+    ) => Effect.Effect<
+      WorkflowCapabilityCompleteResult,
+      WorkflowQueryError | WorkflowDirectorError
+    >;
   }
 >()("t3/workflow/WorkflowDirectorService") {}
 
@@ -1010,6 +1106,62 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const approvedDeliveryHierarchy = Effect.fn("WorkflowDirectorService.approvedDeliveryHierarchy")(
+    function* (input: {
+      readonly projectId: ProjectId;
+      readonly repository: string;
+      readonly capabilityNumber: number;
+      readonly breakdownApproval: WorkflowEvidenceRecord;
+    }) {
+      const ticketSummaries = yield* collectDeliveryTickets(input);
+      const approvedTickets = yield* Effect.forEach(ticketSummaries, (ticket) =>
+        workflow.issueDetail({
+          projectId: input.projectId,
+          repository: input.repository as WorkflowIssueSummary["repository"],
+          number: ticket.number,
+        }),
+      );
+      yield* verifyPublishedBreakdown(input.breakdownApproval, approvedTickets);
+
+      const required = new Map(approvedTickets.map((ticket) => [ticket.number, ticket]));
+      const pending = approvedTickets.map((ticket) => ticket.number);
+      const visited = new Set<number>();
+      while (pending.length > 0) {
+        const parentNumber = pending.shift()!;
+        if (visited.has(parentNumber)) continue;
+        visited.add(parentNumber);
+        const children = yield* workflow.children({
+          projectId: input.projectId,
+          repository: input.repository as WorkflowIssueSummary["repository"],
+          parentNumber,
+        });
+        for (const child of children.children) {
+          if (child.kind === "ticket" || child.kind === "task") {
+            if (!required.has(child.number)) {
+              required.set(
+                child.number,
+                yield* workflow.issueDetail({
+                  projectId: input.projectId,
+                  repository: input.repository as WorkflowIssueSummary["repository"],
+                  number: child.number,
+                }),
+              );
+            }
+          }
+          if (
+            child.kind === "ticket" ||
+            child.kind === "task" ||
+            child.kind === "container" ||
+            child.kind === "map"
+          ) {
+            pending.push(child.number);
+          }
+        }
+      }
+      return { approvedTickets, requiredIssues: [...required.values()] };
+    },
+  );
+
   const providerPreflight = Effect.fn("WorkflowDirectorService.providerPreflight")(function* (
     cwd: string,
     modelSelection: WorkflowDirectorStartInput["modelSelection"],
@@ -1155,9 +1307,10 @@ export const make = Effect.gen(function* () {
   const executeGitHub = Effect.fn("WorkflowDirectorService.executeGitHub")(function* (
     cwd: string,
     args: ReadonlyArray<string>,
+    stdin?: string,
   ) {
     return yield* github
-      .execute({ cwd, args, maxOutputBytes: 100_000 })
+      .execute({ cwd, args, ...(stdin === undefined ? {} : { stdin }), maxOutputBytes: 100_000 })
       .pipe(
         Effect.mapError((error) =>
           directorError("claim-failed", "GitHub ownership could not be verified.", error.message),
@@ -1964,6 +2117,95 @@ export const make = Effect.gen(function* () {
     return rows.map(resolutionStatusFromRow);
   });
 
+  const completionChecks = Effect.fn("WorkflowDirectorService.completionChecks")(function* (
+    completionId: string,
+  ) {
+    const rawRows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT completion_id AS "completionId", label, command,
+          tool_call_id AS "toolCallId", exit_code AS "exitCode", output,
+          started_head AS "startedHead", finished_head AS "finishedHead",
+          started_clean AS "startedClean", finished_clean AS "finishedClean",
+          verification_status AS "verificationStatus",
+          verification_error AS "verificationError", created_at AS "createdAt"
+        FROM workflow_capability_checks
+        WHERE completion_id = ${completionId}
+        ORDER BY rowid
+      `,
+      "Capability acceptance checks could not be read.",
+    );
+    return yield* Effect.forEach(rawRows, (candidate) => decodeCompletionCheckRow(candidate)).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "Capability acceptance check evidence is invalid.",
+          String(error),
+        ),
+      ),
+    );
+  });
+
+  const completionStatusFromRow = Effect.fn("WorkflowDirectorService.completionStatusFromRow")(
+    function* (row: CompletionRow, authority: WorkflowCapabilityCompletionStatus["authority"]) {
+      const checks = (yield* completionChecks(row.completionId)).map((check) => ({
+        label: check.label,
+        command: check.command,
+        toolCallId: check.toolCallId,
+        exitCode: check.exitCode,
+        output: check.output,
+        startedHead: check.startedHead,
+        finishedHead: check.finishedHead,
+        startedClean: check.startedClean === 1,
+        finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
+        status: check.verificationStatus as "pending" | "passed" | "failed",
+        verificationError: check.verificationError,
+      }));
+      return {
+        completionId: row.completionId,
+        resultingHead: row.resultingHead,
+        status: row.status as WorkflowCapabilityCompletionStatus["status"],
+        authority,
+        checks,
+        evidenceUrl: row.commentUrl,
+        requiredAction: row.requiredAction,
+        lastError: row.lastError,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      } satisfies WorkflowCapabilityCompletionStatus;
+    },
+  );
+
+  const latestCompletion = Effect.fn("WorkflowDirectorService.latestCompletion")(function* (
+    directorId: string,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT completion_id AS "completionId", director_id AS "directorId", repository,
+          capability_number AS "capabilityNumber", resulting_head AS "resultingHead",
+          specification_fingerprint AS "specificationFingerprint",
+          breakdown_fingerprint AS "breakdownFingerprint", comment_body AS "commentBody",
+          status, comment_url AS "commentUrl", close_confirmed AS "closeConfirmed",
+          required_action AS "requiredAction", last_error AS "lastError",
+          created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM workflow_capability_completions
+        WHERE director_id = ${directorId}
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+      `,
+      "Capability completion history could not be read.",
+    );
+    if (!rows[0]) return null;
+    return yield* decodeCompletionRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "The capability completion record is invalid.",
+          String(error),
+        ),
+      ),
+    );
+  });
+
   const reconcileDirector = Effect.fn("WorkflowDirectorService.reconcileDirector")(function* (
     row: DirectorRow,
   ) {
@@ -2024,11 +2266,58 @@ export const make = Effect.gen(function* () {
     return row;
   });
 
+  const completionForStatus = Effect.fn("WorkflowDirectorService.completionForStatus")(function* (
+    director: DirectorRow,
+  ) {
+    let completion = yield* latestCompletion(director.directorId);
+    if (!completion) return null;
+    if (completion.status === "completed") {
+      const current = yield* capabilityCompletionGate(
+        director,
+        completion.resultingHead,
+        true,
+      ).pipe(Effect.result);
+      const authoritative =
+        current._tag === "Success" &&
+        current.success.capability.state === "closed" &&
+        current.success.capability.stateReason === "completed" &&
+        matchingCapabilityCompletion(current.success.capability, completion);
+      if (authoritative) return yield* completionStatusFromRow(completion, "current");
+      const reason =
+        current._tag === "Failure"
+          ? (current.failure.detail ?? current.failure.message)
+          : "The saved capability completion evidence is no longer current.";
+      if (
+        completion.closeConfirmed === 1 &&
+        (current._tag === "Success" || completionEvidenceChanged(current.failure))
+      ) {
+        completion = yield* compensateCapabilityClose(director, completion, reason);
+        return yield* completionStatusFromRow(
+          completion,
+          completion.status === "invalidated" ? "historical" : "unknown",
+        );
+      }
+      return {
+        ...(yield* completionStatusFromRow(completion, "unknown")),
+        requiredAction:
+          "Refresh live tracker and workspace evidence before relying on this historical completion.",
+        lastError: reason,
+      };
+    }
+    return yield* completionStatusFromRow(
+      completion,
+      completion.status === "invalidated" || completion.status === "checks-failed"
+        ? "historical"
+        : "unknown",
+    );
+  });
+
   const statusFromRow = Effect.fn("WorkflowDirectorService.statusFromRow")(function* (
     original: DirectorRow,
   ) {
     const row = yield* reconcileDirector(original);
     const reassessment = yield* reassessmentStatus(row.directorId);
+    const completion = yield* completionForStatus(row);
     const admissionRows = yield* admissions(row.directorId);
     const admissionCount = new Set(admissionRows.map((admission) => admission.slotTicketNumber))
       .size;
@@ -2071,7 +2360,14 @@ export const make = Effect.gen(function* () {
       actions.push("resume");
     }
     const status =
-      admissionCount >= ADMISSION_LIMIT && row.status === "active" ? "waiting" : row.status;
+      completion?.status === "completed" && completion.authority === "current"
+        ? "completed"
+        : admissionCount >= ADMISSION_LIMIT && row.status === "active"
+          ? "waiting"
+          : row.status;
+    if (status === "completed") {
+      actions.splice(0, actions.length, ...(Option.isSome(shell) ? (["open"] as const) : []));
+    }
     const observation = [
       row.directorId,
       row.updatedAt,
@@ -2079,6 +2375,8 @@ export const make = Effect.gen(function* () {
       Option.isSome(shell) ? (shell.value.latestTurn?.turnId ?? "no-turn") : "no-thread",
       admissionCount,
       reassessment?.updatedAt ?? "no-reassessment",
+      completion?.updatedAt ?? "no-completion",
+      completion?.authority ?? "no-completion-authority",
     ].join("|");
     return {
       directorId: row.directorId,
@@ -2108,22 +2406,25 @@ export const make = Effect.gen(function* () {
       reviews: yield* reviews(row.directorId),
       resolutions: yield* resolutions(row.directorId),
       reassessment,
+      completion,
       observation,
       actions,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       message:
-        status === "waiting"
-          ? "This director has admitted ten delivery slices. Finish or settle admitted work, then wait for a successor."
-          : reassessment
-            ? "Work is held for reassessment. Resume only after every native turn is settled and the tracker records the current decision."
-            : status === "held"
-              ? (row.detail ?? "Director startup is held for recovery.")
-              : status === "preparing-worktree"
-                ? "The recorded capability worktree needs recovery before the director can start."
-                : status === "submitting"
-                  ? "The director submission is being reconciled."
-                  : "The capability director is active in its preserved worktree.",
+        status === "completed"
+          ? "Combined acceptance is current and the capability is closed completed."
+          : status === "waiting"
+            ? "This director has admitted ten delivery slices. Finish or settle admitted work, then wait for a successor."
+            : reassessment
+              ? "Work is held for reassessment. Resume only after every native turn is settled and the tracker records the current decision."
+              : status === "held"
+                ? (row.detail ?? "Director startup is held for recovery.")
+                : status === "preparing-worktree"
+                  ? "The recorded capability worktree needs recovery before the director can start."
+                  : status === "submitting"
+                    ? "The director submission is being reconciled."
+                    : "The capability director is active in its preserved worktree.",
     } satisfies WorkflowDirectorStatus;
   });
 
@@ -4045,6 +4346,154 @@ export const make = Effect.gen(function* () {
     return observed;
   });
 
+  const capabilityCompletionGate = Effect.fn("WorkflowDirectorService.capabilityCompletionGate")(
+    function* (row: DirectorRow, resultingHead: string, allowClosed: boolean) {
+      if (!/^[0-9a-f]{40}$/iu.test(resultingHead)) {
+        return yield* directorError(
+          "completion-pending",
+          "Capability completion requires a full resulting commit hash.",
+        );
+      }
+      const capability = yield* workflow.issueDetail({
+        projectId: ProjectId.make(row.projectId),
+        repository: row.repository as WorkflowIssueSummary["repository"],
+        number: row.capabilityNumber,
+      });
+      if (
+        capability.kind !== "capability" ||
+        (capability.state !== "open" && (!allowClosed || capability.stateReason !== "completed"))
+      ) {
+        return yield* directorError(
+          "completion-pending",
+          "The capability must be open, or be the completed capability currently being reconciled.",
+        );
+      }
+      const specification = yield* currentApproval(capability, "specification");
+      const breakdown = yield* currentApproval(capability, "ticket-breakdown");
+      if (!specification || !breakdown) {
+        return yield* directorError(
+          "approval-unavailable",
+          "Current verified specification and ticket-breakdown approvals are required for completion.",
+        );
+      }
+      const specificationFingerprint = workflowEvidenceBodyFingerprint(
+        specification.approvedContent ?? "",
+      );
+      const breakdownFingerprint = workflowEvidenceBodyFingerprint(breakdown.approvedContent ?? "");
+      if (
+        specificationFingerprint !== row.specificationFingerprint ||
+        breakdownFingerprint !== row.breakdownFingerprint
+      ) {
+        return yield* directorError(
+          "completion-pending",
+          "Approved capability scope changed and requires reassessment before completion.",
+        );
+      }
+      if (yield* activeReassessment(row.directorId)) {
+        return yield* directorError(
+          "completion-pending",
+          "Capability completion is held until the active reassessment is cleared.",
+        );
+      }
+      const hierarchy = yield* approvedDeliveryHierarchy({
+        projectId: ProjectId.make(row.projectId),
+        repository: row.repository,
+        capabilityNumber: row.capabilityNumber,
+        breakdownApproval: breakdown,
+      });
+      const unresolved = hierarchy.requiredIssues.filter(
+        (issue) => issue.readiness?.status !== "resolved",
+      );
+      if (unresolved.length > 0) {
+        return yield* directorError(
+          "completion-pending",
+          "Every approved delivery ticket and nested task needs current resolution evidence.",
+          unresolved.map((issue) => `#${issue.number}: ${readinessDetail(issue)}`).join(" "),
+        );
+      }
+      const requiredNumbers = hierarchy.requiredIssues.map((issue) => issue.number);
+      const pendingResolutions =
+        requiredNumbers.length === 0
+          ? []
+          : yield* persistence(
+              sql<{ readonly ticketNumber: number }>`
+              SELECT ticket_number AS "ticketNumber"
+              FROM workflow_ticket_resolution_intents
+              WHERE director_id = ${row.directorId}
+                AND ${sql.in("ticket_number", requiredNumbers)}
+                AND status <> 'resolved'
+            `,
+              "Pending ticket writes could not be checked before capability completion.",
+            );
+      if (pendingResolutions.length > 0) {
+        return yield* directorError(
+          "completion-pending",
+          "A required ticket still has a pending or uncertain tracker write.",
+          pendingResolutions.map((entry) => `#${entry.ticketNumber}`).join(", "),
+        );
+      }
+      const unconfirmedDispatches = yield* persistence(
+        sql<{ readonly ticketNumber: number }>`
+        SELECT ticket_number AS "ticketNumber" FROM workflow_worker_dispatches
+        WHERE director_id = ${row.directorId} AND provider_thread_id IS NULL
+      `,
+        "Worker association evidence could not be checked before capability completion.",
+      );
+      if (unconfirmedDispatches.length > 0) {
+        return yield* directorError(
+          "completion-pending",
+          "A prepared worker has no confirmed native child identity.",
+        );
+      }
+      const childRows = yield* persistence(
+        sql<{
+          readonly providerThreadId: string;
+          readonly nativeLifecycle: string | null;
+          readonly associated: number;
+        }>`
+        SELECT o.provider_thread_id AS "providerThreadId",
+          o.native_lifecycle AS "nativeLifecycle",
+          CASE WHEN d.dispatch_id IS NOT NULL OR r.review_id IS NOT NULL OR ar.review_id IS NOT NULL
+            THEN 1 ELSE 0 END AS associated
+        FROM workflow_worker_observations o
+        LEFT JOIN workflow_worker_dispatches d
+          ON d.director_id = o.director_id AND d.provider_thread_id = o.provider_thread_id
+        LEFT JOIN workflow_ticket_reviews r
+          ON r.director_id = o.director_id AND r.provider_thread_id = o.provider_thread_id
+        LEFT JOIN workflow_review_axes a ON a.provider_thread_id = o.provider_thread_id
+        LEFT JOIN workflow_ticket_reviews ar
+          ON ar.review_id = a.review_id AND ar.director_id = o.director_id
+        WHERE o.director_id = ${row.directorId}
+      `,
+        "Native child settlement evidence could not be checked before capability completion.",
+      );
+      const unsettledChildren = childRows.filter(
+        (child) => child.associated !== 1 || child.nativeLifecycle !== "closed",
+      );
+      if (unsettledChildren.length > 0) {
+        return yield* directorError(
+          "completion-pending",
+          "Every observed native child must be associated and exactly closed before completion.",
+          unsettledChildren.map((child) => child.providerThreadId).join(", "),
+        );
+      }
+      const observed = yield* gitObservation(row.worktreePath);
+      if (observed.head !== resultingHead || !observed.clean) {
+        return yield* directorError(
+          "completion-pending",
+          "Combined acceptance requires the clean worktree at the exact registered result head.",
+          `Expected ${resultingHead}; observed ${observed.head}${observed.clean ? "" : " with uncommitted changes"}.`,
+        );
+      }
+      return {
+        capability,
+        requiredIssues: hierarchy.requiredIssues,
+        specificationFingerprint,
+        breakdownFingerprint,
+      };
+    },
+  );
+
   const prepareWorkerUnlocked = Effect.fn("WorkflowDirectorService.prepareWorker")(function* (
     environmentId: EnvironmentId,
     threadId: ThreadId,
@@ -5544,6 +5993,645 @@ export const make = Effect.gen(function* () {
     } satisfies WorkflowTicketResolveResult;
   });
 
+  const updateCompletion = Effect.fn("WorkflowDirectorService.updateCompletion")(function* (
+    row: CompletionRow,
+    update: {
+      readonly status: CompletionRow["status"];
+      readonly requiredAction: string;
+      readonly lastError?: string | null;
+      readonly commentUrl?: string | null;
+      readonly closeConfirmed?: boolean;
+    },
+  ) {
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql`UPDATE workflow_capability_completions SET status = ${update.status},
+        required_action = ${update.requiredAction},
+        last_error = ${update.lastError ?? null},
+        comment_url = ${update.commentUrl === undefined ? row.commentUrl : update.commentUrl},
+        close_confirmed = ${update.closeConfirmed === undefined ? row.closeConfirmed : update.closeConfirmed ? 1 : 0},
+        updated_at = ${updatedAt}
+        WHERE completion_id = ${row.completionId}`,
+      "Capability completion state could not be saved.",
+    );
+    return {
+      ...row,
+      status: update.status,
+      requiredAction: update.requiredAction,
+      lastError: update.lastError ?? null,
+      commentUrl: update.commentUrl === undefined ? row.commentUrl : update.commentUrl,
+      closeConfirmed:
+        update.closeConfirmed === undefined ? row.closeConfirmed : update.closeConfirmed ? 1 : 0,
+      updatedAt,
+    };
+  });
+
+  const matchingCapabilityCompletion = (detail: WorkflowIssueDetail, row: CompletionRow) =>
+    detail.evidence?.records.find(
+      (record) =>
+        record.kind === "resolution" &&
+        record.state === "current" &&
+        record.scope === "current" &&
+        record.sourceAccess !== "unavailable" &&
+        record.outcome === "resolved" &&
+        record.bodyFingerprint === workflowEvidenceBodyFingerprint(row.commentBody) &&
+        record.evidence?.includes(`workflow-capability-completion:${row.completionId}`),
+    );
+
+  const compensateCapabilityClose = Effect.fn("WorkflowDirectorService.compensateCapabilityClose")(
+    function* (director: DirectorRow, completion: CompletionRow, reason: string) {
+      const current = yield* workflow.issueDetail({
+        projectId: ProjectId.make(director.projectId),
+        repository: director.repository as WorkflowIssueSummary["repository"],
+        number: director.capabilityNumber,
+      });
+      if (current.state === "open") {
+        return yield* updateCompletion(completion, {
+          status: "invalidated",
+          requiredAction: reason,
+          lastError: reason,
+          closeConfirmed: false,
+        });
+      }
+      let row = yield* updateCompletion(completion, {
+        status: "reopen-uncertain",
+        requiredAction:
+          "Reconcile the compensating capability reopen before retrying combined acceptance.",
+        lastError: reason,
+      });
+      yield* executeGitHub(director.worktreePath, [
+        "issue",
+        "reopen",
+        String(director.capabilityNumber),
+        "--repo",
+        director.repository,
+      ]).pipe(Effect.result);
+      const refreshed = yield* workflow.issueDetail({
+        projectId: ProjectId.make(director.projectId),
+        repository: director.repository as WorkflowIssueSummary["repository"],
+        number: director.capabilityNumber,
+      });
+      if (refreshed.state === "open") {
+        row = yield* updateCompletion(row, {
+          status: "invalidated",
+          requiredAction: reason,
+          lastError: reason,
+          closeConfirmed: false,
+        });
+      }
+      return row;
+    },
+  );
+
+  const bindCapabilityCheckReceipts = Effect.fn(
+    "WorkflowDirectorService.bindCapabilityCheckReceipts",
+  )(function* (
+    director: DirectorRow,
+    completion: CompletionRow,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowCapabilityCompleteInput,
+  ) {
+    const labels = input.receipts.map((receipt) => receipt.label);
+    const toolCallIds = input.receipts.map((receipt) => receipt.toolCallId);
+    if (
+      new Set(labels).size !== labels.length ||
+      new Set(toolCallIds).size !== toolCallIds.length
+    ) {
+      return yield* directorError(
+        "checks-failed",
+        "Each capability check label and native toolCallId may be bound only once per request.",
+      );
+    }
+    for (const receipt of input.receipts) {
+      const check = (yield* completionChecks(completion.completionId)).find(
+        (candidate) => candidate.label === receipt.label,
+      );
+      if (!check) {
+        return yield* directorError(
+          "checks-failed",
+          `No registered capability check is named ${receipt.label}.`,
+        );
+      }
+      if (check.toolCallId === receipt.toolCallId && check.verificationStatus !== "pending") {
+        continue;
+      }
+      if (check.toolCallId && check.toolCallId !== receipt.toolCallId) {
+        return yield* directorError(
+          "checks-failed",
+          `Capability check ${receipt.label} is already bound to a different native receipt.`,
+        );
+      }
+      const reused = yield* persistence(
+        sql<{ readonly used: number }>`
+          SELECT 1 AS used FROM workflow_review_checks
+          WHERE thread_id = ${director.threadId}
+            AND provider_instance_id = ${providerInstanceId}
+            AND tool_call_id = ${receipt.toolCallId}
+          UNION ALL
+          SELECT 1 AS used FROM workflow_capability_checks
+          WHERE completion_id <> ${completion.completionId}
+            AND thread_id = ${director.threadId}
+            AND provider_instance_id = ${providerInstanceId}
+            AND tool_call_id = ${receipt.toolCallId}
+          LIMIT 1
+        `,
+        "Prior native receipt use could not be checked.",
+      );
+      if (reused.length > 0) {
+        return yield* directorError(
+          "checks-failed",
+          "A native command receipt cannot be reused for capability acceptance.",
+        );
+      }
+      const rawNative = yield* persistence(
+        sql<Record<string, unknown>>`
+          SELECT lifecycle, command, cwd, status, exit_code AS "exitCode", output,
+            created_at AS "createdAt"
+          FROM workflow_native_command_observations
+          WHERE thread_id = ${director.threadId}
+            AND provider_instance_id = ${providerInstanceId}
+            AND tool_call_id = ${receipt.toolCallId}
+            AND created_at > ${check.createdAt}
+          ORDER BY created_at
+        `,
+        "Capability native check receipts could not be read.",
+      );
+      const native = yield* Effect.forEach(rawNative, (candidate) =>
+        decodeNativeCommandRow(candidate),
+      ).pipe(
+        Effect.mapError((error) =>
+          directorError("persistence-failed", "Native command evidence is invalid.", String(error)),
+        ),
+      );
+      const started = native.find((candidate) => candidate.lifecycle === "started");
+      const completed = native.findLast((candidate) => candidate.lifecycle === "completed");
+      if (!started || !completed || started.createdAt > completed.createdAt) {
+        return yield* directorError(
+          "checks-failed",
+          `Native start and completion for ${receipt.label} are not both observed after registration.`,
+        );
+      }
+      const git = yield* gitObservation(director.worktreePath);
+      const accepted =
+        started.command === check.command &&
+        completed.command === check.command &&
+        started.cwd === director.worktreePath &&
+        completed.cwd === director.worktreePath &&
+        completed.status === "completed" &&
+        completed.exitCode === 0 &&
+        check.startedHead === completion.resultingHead &&
+        check.startedClean === 1 &&
+        git.head === completion.resultingHead &&
+        git.clean;
+      const verificationError = accepted
+        ? null
+        : started.command !== check.command || completed.command !== check.command
+          ? "The observed native command does not match the registered command."
+          : started.cwd !== director.worktreePath || completed.cwd !== director.worktreePath
+            ? "The observed native command ran outside the capability worktree."
+            : completed.status !== "completed" || completed.exitCode === null
+              ? "The native command completion status or exit code is unknown."
+              : completed.exitCode !== 0
+                ? `The native command exited with code ${completed.exitCode}.`
+                : git.head !== completion.resultingHead
+                  ? "The resulting HEAD changed while combined acceptance ran."
+                  : "The capability worktree was dirty before or after combined acceptance.";
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`UPDATE workflow_capability_checks SET tool_call_id = ${receipt.toolCallId},
+          exit_code = ${completed.exitCode}, output = ${completed.output},
+          finished_head = ${git.head}, finished_clean = ${git.clean ? 1 : 0},
+          verification_status = ${accepted ? "passed" : "failed"},
+          verification_error = ${verificationError}, native_started_at = ${started.createdAt},
+          native_completed_at = ${completed.createdAt}, updated_at = ${updatedAt}
+          WHERE completion_id = ${completion.completionId} AND label = ${receipt.label}`,
+        "Capability native check evidence could not be saved.",
+      );
+      yield* persistence(
+        sql`DELETE FROM workflow_native_command_observations
+          WHERE thread_id = ${director.threadId}
+            AND provider_instance_id = ${providerInstanceId}
+            AND tool_call_id = ${receipt.toolCallId}`,
+        "Compacted capability check observations could not be released.",
+      );
+    }
+  });
+
+  const completeCapabilityUnlocked = Effect.fn("WorkflowDirectorService.completeCapability")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowCapabilityCompleteInput,
+    ) {
+      const director = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const labels = input.checks.map((check) => check.label);
+      if (new Set(labels).size !== labels.length) {
+        return yield* directorError("checks-failed", "Capability check labels must be unique.");
+      }
+      let completion = yield* latestCompletion(director.directorId);
+      if (completion?.status === "completed") {
+        const status = yield* completionForStatus(director);
+        return {
+          disposition:
+            status?.status === "completed" && status.authority === "current" ? "completed" : "held",
+          completion: status!,
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (completion?.status === "reopen-pending" || completion?.status === "reopen-uncertain") {
+        completion = yield* compensateCapabilityClose(
+          director,
+          completion,
+          completion.lastError ?? "The owned capability close no longer has current acceptance.",
+        );
+        return {
+          disposition: "held",
+          completion: yield* completionStatusFromRow(
+            completion,
+            completion.status === "invalidated" ? "historical" : "unknown",
+          ),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (
+        completion?.status === "comment-uncertain" ||
+        completion?.status === "close-pending" ||
+        completion?.status === "close-uncertain"
+      ) {
+        const tracker = yield* workflow.issueDetail({
+          projectId: ProjectId.make(director.projectId),
+          repository: director.repository as WorkflowIssueSummary["repository"],
+          number: director.capabilityNumber,
+        });
+        const record = matchingCapabilityCompletion(tracker, completion);
+        if (completion.status === "comment-uncertain" && !record) {
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        if (record && completion.status === "comment-uncertain") {
+          completion = yield* updateCompletion(completion, {
+            status: "close-pending",
+            requiredAction:
+              "Confirm current acceptance state, then close the capability completed.",
+            commentUrl: record.url,
+          });
+        }
+        if (tracker.state === "closed" && tracker.stateReason === "completed" && record) {
+          completion = yield* updateCompletion(completion, {
+            status: "close-pending",
+            requiredAction: "Confirm the post-close acceptance gate.",
+            commentUrl: record.url,
+            closeConfirmed: true,
+          });
+          const postClose = yield* capabilityCompletionGate(
+            director,
+            completion.resultingHead,
+            true,
+          ).pipe(Effect.result);
+          if (postClose._tag === "Failure") {
+            if (!completionEvidenceChanged(postClose.failure)) {
+              return {
+                disposition: "pending",
+                completion: yield* completionStatusFromRow(completion, "unknown"),
+              } satisfies WorkflowCapabilityCompleteResult;
+            }
+            completion = yield* compensateCapabilityClose(
+              director,
+              completion,
+              postClose.failure.detail ?? postClose.failure.message,
+            );
+            return {
+              disposition: "held",
+              completion: yield* completionStatusFromRow(
+                completion,
+                completion.status === "invalidated" ? "historical" : "unknown",
+              ),
+            } satisfies WorkflowCapabilityCompleteResult;
+          }
+          completion = yield* updateCompletion(completion, {
+            status: "completed",
+            requiredAction: "No capability completion action is required.",
+            commentUrl: record.url,
+            closeConfirmed: true,
+          });
+          return {
+            disposition: "completed",
+            completion: yield* completionStatusFromRow(completion, "current"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+      }
+      if (completion?.status === "invalidated") completion = null;
+      const gated = yield* capabilityCompletionGate(director, input.resultingHead, false).pipe(
+        Effect.result,
+      );
+      if (gated._tag === "Failure") {
+        if (completion) {
+          if (!completionEvidenceChanged(gated.failure)) {
+            return {
+              disposition: "pending",
+              completion: yield* completionStatusFromRow(completion, "unknown"),
+            } satisfies WorkflowCapabilityCompleteResult;
+          }
+          completion = yield* updateCompletion(completion, {
+            status: "invalidated",
+            requiredAction: gated.failure.message,
+            lastError: gated.failure.detail ?? gated.failure.message,
+          });
+          return {
+            disposition: "held",
+            completion: yield* completionStatusFromRow(completion, "historical"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        return yield* gated.failure;
+      }
+      const gate = gated.success;
+      const sameAttempt =
+        completion?.resultingHead === input.resultingHead &&
+        completion.specificationFingerprint === gate.specificationFingerprint &&
+        completion.breakdownFingerprint === gate.breakdownFingerprint &&
+        (yield* completionChecks(completion.completionId)).length === input.checks.length &&
+        (yield* completionChecks(completion.completionId)).every((check) =>
+          input.checks.some(
+            (candidate) => candidate.label === check.label && candidate.command === check.command,
+          ),
+        );
+      if (completion?.status === "checks-failed" && sameAttempt && input.receipts.length === 0) {
+        completion = yield* updateCompletion(completion, {
+          status: "invalidated",
+          requiredAction: "A fresh immutable retry replaced this failed acceptance attempt.",
+        });
+        completion = null;
+      } else if (completion && !sameAttempt) {
+        if (
+          (completion.status === "checks-pending" || completion.status === "checks-failed") &&
+          !completion.commentUrl &&
+          completion.closeConfirmed === 0
+        ) {
+          completion = yield* updateCompletion(completion, {
+            status: "invalidated",
+            requiredAction: "A corrected head or combined check set replaced this attempt.",
+          });
+          completion = null;
+        } else {
+          return yield* directorError(
+            "completion-pending",
+            "Reconcile the existing capability completion write before registering a replacement.",
+          );
+        }
+      }
+      if (!completion) {
+        const completionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+        const createdAt = DateTime.formatIso(yield* DateTime.now);
+        const commentBody = workflowCapabilityCompletionBody({
+          completionId,
+          repository: director.repository,
+          capabilityNumber: director.capabilityNumber,
+          resultingHead: input.resultingHead,
+          requiredIssues: gate.requiredIssues,
+          checks: input.checks,
+        });
+        yield* persistence(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO workflow_capability_completions (
+              completion_id, director_id, repository, capability_number, resulting_head,
+              specification_fingerprint, breakdown_fingerprint, comment_body, status,
+              required_action, created_at, updated_at
+            ) VALUES (
+              ${completionId}, ${director.directorId}, ${director.repository},
+              ${director.capabilityNumber}, ${input.resultingHead},
+              ${gate.specificationFingerprint}, ${gate.breakdownFingerprint}, ${commentBody},
+              'checks-pending', 'Run every registered combined acceptance command through the native provider path, then bind its exact receipt.',
+              ${createdAt}, ${createdAt}
+            )`;
+              yield* Effect.forEach(
+                input.checks,
+                (check) => sql`INSERT INTO workflow_capability_checks (
+                completion_id, label, command, output, started_head, started_clean,
+                verification_status, thread_id, provider_instance_id, created_at, updated_at
+              ) VALUES (
+                ${completionId}, ${check.label}, ${check.command}, '', ${input.resultingHead}, 1,
+                'pending', ${director.threadId}, ${providerInstanceId}, ${createdAt}, ${createdAt}
+              )`,
+                { discard: true },
+              );
+            }),
+          ),
+          "The capability completion attempt could not be registered.",
+        );
+        completion = (yield* latestCompletion(director.directorId))!;
+      }
+      if (completion.status === "completed") {
+        return {
+          disposition: "completed",
+          completion: yield* completionStatusFromRow(completion, "current"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (input.receipts.length === 0) {
+        return {
+          disposition: completion.status === "checks-failed" ? "held" : "pending",
+          completion: yield* completionStatusFromRow(
+            completion,
+            completion.status === "checks-failed" ? "historical" : "unknown",
+          ),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      yield* bindCapabilityCheckReceipts(director, completion, providerInstanceId, input);
+      const checks = yield* completionChecks(completion.completionId);
+      if (checks.some((check) => check.verificationStatus === "failed")) {
+        completion = yield* updateCompletion(completion, {
+          status: "checks-failed",
+          requiredAction:
+            "Correct the failure, then register a fresh immutable acceptance attempt with a corrected head or check set.",
+          lastError:
+            checks.find((check) => check.verificationStatus === "failed")?.verificationError ??
+            "Combined acceptance failed.",
+        });
+        return {
+          disposition: "held",
+          completion: yield* completionStatusFromRow(completion, "historical"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (!checks.every((check) => check.verificationStatus === "passed")) {
+        return {
+          disposition: "pending",
+          completion: yield* completionStatusFromRow(completion, "unknown"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      const afterChecks = yield* capabilityCompletionGate(
+        director,
+        completion.resultingHead,
+        false,
+      ).pipe(Effect.result);
+      if (afterChecks._tag === "Failure") {
+        if (!completionEvidenceChanged(afterChecks.failure)) {
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        completion = yield* updateCompletion(completion, {
+          status: "invalidated",
+          requiredAction: afterChecks.failure.message,
+          lastError: afterChecks.failure.detail ?? afterChecks.failure.message,
+        });
+        return {
+          disposition: "held",
+          completion: yield* completionStatusFromRow(completion, "historical"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      let refreshed = afterChecks.success.capability;
+      let record = matchingCapabilityCompletion(refreshed, completion);
+      if (completion.status === "comment-uncertain" && !record) {
+        return {
+          disposition: "pending",
+          completion: yield* completionStatusFromRow(completion, "unknown"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (!record) {
+        completion = yield* updateCompletion(completion, {
+          status: "comment-uncertain",
+          requiredAction: "Reconcile the exact saved capability evidence comment before retrying.",
+        });
+        const write = yield* executeGitHub(
+          director.worktreePath,
+          [
+            "issue",
+            "comment",
+            String(director.capabilityNumber),
+            "--repo",
+            director.repository,
+            "--body-file",
+            "-",
+          ],
+          completion.commentBody,
+        ).pipe(Effect.result);
+        refreshed = yield* workflow.issueDetail({
+          projectId: ProjectId.make(director.projectId),
+          repository: director.repository as WorkflowIssueSummary["repository"],
+          number: director.capabilityNumber,
+        });
+        record = matchingCapabilityCompletion(refreshed, completion);
+        if (!record) {
+          completion = yield* updateCompletion(completion, {
+            status: "comment-uncertain",
+            requiredAction:
+              "Reconcile the exact saved capability evidence comment before retrying.",
+            lastError:
+              write._tag === "Failure"
+                ? write.failure.message
+                : "GitHub has not exposed the saved completion evidence yet.",
+          });
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        completion = yield* updateCompletion(completion, {
+          status: "close-pending",
+          requiredAction: "Confirm current acceptance state, then close the capability completed.",
+          commentUrl: record.url,
+        });
+      }
+      const beforeClose = yield* capabilityCompletionGate(
+        director,
+        completion.resultingHead,
+        false,
+      ).pipe(Effect.result);
+      if (beforeClose._tag === "Failure") {
+        if (!completionEvidenceChanged(beforeClose.failure)) {
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        completion = yield* updateCompletion(completion, {
+          status: "invalidated",
+          requiredAction: beforeClose.failure.message,
+          lastError: beforeClose.failure.detail ?? beforeClose.failure.message,
+        });
+        return {
+          disposition: "held",
+          completion: yield* completionStatusFromRow(completion, "historical"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      if (refreshed.state !== "closed" || refreshed.stateReason !== "completed") {
+        completion = yield* updateCompletion(completion, {
+          status: "close-uncertain",
+          requiredAction: "Reconcile the owned capability close before retrying.",
+        });
+        yield* executeGitHub(director.worktreePath, [
+          "issue",
+          "close",
+          String(director.capabilityNumber),
+          "--repo",
+          director.repository,
+          "--reason",
+          "completed",
+        ]).pipe(Effect.result);
+      }
+      refreshed = yield* workflow.issueDetail({
+        projectId: ProjectId.make(director.projectId),
+        repository: director.repository as WorkflowIssueSummary["repository"],
+        number: director.capabilityNumber,
+      });
+      record = matchingCapabilityCompletion(refreshed, completion);
+      if (refreshed.state !== "closed" || refreshed.stateReason !== "completed" || !record) {
+        completion = yield* updateCompletion(completion, {
+          status: "close-uncertain",
+          requiredAction: "Reconcile the owned capability close before retrying.",
+          lastError: "GitHub capability closure is still unconfirmed.",
+        });
+        return {
+          disposition: "pending",
+          completion: yield* completionStatusFromRow(completion, "unknown"),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      completion = yield* updateCompletion(completion, {
+        status: "close-pending",
+        requiredAction: "Confirm the post-close acceptance gate.",
+        commentUrl: record.url,
+        closeConfirmed: true,
+      });
+      const afterClose = yield* capabilityCompletionGate(
+        director,
+        completion.resultingHead,
+        true,
+      ).pipe(Effect.result);
+      if (afterClose._tag === "Failure") {
+        if (!completionEvidenceChanged(afterClose.failure)) {
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        completion = yield* compensateCapabilityClose(
+          director,
+          completion,
+          afterClose.failure.detail ?? afterClose.failure.message,
+        );
+        return {
+          disposition: "held",
+          completion: yield* completionStatusFromRow(
+            completion,
+            completion.status === "invalidated" ? "historical" : "unknown",
+          ),
+        } satisfies WorkflowCapabilityCompleteResult;
+      }
+      completion = yield* updateCompletion(completion, {
+        status: "completed",
+        requiredAction: "No capability completion action is required.",
+        commentUrl: record.url,
+        closeConfirmed: true,
+      });
+      return {
+        disposition: "completed",
+        completion: yield* completionStatusFromRow(completion, "current"),
+      } satisfies WorkflowCapabilityCompleteResult;
+    },
+  );
+
   return WorkflowDirectorService.of({
     start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
     status: (input) => lock.withPermits(1)(statusUnlocked(input)),
@@ -5587,6 +6675,10 @@ export const make = Effect.gen(function* () {
     resolveTicket: (environmentId, threadId, providerInstanceId, input) =>
       lock.withPermits(1)(
         resolveTicketUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    completeCapability: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        completeCapabilityUnlocked(environmentId, threadId, providerInstanceId, input),
       ),
   });
 });

@@ -49,27 +49,50 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
               AND bound.provider_instance_id =
                 workflow_native_command_observations.provider_instance_id
           )
+          OR EXISTS (
+            SELECT 1 FROM workflow_capability_checks bound
+            WHERE bound.tool_call_id = workflow_native_command_observations.tool_call_id
+              AND bound.thread_id = workflow_native_command_observations.thread_id
+              AND bound.provider_instance_id =
+                workflow_native_command_observations.provider_instance_id
+          )
           OR NOT EXISTS (
-            SELECT 1
-            FROM workflow_directors d
-            JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
-            JOIN workflow_review_checks c ON c.review_id = r.review_id
-            WHERE d.thread_id = workflow_native_command_observations.thread_id
-              AND d.requested_instance_id = workflow_native_command_observations.provider_instance_id
-              AND d.is_current = 1
-              AND c.verification_status <> 'passed'
-              AND c.command = workflow_native_command_observations.command
-              AND d.worktree_path = workflow_native_command_observations.cwd
-              AND workflow_native_command_observations.created_at > c.created_at
-              AND NOT EXISTS (
-                SELECT 1 FROM workflow_ticket_reviews newer
-                WHERE newer.director_id = r.director_id
-                  AND newer.ticket_number = r.ticket_number
-                  AND (
-                    newer.created_at > r.created_at
-                    OR (newer.created_at = r.created_at AND newer.rowid > r.rowid)
-                  )
-              )
+            SELECT 1 FROM (
+              SELECT c.created_at AS registered_at
+              FROM workflow_directors d
+              JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
+              JOIN workflow_review_checks c ON c.review_id = r.review_id
+              WHERE d.thread_id = workflow_native_command_observations.thread_id
+                AND d.requested_instance_id = workflow_native_command_observations.provider_instance_id
+                AND d.is_current = 1
+                AND c.verification_status <> 'passed'
+                AND c.command = workflow_native_command_observations.command
+                AND d.worktree_path = workflow_native_command_observations.cwd
+                AND NOT EXISTS (
+                  SELECT 1 FROM workflow_ticket_reviews newer
+                  WHERE newer.director_id = r.director_id
+                    AND newer.ticket_number = r.ticket_number
+                    AND (
+                      newer.created_at > r.created_at
+                      OR (newer.created_at = r.created_at AND newer.rowid > r.rowid)
+                    )
+                )
+              UNION ALL
+              SELECT c.created_at AS registered_at
+              FROM workflow_directors d
+              JOIN workflow_capability_completions completion
+                ON completion.director_id = d.director_id
+              JOIN workflow_capability_checks c
+                ON c.completion_id = completion.completion_id
+              WHERE d.thread_id = workflow_native_command_observations.thread_id
+                AND d.requested_instance_id = workflow_native_command_observations.provider_instance_id
+                AND d.is_current = 1
+                AND completion.status IN ('checks-pending', 'checks-failed')
+                AND c.verification_status <> 'passed'
+                AND c.command = workflow_native_command_observations.command
+                AND d.worktree_path = workflow_native_command_observations.cwd
+            ) eligible
+            WHERE workflow_native_command_observations.created_at > eligible.registered_at
           )
         )
     `;
@@ -78,25 +101,41 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
       readonly registered: number;
     }>`
     SELECT COUNT(*) AS registered,
-      COUNT(CASE WHEN ${event.createdAt} > c.created_at THEN 1 END) AS eligible
-    FROM workflow_directors d
-    JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
-    JOIN workflow_review_checks c ON c.review_id = r.review_id
-    WHERE d.thread_id = ${event.threadId}
-      AND d.requested_instance_id = ${event.providerInstanceId}
-      AND d.is_current = 1
-      AND c.verification_status <> 'passed'
-      AND c.command = ${item.command}
-      AND d.worktree_path = ${cwd}
-      AND NOT EXISTS (
-        SELECT 1 FROM workflow_ticket_reviews newer
-        WHERE newer.director_id = r.director_id
-          AND newer.ticket_number = r.ticket_number
-          AND (
-            newer.created_at > r.created_at
-            OR (newer.created_at = r.created_at AND newer.rowid > r.rowid)
-          )
-      )
+      COUNT(CASE WHEN ${event.createdAt} > candidate.registered_at THEN 1 END) AS eligible
+    FROM (
+      SELECT c.created_at AS registered_at
+      FROM workflow_directors d
+      JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
+      JOIN workflow_review_checks c ON c.review_id = r.review_id
+      WHERE d.thread_id = ${event.threadId}
+        AND d.requested_instance_id = ${event.providerInstanceId}
+        AND d.is_current = 1
+        AND c.verification_status <> 'passed'
+        AND c.command = ${item.command}
+        AND d.worktree_path = ${cwd}
+        AND NOT EXISTS (
+          SELECT 1 FROM workflow_ticket_reviews newer
+          WHERE newer.director_id = r.director_id
+            AND newer.ticket_number = r.ticket_number
+            AND (
+              newer.created_at > r.created_at
+              OR (newer.created_at = r.created_at AND newer.rowid > r.rowid)
+            )
+        )
+      UNION ALL
+      SELECT c.created_at AS registered_at
+      FROM workflow_directors d
+      JOIN workflow_capability_completions completion
+        ON completion.director_id = d.director_id
+      JOIN workflow_capability_checks c ON c.completion_id = completion.completion_id
+      WHERE d.thread_id = ${event.threadId}
+        AND d.requested_instance_id = ${event.providerInstanceId}
+        AND d.is_current = 1
+        AND completion.status IN ('checks-pending', 'checks-failed')
+        AND c.verification_status <> 'passed'
+        AND c.command = ${item.command}
+        AND d.worktree_path = ${cwd}
+    ) candidate
   `;
     const registered = active[0]?.registered ?? 0;
     const eligible = active[0]?.eligible ?? 0;
@@ -151,6 +190,12 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
               AND candidate.cwd = ${cwd}
               AND NOT EXISTS (
                 SELECT 1 FROM workflow_review_checks bound
+                WHERE bound.tool_call_id = candidate.tool_call_id
+                  AND bound.thread_id = candidate.thread_id
+                  AND bound.provider_instance_id = candidate.provider_instance_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM workflow_capability_checks bound
                 WHERE bound.tool_call_id = candidate.tool_call_id
                   AND bound.thread_id = candidate.thread_id
                   AND bound.provider_instance_id = candidate.provider_instance_id

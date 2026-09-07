@@ -452,4 +452,99 @@ layer("WorkflowCheckObservation", (it) => {
       assert.deepStrictEqual(rows, []);
     }),
   );
+
+  it.effect("retains native receipts registered for capability acceptance", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO workflow_directors (
+          director_id, batch_id, environment_id, project_id, repository, root_number,
+          capability_number, thread_id, command_id, message_id, worktree_path, worktree_branch,
+          status, requested_model, requested_instance_id, requested_effort, observed_match,
+          initial_turn_disposition, is_current, created_at, updated_at
+        ) VALUES (
+          'director-completion', 'batch-completion', 'environment-completion', 'project',
+          'Flow-Fly/t3code', 10, 23, 'director-thread-completion', 'command-completion',
+          'message-completion', '/tmp/capability-completion', 'capability/workflow-10',
+          'active', 'gpt-6-astra', 'codex-completion', 'high', 'unknown', 'accepted', 1,
+          '2026-09-07T09:00:00.000Z', '2026-09-07T09:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO workflow_capability_completions (
+          completion_id, director_id, repository, capability_number, resulting_head,
+          specification_fingerprint, breakdown_fingerprint, comment_body, status,
+          required_action, created_at, updated_at
+        ) VALUES (
+          'completion', 'director-completion', 'Flow-Fly/t3code', 23, 'head',
+          'specification', 'breakdown', 'body', 'checks-pending', 'Run checks.',
+          '2026-09-07T10:00:00.000Z', '2026-09-07T10:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO workflow_capability_checks (
+          completion_id, label, command, output, started_head, started_clean,
+          verification_status, thread_id, provider_instance_id, created_at, updated_at
+        ) VALUES (
+          'completion', 'combined', 'vp test run combined.test.ts', '', 'head', 1,
+          'pending', 'director-thread-completion', 'codex-completion',
+          '2026-09-07T10:00:00.000Z', '2026-09-07T10:00:00.000Z'
+        )
+      `;
+      const base = {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex-completion"),
+        threadId: ThreadId.make("director-thread-completion"),
+        itemId: RuntimeItemId.make("completion-check"),
+      } as const;
+      yield* recordWorkflowCheckObservation({
+        ...base,
+        type: "item.started",
+        eventId: EventId.make("completion-check-started"),
+        createdAt: "2026-09-07T10:01:00.000Z",
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          data: {
+            item: {
+              type: "commandExecution",
+              command: "vp test run combined.test.ts",
+              cwd: "/tmp/capability-completion",
+            },
+          },
+        },
+      });
+      yield* recordWorkflowCheckObservation({
+        ...base,
+        type: "item.completed",
+        eventId: EventId.make("completion-check-completed"),
+        createdAt: "2026-09-07T10:01:01.000Z",
+        payload: {
+          itemType: "command_execution",
+          status: "completed",
+          data: {
+            item: {
+              type: "commandExecution",
+              command: "vp test run combined.test.ts",
+              cwd: "/tmp/capability-completion",
+              status: "completed",
+              exitCode: 0,
+              aggregatedOutput: "passed",
+            },
+          },
+        },
+      });
+      const observations = yield* sql<{
+        readonly lifecycle: string;
+        readonly exitCode: number | null;
+      }>`SELECT lifecycle, exit_code AS "exitCode"
+        FROM workflow_native_command_observations
+        WHERE thread_id = 'director-thread-completion'
+        ORDER BY created_at`;
+      assert.deepStrictEqual(observations, [
+        { lifecycle: "started", exitCode: null },
+        { lifecycle: "completed", exitCode: 0 },
+      ]);
+    }),
+  );
 });

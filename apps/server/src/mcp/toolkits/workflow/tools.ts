@@ -1,4 +1,6 @@
 import {
+  WorkflowCapabilityCompleteInput,
+  WorkflowCapabilityCompleteResult,
   WorkflowDirectorError,
   WorkflowQueryError,
   WorkflowWorkerAssociateInput,
@@ -112,6 +114,15 @@ export const WorkflowResolveTicketTool = Tool.make("workflow_resolve_ticket", {
   dependencies,
 });
 
+export const WorkflowCompleteCapabilityTool = Tool.make("workflow_complete_capability", {
+  description:
+    "Register combined acceptance against one exact clean result head, bind exact native command receipts, reconcile durable evidence, and close the capability only while all approved work and native children remain settled.",
+  parameters: WorkflowCapabilityCompleteInput,
+  success: WorkflowCapabilityCompleteResult,
+  failure: WorkflowWorkerFailure,
+  dependencies,
+});
+
 export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowPrepareWorkerTool,
   WorkflowAssociateWorkerTool,
@@ -122,4 +133,5 @@ export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowReportTicketReviewTool,
   WorkflowRecordReviewDispositionsTool,
   WorkflowResolveTicketTool,
+  WorkflowCompleteCapabilityTool,
 );
