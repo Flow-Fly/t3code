@@ -748,6 +748,141 @@ describe("WorkflowMonitor", () => {
       }),
   );
 
+  it.effect("does not requeue a captured path waiting for a refresh slot", () =>
+    Effect.gen(function* () {
+      const fourRefreshesStarted = yield* Deferred.make<void>();
+      const releaseRefreshes = yield* Deferred.make<void>();
+      let mode: "warm" | "outage" | "recovery" = "warm";
+      let refreshReads = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        for (const number of [11, 12, 13, 14, 15]) {
+          yield* monitor.issueDetail({ projectId: projectOne, repository, number });
+        }
+        yield* TestClock.adjust("61 seconds");
+
+        mode = "outage";
+        const failed = yield* monitor.refresh({ projectId: projectOne, repository });
+        expect(failed.status).toBe("unavailable");
+        for (const number of [11, 12, 13, 14, 15]) {
+          yield* monitor.issueDetail({ projectId: projectOne, repository, number });
+        }
+        yield* TestClock.adjust("30 seconds");
+
+        mode = "recovery";
+        const refresh = yield* monitor
+          .refresh({ projectId: projectOne, repository })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(fourRefreshesStarted);
+        expect(refreshReads).toBe(4);
+
+        expect(
+          (yield* monitor.issueDetail({ projectId: projectOne, repository, number: 15 })).number,
+        ).toBe(15);
+        yield* Deferred.succeed(releaseRefreshes, undefined);
+        const completed = yield* Fiber.join(refresh);
+
+        expect(completed.status).toBe("fresh");
+        expect(refreshReads).toBe(5);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () =>
+              mode === "outage"
+                ? Effect.fail(
+                    new WorkflowQueryError({
+                      failure: "request-failed",
+                      message: "GitHub is unavailable.",
+                    }),
+                  )
+                : Effect.succeed(roots("current")),
+            onRead: (operation) =>
+              Effect.gen(function* () {
+                if (mode !== "recovery" || operation !== "detail") return;
+                refreshReads += 1;
+                if (refreshReads === 4) {
+                  yield* Deferred.succeed(fourRefreshesStarted, undefined);
+                }
+                yield* Deferred.await(releaseRefreshes);
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("does not retry captured paths before outage backoff", () =>
+    Effect.gen(function* () {
+      const fourRefreshesStarted = yield* Deferred.make<void>();
+      const releaseRefreshes = yield* Deferred.make<void>();
+      let mode: "warm" | "outage" | "recovery" = "warm";
+      let refreshReads = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        for (const number of [11, 12, 13, 14, 15]) {
+          yield* monitor.issueDetail({ projectId: projectOne, repository, number });
+        }
+        yield* TestClock.adjust("61 seconds");
+
+        mode = "outage";
+        const failed = yield* monitor.refresh({ projectId: projectOne, repository });
+        expect(failed.status).toBe("unavailable");
+        for (const number of [11, 12, 13, 14, 15]) {
+          yield* monitor.issueDetail({ projectId: projectOne, repository, number });
+        }
+        yield* TestClock.adjust("30 seconds");
+
+        mode = "recovery";
+        const refresh = yield* monitor
+          .refresh({ projectId: projectOne, repository })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(fourRefreshesStarted);
+        expect(refreshReads).toBe(4);
+
+        expect(
+          (yield* monitor.issueDetail({ projectId: projectOne, repository, number: 15 })).number,
+        ).toBe(15);
+        yield* Deferred.succeed(releaseRefreshes, undefined);
+        const completed = yield* Fiber.join(refresh);
+
+        expect(completed.status).toBe("unavailable");
+        expect(completed.retryAt).not.toBeNull();
+        expect(refreshReads).toBe(5);
+        for (const number of [11, 12, 13, 14, 15]) {
+          yield* monitor.issueDetail({ projectId: projectOne, repository, number });
+        }
+        expect(refreshReads).toBe(5);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () =>
+              mode === "warm"
+                ? Effect.succeed(roots("current"))
+                : Effect.fail(
+                    new WorkflowQueryError({
+                      failure: "request-failed",
+                      message: "GitHub is unavailable.",
+                    }),
+                  ),
+            onRead: (operation) =>
+              Effect.gen(function* () {
+                if (mode !== "recovery" || operation !== "detail") return;
+                refreshReads += 1;
+                if (refreshReads === 4) {
+                  yield* Deferred.succeed(fourRefreshesStarted, undefined);
+                }
+                yield* Deferred.await(releaseRefreshes);
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("refreshes a cached path that returns after an in-flight snapshot", () =>
     Effect.gen(function* () {
       const rootStarted = yield* Deferred.make<void>();

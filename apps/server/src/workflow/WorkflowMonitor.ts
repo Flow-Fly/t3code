@@ -333,9 +333,7 @@ export const make = Effect.gen(function* () {
     entry: CacheEntry,
     generation: number,
   ) {
-    entry.refreshingGeneration = generation;
-    const finish = Effect.sync(() => {
-      if (entry.refreshingGeneration === generation) delete entry.refreshingGeneration;
+    const finishRequest = Effect.sync(() => {
       if ((entry.refreshRequestedGeneration ?? Number.POSITIVE_INFINITY) <= generation) {
         delete entry.refreshRequestedGeneration;
       }
@@ -376,7 +374,7 @@ export const make = Effect.gen(function* () {
           return null;
         }
       }
-    }).pipe(Effect.ensuring(finish));
+    }).pipe(Effect.ensuring(finishRequest));
   });
 
   const refreshRepository = Effect.fn("WorkflowMonitor.refreshRepository")(function* (
@@ -391,57 +389,68 @@ export const make = Effect.gen(function* () {
           if (entries.length === 0) return yield* snapshot(state);
           const capturedEpoch = state.epoch;
           state.generation += 1;
-          state.status = "refreshing";
-          state.message =
-            state.lastSuccessfulAtMs === null
-              ? "Syncing Workflow with GitHub…"
-              : "Refreshing Workflow from GitHub…";
-          yield* publish(state);
-          const attemptAt = yield* Clock.currentTimeMillis;
-          state.lastAttemptAtMs = attemptAt;
-          const errors = yield* Effect.forEach(
-            entries,
-            (entry) => refreshEntry(entry, state.generation),
-            { concurrency: 4 },
-          );
-          const error = errors.find((candidate) => candidate !== null) ?? null;
-          const completedAt = yield* Clock.currentTimeMillis;
-          if (capturedEpoch !== state.epoch) {
-            state.status = "stale";
-            state.message =
-              "Workflow changed while GitHub was refreshing. Waiting for a newer read.";
-            yield* publish(state);
-            targetEpoch = state.epoch;
-            minimumGeneration = state.generation + 1;
-            continue;
-          }
-          const requestedGeneration = Math.max(
-            0,
-            ...(yield* entriesFor(state)).map((entry) => entry.refreshRequestedGeneration ?? 0),
-          );
-          if (requestedGeneration > state.generation) {
-            minimumGeneration = requestedGeneration;
-            continue;
-          }
-          if (error !== null) {
-            state.attemptedEpoch = capturedEpoch;
-            state.failureCount += 1;
-            state.nextRefreshAtMs = completedAt + backoffMillis(state.failureCount);
-            state.status = failureStatus(error);
+          const generation = state.generation;
+          for (const entry of entries) entry.refreshingGeneration = generation;
+          const finishGeneration = Effect.sync(() => {
+            for (const entry of entries) {
+              if (entry.refreshingGeneration === generation) delete entry.refreshingGeneration;
+            }
+          });
+          const completed = yield* Effect.gen(function* () {
+            state.status = "refreshing";
             state.message =
               state.lastSuccessfulAtMs === null
-                ? error.message
-                : `${error.message} Showing the last successful Workflow data.`;
+                ? "Syncing Workflow with GitHub…"
+                : "Refreshing Workflow from GitHub…";
+            yield* publish(state);
+            const attemptAt = yield* Clock.currentTimeMillis;
+            state.lastAttemptAtMs = attemptAt;
+            const errors = yield* Effect.forEach(
+              entries,
+              (entry) => refreshEntry(entry, generation),
+              { concurrency: 4 },
+            );
+            const error = errors.find((candidate) => candidate !== null) ?? null;
+            const completedAt = yield* Clock.currentTimeMillis;
+            if (capturedEpoch !== state.epoch) {
+              state.status = "stale";
+              state.message =
+                "Workflow changed while GitHub was refreshing. Waiting for a newer read.";
+              yield* publish(state);
+              targetEpoch = state.epoch;
+              minimumGeneration = generation + 1;
+              return null;
+            }
+            const requestedGeneration = Math.max(
+              0,
+              ...(yield* entriesFor(state)).map((entry) => entry.refreshRequestedGeneration ?? 0),
+            );
+            if (requestedGeneration > generation) {
+              minimumGeneration = requestedGeneration;
+              return null;
+            }
+            if (error !== null) {
+              state.attemptedEpoch = capturedEpoch;
+              state.failureCount += 1;
+              state.nextRefreshAtMs = completedAt + backoffMillis(state.failureCount);
+              state.status = failureStatus(error);
+              state.message =
+                state.lastSuccessfulAtMs === null
+                  ? error.message
+                  : `${error.message} Showing the last successful Workflow data.`;
+              yield* publish(state);
+              return yield* snapshot(state);
+            }
+            state.attemptedEpoch = capturedEpoch;
+            state.failureCount = 0;
+            state.lastSuccessfulAtMs = completedAt;
+            state.nextRefreshAtMs = completedAt + Duration.toMillis(REFRESH_INTERVAL);
+            state.status = "fresh";
+            state.message = "Workflow is current with GitHub.";
             yield* publish(state);
             return yield* snapshot(state);
-          }
-          state.attemptedEpoch = capturedEpoch;
-          state.failureCount = 0;
-          state.lastSuccessfulAtMs = completedAt;
-          state.nextRefreshAtMs = completedAt + Duration.toMillis(REFRESH_INTERVAL);
-          state.status = "fresh";
-          state.message = "Workflow is current with GitHub.";
-          yield* publish(state);
+          }).pipe(Effect.ensuring(finishGeneration));
+          if (completed !== null) return completed;
         }
         return yield* snapshot(state);
       }),
