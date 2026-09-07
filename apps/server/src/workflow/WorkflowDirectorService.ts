@@ -1411,6 +1411,63 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const verifyIndependentReviewAncestry = Effect.fn(
+    "WorkflowDirectorService.verifyIndependentReviewAncestry",
+  )(function* (
+    row: DirectorRow,
+    observationRows: ReadonlyArray<ObservationRow>,
+    coordinatorProviderThreadId: string,
+    implementationProviderThreadId: string,
+  ) {
+    const directorIdentities = yield* persistence(
+      sql<{ readonly providerThreadId: string | null }>`
+        SELECT provider_thread_id AS "providerThreadId"
+        FROM projection_thread_sessions
+        WHERE thread_id = ${row.threadId}
+          AND provider_instance_id = ${row.requestedInstanceId}
+        LIMIT 1
+      `,
+      "The director's native provider identity could not be read.",
+    );
+    const directorProviderThreadId = directorIdentities[0]?.providerThreadId;
+    if (!directorProviderThreadId) {
+      return yield* directorError(
+        "review-incomplete",
+        "The director's exact native provider identity is unavailable.",
+      );
+    }
+    const byId = new Map(
+      observationRows.map((observation) => [observation.providerThreadId, observation]),
+    );
+    let current = byId.get(coordinatorProviderThreadId);
+    const visited = new Set([coordinatorProviderThreadId]);
+    while (current?.parentProviderThreadId) {
+      const parentId = current.parentProviderThreadId;
+      if (parentId === implementationProviderThreadId) {
+        return yield* directorError(
+          "review-incomplete",
+          "The review coordinator cannot be an implementation-worker descendant.",
+        );
+      }
+      if (parentId === directorProviderThreadId) return;
+      if (visited.has(parentId)) {
+        return yield* directorError("review-incomplete", "The review ancestry is cyclic.");
+      }
+      visited.add(parentId);
+      current = byId.get(parentId);
+      if (!current) {
+        return yield* directorError(
+          "review-incomplete",
+          "The review ancestry is incomplete and does not reach the director's native identity.",
+        );
+      }
+    }
+    return yield* directorError(
+      "review-incomplete",
+      "The review ancestry does not reach the director's native identity.",
+    );
+  });
+
   const reviewStatusFromRow = Effect.fn("WorkflowDirectorService.reviewStatusFromRow")(function* (
     row: ReviewRow,
   ): Effect.fn.Return<WorkflowTicketReviewStatus, WorkflowDirectorError> {
@@ -3282,6 +3339,11 @@ export const make = Effect.gen(function* () {
         (review) =>
           review.ticketNumber === input.ticketNumber &&
           review.implementationHead !== input.implementationHead &&
+          (review.status === "spawn-issued" ||
+            review.status === "associated" ||
+            review.status === "reported" ||
+            review.providerThreadId !== null ||
+            review.axes.length > 0) &&
           (review.settlementEvidence !== "native-closed" ||
             review.axes.some((axis) => axis.settlementEvidence !== "native-closed")),
       );
@@ -3317,10 +3379,11 @@ export const make = Effect.gen(function* () {
               yield* sql`
                 INSERT INTO workflow_review_checks (
                   review_id, label, command, output, started_head, started_clean,
-                  verification_status, created_at, updated_at
+                  verification_status, thread_id, provider_instance_id, created_at, updated_at
                 ) VALUES (
                   ${reviewId}, ${check.label}, ${check.command}, '', ${git.head},
-                  ${git.clean ? 1 : 0}, 'pending', ${createdAt}, ${createdAt}
+                  ${git.clean ? 1 : 0}, 'pending', ${row.threadId}, ${row.requestedInstanceId},
+                  ${createdAt}, ${createdAt}
                 )
               `;
             }
@@ -3494,9 +3557,9 @@ export const make = Effect.gen(function* () {
       }
       const review = yield* reviewStatusFromRow(yield* loadReview(row.directorId, input.reviewId));
       const status = review.checks.every((check) => check.status === "passed")
-        ? reviewRow.status === "reported"
-          ? "reported"
-          : "prepared"
+        ? reviewRow.status === "checks-pending" || reviewRow.status === "checks-failed"
+          ? "prepared"
+          : reviewRow.status
         : review.checks.some((check) => check.status === "failed")
           ? "checks-failed"
           : "checks-pending";
@@ -3535,16 +3598,17 @@ export const make = Effect.gen(function* () {
         );
       }
       const reviewRow = yield* loadReview(row.directorId, reviewRows[0].reviewId);
-      if (reviewRow.providerThreadId) {
-        if (reviewRow.providerThreadId !== input.providerThreadId) {
-          return yield* directorError(
-            "review-incomplete",
-            "This review is already associated with another exact provider child.",
-          );
-        }
-        return yield* reviewStatusFromRow(reviewRow);
+      if (reviewRow.providerThreadId && reviewRow.providerThreadId !== input.providerThreadId) {
+        return yield* directorError(
+          "review-incomplete",
+          "This review is already associated with another exact provider child.",
+        );
       }
-      if (reviewRow.status !== "spawn-issued" && reviewRow.status !== "associated") {
+      if (
+        !reviewRow.providerThreadId &&
+        reviewRow.status !== "spawn-issued" &&
+        reviewRow.status !== "associated"
+      ) {
         return yield* directorError(
           "checks-failed",
           "A reviewer cannot be associated until every registered check is verified.",
@@ -3570,24 +3634,12 @@ export const make = Effect.gen(function* () {
           `Review association requires a fresh exact ${REVIEWER_MODEL}/${REVIEWER_EFFORT} child observed under this director and distinct from its implementation worker.`,
         );
       }
-      const byId = new Map(
-        observationRows.map((observation) => [observation.providerThreadId, observation]),
+      yield* verifyIndependentReviewAncestry(
+        row,
+        observationRows,
+        input.providerThreadId,
+        implementation.providerThreadId,
       );
-      let parentId = observed.parentProviderThreadId;
-      const visited = new Set<string>();
-      while (parentId) {
-        if (parentId === implementation.providerThreadId) {
-          return yield* directorError(
-            "review-incomplete",
-            "The review coordinator cannot be an implementation-worker descendant.",
-          );
-        }
-        if (visited.has(parentId)) {
-          return yield* directorError("review-incomplete", "The review ancestry is cyclic.");
-        }
-        visited.add(parentId);
-        parentId = byId.get(parentId)?.parentProviderThreadId ?? null;
-      }
       const workerReuse = (yield* workers(row.directorId)).some(
         (worker) => worker.dispatchId && worker.providerThreadId === input.providerThreadId,
       );
@@ -3605,6 +3657,7 @@ export const make = Effect.gen(function* () {
           "Reviewer identity must be fresh and independent of prior implementation or review work.",
         );
       }
+      if (reviewRow.providerThreadId) return yield* reviewStatusFromRow(reviewRow);
       const updatedAt = DateTime.formatIso(yield* DateTime.now);
       yield* persistence(
         sql`
@@ -4007,7 +4060,7 @@ export const make = Effect.gen(function* () {
     const implementation = currentWorkers.find(
       (worker) => worker.dispatchId === reviewRow.implementationDispatchId,
     );
-    if (!implementation || implementation.writeReservation !== "released") {
+    if (!implementation?.providerThreadId || implementation.writeReservation !== "released") {
       return yield* directorError(
         "review-incomplete",
         "The implementation worker is still live, idle, or has unconfirmed descendants.",
@@ -4015,10 +4068,22 @@ export const make = Effect.gen(function* () {
     }
     const observationRows = yield* observations(row.directorId);
     const coordinator = review.providerThreadId;
+    if (!coordinator) {
+      return yield* directorError(
+        "review-incomplete",
+        "The review coordinator identity is unavailable.",
+      );
+    }
+    yield* verifyIndependentReviewAncestry(
+      row,
+      observationRows,
+      coordinator,
+      implementation.providerThreadId,
+    );
     const coordinatorObservation = observationRows.find(
       (observation) => observation.providerThreadId === coordinator,
     );
-    if (!coordinator || coordinatorObservation?.nativeLifecycle !== "closed") {
+    if (coordinatorObservation?.nativeLifecycle !== "closed") {
       return yield* directorError(
         "review-incomplete",
         "The review coordinator has not reached exact native closure.",

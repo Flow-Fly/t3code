@@ -2767,6 +2767,24 @@ function claimTicket(
   Object.assign(detail, reinterpretTicket(detail, approvalComments, { assignees: ["Flow-Fly"] }));
 }
 
+function seedDirectorProviderIdentity(sql: SqlClient.SqlClient, directorId: string) {
+  return sql`
+    INSERT INTO projection_thread_sessions (
+      thread_id, status, provider_name, provider_session_id, provider_thread_id,
+      active_turn_id, last_error, updated_at, runtime_mode, provider_instance_id
+    )
+    SELECT thread_id, 'running', 'codex', 'provider-session-director',
+      'provider-director', NULL, NULL, '2026-09-07T09:00:00.000Z',
+      'full-access', requested_instance_id
+    FROM workflow_directors
+    WHERE director_id = ${directorId}
+    ON CONFLICT(thread_id) DO UPDATE SET
+      provider_thread_id = excluded.provider_thread_id,
+      provider_instance_id = excluded.provider_instance_id,
+      updated_at = excluded.updated_at
+  `;
+}
+
 function seedReportedReview(
   sql: SqlClient.SqlClient,
   input: {
@@ -2795,6 +2813,7 @@ function seedReportedReview(
   const specId = `spec-${input.suffix}`;
   const createdAt = input.createdAt ?? "2026-09-07T09:03:00.000Z";
   return Effect.gen(function* () {
+    yield* seedDirectorProviderIdentity(sql, input.directorId);
     if (!input.admissionId) {
       yield* sql`
         INSERT INTO workflow_director_admissions (
@@ -3020,30 +3039,34 @@ describe("delivery ticket review resolution", () => {
           );
         }
 
-        expect(outcomes[0]?._tag).toBe("Failure");
+        expect(outcomes.slice(0, 3).map((outcome) => outcome._tag)).toEqual([
+          "Failure",
+          "Failure",
+          "Failure",
+        ]);
         expect(
           outcomes
-            .slice(1)
+            .slice(3)
             .map((outcome) =>
               outcome._tag === "Success" ? outcome.success.checks[0]?.status : null,
             ),
-        ).toEqual(["failed", "failed", "failed", "failed", "passed"]);
+        ).toEqual(["failed", "failed", "passed"]);
 
-        const wrongCommand = outcomes[1]!;
-        if (wrongCommand._tag === "Failure") return yield* wrongCommand.failure;
+        const failedExit = outcomes[3]!;
+        if (failedExit._tag === "Failure") return yield* failedExit.failure;
         const prepared = yield* workflowDirectorHandlers
           .workflow_prepare_ticket_review({
-            ticketNumber: wrongCommand.success.ticketNumber,
-            implementationProviderThreadId: wrongCommand.success.implementationProviderThreadId,
-            fixedBase: wrongCommand.success.fixedBase,
-            implementationHead: wrongCommand.success.implementationHead,
+            ticketNumber: failedExit.success.ticketNumber,
+            implementationProviderThreadId: failedExit.success.implementationProviderThreadId,
+            fixedBase: failedExit.success.fixedBase,
+            implementationHead: failedExit.success.implementationHead,
             checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
           })
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(prepared.disposition).toBe("held");
         expect(prepared.review.status).toBe("checks-failed");
         const resolve = yield* workflowDirectorHandlers
-          .workflow_resolve_ticket({ reviewId: wrongCommand.success.reviewId })
+          .workflow_resolve_ticket({ reviewId: failedExit.success.reviewId })
           .pipe(
             Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
             Effect.result,
@@ -3095,19 +3118,67 @@ describe("delivery ticket review resolution", () => {
         const issued = yield* workflowDirectorHandlers
           .workflow_prepare_ticket_review(launchInput)
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
-        const retried = yield* workflowDirectorHandlers
-          .workflow_prepare_ticket_review(launchInput)
-          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(issued).toMatchObject({
           disposition: "prepared",
           review: { status: "spawn-issued" },
         });
+        const issuedReceiptRetry = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: issued.review.reviewId,
+            receipts: [{ label: "focused", toolCallId: "tool-launch" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(issuedReceiptRetry.status).toBe("spawn-issued");
+        const retried = yield* workflowDirectorHandlers
+          .workflow_prepare_ticket_review(launchInput)
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(retried).toMatchObject({
           disposition: "held",
           associationToken: issued.associationToken,
           review: { status: "spawn-issued", providerThreadId: null },
         });
         expect(retried.instructions).toContain("do not spawn a duplicate");
+        for (const [providerThreadId, parentProviderThreadId] of [
+          ["reviewer-null-parent", null],
+          ["reviewer-missing-parent", "missing-parent"],
+          ["reviewer-implementation-descendant", "worker-launch"],
+          ["reviewer-wrong-root", "foreign-root"],
+          ["foreign-root", null],
+          ["reviewer-cycle", "cycle-parent"],
+          ["cycle-parent", "reviewer-cycle"],
+        ] as const) {
+          yield* sql`
+            INSERT INTO workflow_worker_observations (
+              director_id, provider_thread_id, parent_provider_thread_id, observed_model,
+              observed_effort, provider_status, last_event_kind, first_observed_at, updated_at
+            ) VALUES (
+              ${started.director.directorId}, ${providerThreadId}, ${parentProviderThreadId},
+              'gpt-6-astra', 'medium', 'idle', 'task.started',
+              '2026-09-07T09:03:00.000Z', '2026-09-07T09:03:00.000Z'
+            )
+          `;
+        }
+        const rejectedAncestries = [];
+        for (const providerThreadId of [
+          "reviewer-null-parent",
+          "reviewer-missing-parent",
+          "reviewer-implementation-descendant",
+          "reviewer-wrong-root",
+          "reviewer-cycle",
+        ]) {
+          rejectedAncestries.push(
+            yield* workflowDirectorHandlers
+              .workflow_associate_ticket_review({
+                associationToken: issued.associationToken,
+                providerThreadId,
+              })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                Effect.result,
+              ),
+          );
+        }
+        expect(rejectedAncestries.every((result) => result._tag === "Failure")).toBe(true);
         const associated = yield* workflowDirectorHandlers
           .workflow_associate_ticket_review({
             associationToken: issued.associationToken,
@@ -3115,6 +3186,22 @@ describe("delivery ticket review resolution", () => {
           })
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(associated.status).toBe("associated");
+        yield* sql`
+          DELETE FROM workflow_worker_observations
+          WHERE director_id = ${started.director.directorId}
+            AND provider_thread_id IN (
+              'reviewer-null-parent', 'reviewer-missing-parent',
+              'reviewer-implementation-descendant', 'reviewer-wrong-root', 'foreign-root',
+              'reviewer-cycle', 'cycle-parent'
+            )
+        `;
+        const associatedReceiptRetry = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: associated.reviewId,
+            receipts: [{ label: "focused", toolCallId: "tool-launch" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(associatedReceiptRetry.status).toBe("associated");
         const reported = yield* workflowDirectorHandlers
           .workflow_report_ticket_review({
             providerThreadId: "reviewer-launch",
@@ -3132,6 +3219,13 @@ describe("delivery ticket review resolution", () => {
           })
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(reported).toMatchObject({ status: "reported", findings: [{ disposition: null }] });
+        const reportedReceiptRetry = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: reported.reviewId,
+            receipts: [{ label: "focused", toolCallId: "tool-launch" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(reportedReceiptRetry.status).toBe("reported");
         const associatedAgain = yield* workflowDirectorHandlers
           .workflow_associate_ticket_review({
             associationToken: issued.associationToken,
@@ -3172,6 +3266,21 @@ describe("delivery ticket review resolution", () => {
           })
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(disposed.findings[0]?.disposition?.outcome).toBe("dismissed");
+        yield* sql`
+          UPDATE projection_thread_sessions SET provider_thread_id = 'changed-director-root'
+          WHERE thread_id = ${started.director.threadId}
+        `;
+        const changedDirectorIdentity = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: reported.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(changedDirectorIdentity._tag).toBe("Failure");
+        yield* sql`
+          UPDATE projection_thread_sessions SET provider_thread_id = 'provider-director'
+          WHERE thread_id = ${started.director.threadId}
+        `;
         const handlerResolution = yield* workflowDirectorHandlers
           .workflow_resolve_ticket({ reviewId: reported.reviewId })
           .pipe(
@@ -3182,6 +3291,220 @@ describe("delivery ticket review resolution", () => {
       }).pipe(Effect.provide(test.layer));
     },
   );
+
+  it.effect("starts corrected-head checks after a pre-spawn check failure", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    let currentHead = reviewHead;
+    let claimEstablished = false;
+    const test = harness({
+      ...fixture,
+      processRunner: {
+        run: ({ args }) => {
+          if (args[0] === "remote") {
+            return Effect.succeed(
+              processOutput(`fork\tgit@github.com:${repository}.git (fetch)\n`),
+            );
+          }
+          if (args[0] === "rev-parse") return Effect.succeed(processOutput(`${currentHead}\n`));
+          if (args[0] === "status") return Effect.succeed(processOutput(""));
+          return Effect.succeed(processOutput(""));
+        },
+      },
+      githubExecute: ({ args }) => {
+        if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+        if (args[0] === "issue" && args[1] === "view") {
+          return Effect.succeed(output(claimEstablished ? "Flow-Fly\n" : ""));
+        }
+        if (args[0] === "issue" && args[1] === "edit") claimEstablished = true;
+        return Effect.succeed(output(""));
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const ticket = fixture.ticketDetails[0]!;
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedDirectorProviderIdentity(sql, started.director.directorId);
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const finishImplementation = (providerThreadId: string, head: string) =>
+        Effect.gen(function* () {
+          const prepared = yield* service.prepareWorker(
+            environmentId,
+            started.director.threadId,
+            instanceId,
+            {
+              ticketNumber: ticket.number,
+              ownership: "workflow review correction",
+              writePaths: ["apps/server/src/workflow/"],
+            },
+          );
+          yield* recordWorkflowWorkerObservation({
+            type: "task.started",
+            eventId: EventId.make(`${providerThreadId}-started`),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: instanceId,
+            threadId: started.director.threadId,
+            createdAt: "2026-09-07T09:01:00.000Z",
+            payload: {
+              taskId: RuntimeTaskId.make(providerThreadId),
+              description: "implementation worker",
+              parentAgentId: "provider-director",
+              model: "gpt-5.6-sol",
+              effort: "high",
+              timelineBypass: true,
+            },
+          });
+          yield* service.associateWorker(environmentId, started.director.threadId, instanceId, {
+            associationToken: prepared.associationToken,
+            providerThreadId,
+          });
+          yield* service.reportWorkerHandoff(environmentId, started.director.threadId, instanceId, {
+            providerThreadId,
+            outcome: "succeeded",
+            summary: `Implemented ${head}.`,
+            commits: [head],
+            checks: ["implementation checks passed"],
+          });
+          yield* recordWorkflowWorkerObservation({
+            type: "task.completed",
+            eventId: EventId.make(`${providerThreadId}-closed`),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: instanceId,
+            threadId: started.director.threadId,
+            createdAt: "2026-09-07T09:02:00.000Z",
+            payload: {
+              taskId: RuntimeTaskId.make(providerThreadId),
+              status: "stopped",
+              nativeLifecycle: "closed",
+              timelineBypass: true,
+            },
+          });
+          return prepared;
+        });
+
+      yield* finishImplementation("worker-check-a", reviewHead);
+      const first = yield* workflowDirectorHandlers
+        .workflow_prepare_ticket_review({
+          ticketNumber: ticket.number,
+          implementationProviderThreadId: "worker-check-a",
+          fixedBase: reviewBase,
+          implementationHead: reviewHead,
+          checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+        })
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "failed-check-a",
+        cwd: started.director.worktreePath,
+        startedAt: "2099-09-07T09:03:00.000Z",
+        completedAt: "2099-09-07T09:03:10.000Z",
+        exitCode: 1,
+      });
+      const failed = yield* workflowDirectorHandlers
+        .workflow_record_review_checks({
+          reviewId: first.review.reviewId,
+          receipts: [{ label: "focused", toolCallId: "failed-check-a" }],
+        })
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      expect(failed).toMatchObject({ status: "checks-failed", providerThreadId: null });
+
+      const correctedHead = "c".repeat(40);
+      currentHead = correctedHead;
+      const correction = yield* finishImplementation("worker-check-b", correctedHead);
+      const second = yield* workflowDirectorHandlers
+        .workflow_prepare_ticket_review({
+          ticketNumber: ticket.number,
+          implementationProviderThreadId: "worker-check-b",
+          fixedBase: reviewBase,
+          implementationHead: correctedHead,
+          checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+        })
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      expect(second).toMatchObject({
+        disposition: "held",
+        review: { status: "checks-pending", implementationHead: correctedHead },
+      });
+      expect(second.review.reviewId).not.toBe(first.review.reviewId);
+      expect(correction.admission.admissionId).toBe(first.review.admissionId);
+
+      const pendingCorrectionHead = "d".repeat(40);
+      currentHead = pendingCorrectionHead;
+      yield* finishImplementation("worker-check-c", pendingCorrectionHead);
+      const thirdInput = {
+        ticketNumber: ticket.number,
+        implementationProviderThreadId: "worker-check-c",
+        fixedBase: reviewBase,
+        implementationHead: pendingCorrectionHead,
+        checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+      } as const;
+      const third = yield* workflowDirectorHandlers
+        .workflow_prepare_ticket_review(thirdInput)
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      expect(third).toMatchObject({
+        disposition: "held",
+        review: { status: "checks-pending", implementationHead: pendingCorrectionHead },
+      });
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "passed-check-c",
+        cwd: started.director.worktreePath,
+        startedAt: "2099-09-07T09:04:00.000Z",
+        completedAt: "2099-09-07T09:04:10.000Z",
+        exitCode: 0,
+      });
+      yield* workflowDirectorHandlers
+        .workflow_record_review_checks({
+          reviewId: third.review.reviewId,
+          receipts: [{ label: "focused", toolCallId: "passed-check-c" }],
+        })
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      const issued = yield* workflowDirectorHandlers
+        .workflow_prepare_ticket_review(thirdInput)
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      expect(issued.review.status).toBe("spawn-issued");
+
+      const heldHead = "e".repeat(40);
+      currentHead = heldHead;
+      yield* finishImplementation("worker-check-d", heldHead);
+      const held = yield* workflowDirectorHandlers
+        .workflow_prepare_ticket_review({
+          ticketNumber: ticket.number,
+          implementationProviderThreadId: "worker-check-d",
+          fixedBase: reviewBase,
+          implementationHead: heldHead,
+          checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.result,
+        );
+      expect(held._tag).toBe("Failure");
+      const persisted = yield* sql<{
+        readonly status: string;
+        readonly providerThreadId: string | null;
+      }>`
+        SELECT status, provider_thread_id AS "providerThreadId"
+        FROM workflow_ticket_reviews
+        WHERE review_id = ${first.review.reviewId}
+      `;
+      expect(persisted[0]).toEqual({ status: "checks-failed", providerThreadId: null });
+      const admissions = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM workflow_director_admissions
+        WHERE director_id = ${started.director.directorId}
+      `;
+      expect(admissions[0]?.count).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  });
 
   it.effect("holds failed checks, unresolved findings, idle workers and stale review heads", () => {
     const fixture = interpretedCapabilityFixture(4);
