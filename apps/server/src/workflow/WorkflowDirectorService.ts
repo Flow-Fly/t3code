@@ -337,6 +337,7 @@ const CompletionRow = Schema.Struct({
   status: Schema.String,
   commentUrl: Schema.NullOr(Schema.String),
   closeConfirmed: Schema.Number,
+  closeOwned: Schema.Number,
   requiredAction: Schema.String,
   lastError: Schema.NullOr(Schema.String),
   createdAt: Schema.String,
@@ -447,6 +448,46 @@ function completionEvidenceChanged(error: WorkflowDirectorError | WorkflowQueryE
   return (
     error._tag === "WorkflowDirectorError" &&
     (error.failure === "completion-pending" || error.failure === "breakdown-incomplete")
+  );
+}
+
+function requiredIssueCompletionEvidence(
+  issue: WorkflowIssueDetail,
+): "resolved" | "changed" | "unknown" {
+  if (issue.readiness?.status === "resolved") return "resolved";
+  if (issue.state === "open") return "changed";
+  if (
+    issue.readiness?.status === "cancelled" ||
+    issue.readiness?.status === "out-of-scope" ||
+    issue.readiness?.status === "superseded"
+  ) {
+    return "changed";
+  }
+  if (issue.readiness?.status !== "closed-unverified") {
+    return issue.readiness ? "changed" : "unknown";
+  }
+  if (!issue.evidence) return "unknown";
+  if (issue.evidence?.historyComplete === false) return "unknown";
+  const uncertainResolution = issue.evidence?.records.some(
+    (record) =>
+      record.kind === "resolution" &&
+      record.state === "current" &&
+      (record.scope === "unknown" || record.sourceAccess === "unavailable"),
+  );
+  return uncertainResolution ? "unknown" : "changed";
+}
+
+function closeCommandWasAcknowledged(
+  result: { readonly stdout: string; readonly stderr: string },
+  repository: string,
+  issueNumber: number,
+) {
+  const acknowledgment = `closed issue ${repository.toLocaleLowerCase()}#${issueNumber} (`;
+  return `${result.stdout}\n${result.stderr}`.split(/\r?\n/gu).some((line) =>
+    line
+      .replace(/^[\p{P}\p{S}\s]*/u, "")
+      .toLocaleLowerCase()
+      .startsWith(acknowledgment),
   );
 }
 
@@ -1045,7 +1086,11 @@ export const make = Effect.gen(function* () {
   );
 
   const verifyPublishedBreakdown = Effect.fn("WorkflowDirectorService.verifyPublishedBreakdown")(
-    function* (approval: WorkflowEvidenceRecord, tickets: ReadonlyArray<WorkflowIssueDetail>) {
+    function* (
+      approval: WorkflowEvidenceRecord,
+      tickets: ReadonlyArray<WorkflowIssueDetail>,
+      uncertainFailure: WorkflowDirectorError["failure"] = "breakdown-incomplete",
+    ) {
       const approved = breakdownUnits(approval.approvedContent ?? "");
       if (approved.length === 0) {
         return yield* directorError(
@@ -1063,24 +1108,42 @@ export const make = Effect.gen(function* () {
               (candidate) =>
                 normalizedUnitTitle(candidate.title) === normalizedUnitTitle(ticket.title),
             );
-        const approvalRecord = ticket.evidence?.records.find(
+        const approvalRecords =
+          ticket.evidence?.records.filter(
+            (record) =>
+              record.kind === "approval" &&
+              record.approvalKind === "ticket-breakdown" &&
+              record.state === "current" &&
+              sameContent(record.approvedContent ?? "", approval.approvedContent ?? ""),
+          ) ?? [];
+        const approvalRecord = approvalRecords.find(
           (record) =>
-            record.kind === "approval" &&
-            record.approvalKind === "ticket-breakdown" &&
-            record.state === "current" &&
             record.scope === "current" &&
             record.authority === "verified" &&
-            sameContent(record.approvedContent ?? "", approval.approvedContent ?? ""),
+            record.sourceAccess !== "unavailable",
         );
-        return { ticket, unit, approvalRecord };
+        const evidenceUnknown =
+          !approvalRecord &&
+          approvalRecords.some(
+            (record) =>
+              record.scope === "unknown" ||
+              record.sourceAccess === "unavailable" ||
+              record.authority === "unknown",
+          );
+        const evidenceChanged = approvalRecords.some((record) => record.scope === "changed");
+        return { ticket, unit, approvalRecord, evidenceUnknown, evidenceChanged };
       });
       const matchedUnits = new Set(matched.flatMap(({ unit }) => (unit ? [unit] : [])));
       const missing = approved.filter((unit) => !matchedUnits.has(unit));
       const extra = matched.filter(({ unit }) => !unit).map(({ ticket }) => ticket.title);
       const changedScope: WorkflowIssueDetail[] = [];
+      const unknownScope: WorkflowIssueDetail[] = [];
       for (const entry of matched) {
-        if (!entry.approvalRecord || !(yield* verifyApprovalSource(entry.approvalRecord))) {
+        if (entry.approvalRecord && (yield* verifyApprovalSource(entry.approvalRecord))) continue;
+        if (entry.evidenceChanged || !entry.evidenceUnknown) {
           changedScope.push(entry.ticket);
+        } else {
+          unknownScope.push(entry.ticket);
         }
       }
       if (
@@ -1103,6 +1166,13 @@ export const make = Effect.gen(function* () {
             .join(" "),
         );
       }
+      if (unknownScope.length > 0) {
+        return yield* directorError(
+          uncertainFailure,
+          "Published delivery scope cannot be verified from the available approval evidence.",
+          `Unavailable or unknown scope: ${unknownScope.map((ticket) => `#${ticket.number}`).join(", ")}.`,
+        );
+      }
     },
   );
 
@@ -1112,6 +1182,7 @@ export const make = Effect.gen(function* () {
       readonly repository: string;
       readonly capabilityNumber: number;
       readonly breakdownApproval: WorkflowEvidenceRecord;
+      readonly uncertainFailure?: WorkflowDirectorError["failure"];
     }) {
       const ticketSummaries = yield* collectDeliveryTickets(input);
       const approvedTickets = yield* Effect.forEach(ticketSummaries, (ticket) =>
@@ -1121,7 +1192,11 @@ export const make = Effect.gen(function* () {
           number: ticket.number,
         }),
       );
-      yield* verifyPublishedBreakdown(input.breakdownApproval, approvedTickets);
+      yield* verifyPublishedBreakdown(
+        input.breakdownApproval,
+        approvedTickets,
+        input.uncertainFailure,
+      );
 
       const required = new Map(approvedTickets.map((ticket) => [ticket.number, ticket]));
       const pending = approvedTickets.map((ticket) => ticket.number);
@@ -2185,6 +2260,7 @@ export const make = Effect.gen(function* () {
           specification_fingerprint AS "specificationFingerprint",
           breakdown_fingerprint AS "breakdownFingerprint", comment_body AS "commentBody",
           status, comment_url AS "commentUrl", close_confirmed AS "closeConfirmed",
+          close_owned AS "closeOwned",
           required_action AS "requiredAction", last_error AS "lastError",
           created_at AS "createdAt", updated_at AS "updatedAt"
         FROM workflow_capability_completions
@@ -2287,10 +2363,7 @@ export const make = Effect.gen(function* () {
         current._tag === "Failure"
           ? (current.failure.detail ?? current.failure.message)
           : "The saved capability completion evidence is no longer current.";
-      if (
-        completion.closeConfirmed === 1 &&
-        (current._tag === "Success" || completionEvidenceChanged(current.failure))
-      ) {
+      if (current._tag === "Success" || completionEvidenceChanged(current.failure)) {
         completion = yield* compensateCapabilityClose(director, completion, reason);
         return yield* completionStatusFromRow(
           completion,
@@ -4400,15 +4473,26 @@ export const make = Effect.gen(function* () {
         repository: row.repository,
         capabilityNumber: row.capabilityNumber,
         breakdownApproval: breakdown,
+        uncertainFailure: "completion-unavailable",
       });
-      const unresolved = hierarchy.requiredIssues.filter(
-        (issue) => issue.readiness?.status !== "resolved",
-      );
-      if (unresolved.length > 0) {
+      const requiredEvidence = hierarchy.requiredIssues.map((issue) => ({
+        issue,
+        state: requiredIssueCompletionEvidence(issue),
+      }));
+      const invalidated = requiredEvidence.filter((entry) => entry.state === "changed");
+      if (invalidated.length > 0) {
         return yield* directorError(
           "completion-pending",
           "Every approved delivery ticket and nested task needs current resolution evidence.",
-          unresolved.map((issue) => `#${issue.number}: ${readinessDetail(issue)}`).join(" "),
+          invalidated.map(({ issue }) => `#${issue.number}: ${readinessDetail(issue)}`).join(" "),
+        );
+      }
+      const uncertain = requiredEvidence.filter((entry) => entry.state === "unknown");
+      if (uncertain.length > 0) {
+        return yield* directorError(
+          "completion-unavailable",
+          "Required delivery resolution evidence is unavailable or has unknown scope.",
+          uncertain.map(({ issue }) => `#${issue.number}: ${readinessDetail(issue)}`).join(" "),
         );
       }
       const requiredNumbers = hierarchy.requiredIssues.map((issue) => issue.number);
@@ -6001,6 +6085,7 @@ export const make = Effect.gen(function* () {
       readonly lastError?: string | null;
       readonly commentUrl?: string | null;
       readonly closeConfirmed?: boolean;
+      readonly closeOwned?: boolean;
     },
   ) {
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
@@ -6010,6 +6095,7 @@ export const make = Effect.gen(function* () {
         last_error = ${update.lastError ?? null},
         comment_url = ${update.commentUrl === undefined ? row.commentUrl : update.commentUrl},
         close_confirmed = ${update.closeConfirmed === undefined ? row.closeConfirmed : update.closeConfirmed ? 1 : 0},
+        close_owned = ${update.closeOwned === undefined ? row.closeOwned : update.closeOwned ? 1 : 0},
         updated_at = ${updatedAt}
         WHERE completion_id = ${row.completionId}`,
       "Capability completion state could not be saved.",
@@ -6022,6 +6108,7 @@ export const make = Effect.gen(function* () {
       commentUrl: update.commentUrl === undefined ? row.commentUrl : update.commentUrl,
       closeConfirmed:
         update.closeConfirmed === undefined ? row.closeConfirmed : update.closeConfirmed ? 1 : 0,
+      closeOwned: update.closeOwned === undefined ? row.closeOwned : update.closeOwned ? 1 : 0,
       updatedAt,
     };
   });
@@ -6040,6 +6127,15 @@ export const make = Effect.gen(function* () {
 
   const compensateCapabilityClose = Effect.fn("WorkflowDirectorService.compensateCapabilityClose")(
     function* (director: DirectorRow, completion: CompletionRow, reason: string) {
+      if (completion.closeOwned !== 1) {
+        const requiredAction =
+          "This attempt has no attributable director close. Reconcile the tracker state manually before retrying combined acceptance.";
+        return yield* updateCompletion(completion, {
+          status: "invalidated",
+          requiredAction,
+          lastError: reason,
+        });
+      }
       const current = yield* workflow.issueDetail({
         projectId: ProjectId.make(director.projectId),
         repository: director.repository as WorkflowIssueSummary["repository"],
@@ -6238,7 +6334,7 @@ export const make = Effect.gen(function* () {
           completion: status!,
         } satisfies WorkflowCapabilityCompleteResult;
       }
-      if (completion?.status === "reopen-pending" || completion?.status === "reopen-uncertain") {
+      if (completion?.status === "reopen-uncertain") {
         completion = yield* compensateCapabilityClose(
           director,
           completion,
@@ -6318,6 +6414,12 @@ export const make = Effect.gen(function* () {
           return {
             disposition: "completed",
             completion: yield* completionStatusFromRow(completion, "current"),
+          } satisfies WorkflowCapabilityCompleteResult;
+        }
+        if (completion.status === "close-uncertain") {
+          return {
+            disposition: "pending",
+            completion: yield* completionStatusFromRow(completion, "unknown"),
           } satisfies WorkflowCapabilityCompleteResult;
         }
       }
@@ -6559,9 +6661,9 @@ export const make = Effect.gen(function* () {
       if (refreshed.state !== "closed" || refreshed.stateReason !== "completed") {
         completion = yield* updateCompletion(completion, {
           status: "close-uncertain",
-          requiredAction: "Reconcile the owned capability close before retrying.",
+          requiredAction: "Reconcile the capability close result before retrying.",
         });
-        yield* executeGitHub(director.worktreePath, [
+        const close = yield* executeGitHub(director.worktreePath, [
           "issue",
           "close",
           String(director.capabilityNumber),
@@ -6570,6 +6672,16 @@ export const make = Effect.gen(function* () {
           "--reason",
           "completed",
         ]).pipe(Effect.result);
+        if (
+          close._tag === "Success" &&
+          closeCommandWasAcknowledged(close.success, director.repository, director.capabilityNumber)
+        ) {
+          completion = yield* updateCompletion(completion, {
+            status: "close-uncertain",
+            requiredAction: "Confirm the acknowledged capability close from live tracker state.",
+            closeOwned: true,
+          });
+        }
       }
       refreshed = yield* workflow.issueDetail({
         projectId: ProjectId.make(director.projectId),
@@ -6580,7 +6692,7 @@ export const make = Effect.gen(function* () {
       if (refreshed.state !== "closed" || refreshed.stateReason !== "completed" || !record) {
         completion = yield* updateCompletion(completion, {
           status: "close-uncertain",
-          requiredAction: "Reconcile the owned capability close before retrying.",
+          requiredAction: "Reconcile the capability close outcome before retrying.",
           lastError: "GitHub capability closure is still unconfirmed.",
         });
         return {

@@ -629,11 +629,9 @@ export const WorkflowCapabilityCompletionStatus = Schema.Struct({
   status: Schema.Literals([
     "checks-pending",
     "checks-failed",
-    "comment-pending",
     "comment-uncertain",
     "close-pending",
     "close-uncertain",
-    "reopen-pending",
     "reopen-uncertain",
     "invalidated",
     "completed",
@@ -894,6 +892,7 @@ export const WorkflowDirectorFailure = Schema.Literals([
   "checks-failed",
   "resolution-pending",
   "completion-pending",
+  "completion-unavailable",
 ]);
 export type WorkflowDirectorFailure = typeof WorkflowDirectorFailure.Type;
 

@@ -275,6 +275,13 @@ function output(stdout: string) {
   };
 }
 
+function acknowledgedCloseOutput(issue: WorkflowIssueSummary) {
+  return {
+    ...output(""),
+    stderr: `✓ Closed issue ${repository}#${issue.number} (${issue.title})\n`,
+  };
+}
+
 function processOutput(stdout: string) {
   return {
     stdout,
@@ -1926,6 +1933,54 @@ describe("WorkflowDirectorService", () => {
       }).pipe(Effect.provide(test.layer));
     },
   );
+
+  it.effect("keeps unavailable published evidence on the existing Start hold", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    const unavailableBreakdown = evidenceComment({
+      id: "start-unavailable-breakdown",
+      createdAt: fixture.breakdownRecord.createdAt,
+      body: fixture.breakdownRecord.body.replace(
+        `Source: ${fixture.source.url}`,
+        "Source: unavailable",
+      ),
+    });
+    Object.assign(
+      deliveryTicket,
+      interpretWorkflowEvidence({
+        issue: {
+          id: deliveryTicket.id,
+          url: deliveryTicket.url,
+          number: deliveryTicket.number,
+          title: deliveryTicket.title,
+          kind: deliveryTicket.kind,
+          state: "open",
+          stateReason: null,
+          labels: deliveryTicket.labels,
+          assignees: [],
+          body: deliveryTicket.body,
+          comments: [],
+          reopenedAt: [],
+        },
+        approvalComments: [unavailableBreakdown],
+      }),
+    );
+    const test = harness({ ...fixture });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const result = yield* service
+        .start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        )
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({ failure: "breakdown-incomplete" });
+      }
+      expect(test.commands).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  });
 
   it.effect("holds a fresh director while a capability prerequisite needs review", () => {
     const fixture = interpretedCapabilityFixture(1);
@@ -5154,7 +5209,7 @@ describe("capability combined acceptance", () => {
           if (args[0] === "issue" && args[1] === "close") {
             closeWrites += 1;
             refreshCapability("closed");
-            return Effect.succeed(output("closed\n"));
+            return Effect.succeed(acknowledgedCloseOutput(fixture.capability));
           }
           return Effect.succeed(output(""));
         },
@@ -5463,6 +5518,827 @@ describe("capability combined acceptance", () => {
       expect(result.completion.requiredAction).toContain("current resolution evidence");
       expect(fixture.capability.state).toBe("open");
       expect(trackerWrites).toBe(0);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect(
+    "does not acquire reopen ownership from an external close during comment recovery",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const completed = interpretedCapabilityFixture(1, new Set([1]));
+      const deliveryTicket = fixture.ticketDetails[0]!;
+      const completedTicket = completed.ticketDetails[0]!;
+      const nestedTask: WorkflowIssueDetail = {
+        ...completedTicket,
+        id: "issue-202",
+        number: 202,
+        title: "Nested delivery task",
+        url: `https://github.com/${repository}/issues/202`,
+        kind: "task",
+        parentNumber: completedTicket.number,
+        childCount: 0,
+        labels: [],
+      };
+      let commentWrites = 0;
+      let closeWrites = 0;
+      let reopenWrites = 0;
+      const completionComments: WorkflowEvidenceComment[] = [];
+      const refreshCapability = (state: "open" | "closed") => {
+        Object.assign(fixture.capability, {
+          state,
+          stateReason: state === "closed" ? "completed" : null,
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: fixture.capability.id,
+              url: fixture.capability.url,
+              number: fixture.capability.number,
+              title: fixture.capability.title,
+              kind: fixture.capability.kind,
+              state,
+              stateReason: state === "closed" ? "completed" : null,
+              labels: fixture.capability.labels,
+              assignees: [],
+              body: fixture.capability.body,
+              comments: [
+                fixture.source,
+                fixture.specification,
+                fixture.breakdownRecord,
+                ...completionComments,
+              ],
+              reopenedAt: [],
+            },
+          }),
+        });
+      };
+      const test = harness({
+        ...fixture,
+        extraDetails: [nestedTask],
+        children: ({ parentNumber }) =>
+          Effect.succeed({
+            parentNumber,
+            children:
+              parentNumber === fixture.capability.number
+                ? [deliveryTicket]
+                : parentNumber === deliveryTicket.number
+                  ? [nestedTask]
+                  : [],
+            frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+          }),
+        processRunner: reviewProcessRunner(),
+        githubExecute: ({ args, stdin }) => {
+          if (args[0] === "issue" && args[1] === "comment") {
+            commentWrites += 1;
+            completionComments.push({
+              id: "capability-completion",
+              url: `${fixture.capability.url}#issuecomment-completion`,
+              body: stdin!,
+              createdAt: "2026-09-07T11:00:00.000Z",
+              author: "Flow-Fly",
+              authorAssociation: "OWNER",
+            });
+            refreshCapability("closed");
+            return Effect.succeed(output("commented\n"));
+          }
+          if (args[0] === "issue" && args[1] === "close") {
+            closeWrites += 1;
+            refreshCapability("closed");
+            return Effect.succeed(acknowledgedCloseOutput(fixture.capability));
+          }
+          if (args[0] === "issue" && args[1] === "reopen") {
+            reopenWrites += 1;
+            refreshCapability("open");
+            return Effect.succeed(output("reopened\n"));
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        Object.assign(deliveryTicket, completedTicket, { childCount: 1 });
+        const sql = yield* SqlClient.SqlClient;
+        yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: deliveryTicket.number,
+          scopeBody: deliveryTicket.body,
+          suffix: "capability-external-close",
+        });
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+          workflowDirectorHandlers
+            .workflow_complete_capability({
+              resultingHead: reviewHead,
+              checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+              receipts,
+            })
+            .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+        const registered = yield* complete([]);
+        yield* observeReviewCheck({
+          threadId: started.director.threadId,
+          toolCallId: "external-close-combined",
+          command: "vp test run combined.test.ts",
+          cwd: started.director.worktreePath,
+          startedAt: new Date(Date.parse(registered.completion.createdAt) + 1_000).toISOString(),
+          completedAt: new Date(Date.parse(registered.completion.createdAt) + 2_000).toISOString(),
+          exitCode: 0,
+        });
+        yield* sql`CREATE TRIGGER fail_completion_comment_acknowledgment
+          BEFORE UPDATE ON workflow_capability_completions
+          WHEN NEW.status = 'close-pending'
+          BEGIN SELECT RAISE(FAIL, 'injected comment acknowledgment failure'); END`;
+        const interrupted = yield* complete([
+          { label: "combined", toolCallId: "external-close-combined" },
+        ]).pipe(Effect.result);
+        expect(interrupted._tag).toBe("Failure");
+        expect(commentWrites).toBe(1);
+        expect(closeWrites).toBe(0);
+        const saved = yield* sql<{
+          readonly status: string;
+          readonly closeConfirmed: number;
+          readonly closeOwned: number;
+        }>`
+          SELECT status, close_confirmed AS "closeConfirmed", close_owned AS "closeOwned"
+          FROM workflow_capability_completions
+        `;
+        expect(saved).toEqual([{ status: "comment-uncertain", closeConfirmed: 0, closeOwned: 0 }]);
+        yield* sql`DROP TRIGGER fail_completion_comment_acknowledgment`;
+
+        Object.assign(nestedTask, {
+          state: "open",
+          stateReason: null,
+          readiness: {
+            status: "blocked",
+            reasons: [{ kind: "reopened", message: "Required task reopened after acceptance." }],
+          },
+        });
+        const recovered = yield* complete([]);
+        expect(recovered).toMatchObject({
+          disposition: "held",
+          completion: { status: "invalidated", authority: "historical" },
+        });
+        expect(closeWrites).toBe(0);
+        expect(reopenWrites).toBe(0);
+        expect(fixture.capability.state).toBe("closed");
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "keeps unavailable nested resolution unknown until required work is visibly reopened",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const completed = interpretedCapabilityFixture(1, new Set([1]));
+      const deliveryTicket = fixture.ticketDetails[0]!;
+      const completedTicket = completed.ticketDetails[0]!;
+      const nestedTask: WorkflowIssueDetail = {
+        ...completedTicket,
+        id: "issue-203",
+        number: 203,
+        title: "Nested delivery task",
+        url: `https://github.com/${repository}/issues/203`,
+        kind: "task",
+        parentNumber: completedTicket.number,
+        childCount: 0,
+        labels: [],
+      };
+      let commentWrites = 0;
+      let closeWrites = 0;
+      let reopenWrites = 0;
+      const completionComments: WorkflowEvidenceComment[] = [];
+      const refreshCapability = (state: "open" | "closed") => {
+        Object.assign(fixture.capability, {
+          state,
+          stateReason: state === "closed" ? "completed" : null,
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: fixture.capability.id,
+              url: fixture.capability.url,
+              number: fixture.capability.number,
+              title: fixture.capability.title,
+              kind: fixture.capability.kind,
+              state,
+              stateReason: state === "closed" ? "completed" : null,
+              labels: fixture.capability.labels,
+              assignees: [],
+              body: fixture.capability.body,
+              comments: [
+                fixture.source,
+                fixture.specification,
+                fixture.breakdownRecord,
+                ...completionComments,
+              ],
+              reopenedAt: [],
+            },
+          }),
+        });
+      };
+      const test = harness({
+        ...fixture,
+        extraDetails: [nestedTask],
+        children: ({ parentNumber }) =>
+          Effect.succeed({
+            parentNumber,
+            children:
+              parentNumber === fixture.capability.number
+                ? [deliveryTicket]
+                : parentNumber === deliveryTicket.number
+                  ? [nestedTask]
+                  : [],
+            frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+          }),
+        processRunner: reviewProcessRunner(),
+        githubExecute: ({ args, stdin }) => {
+          if (args[0] === "issue" && args[1] === "comment") {
+            commentWrites += 1;
+            completionComments.push({
+              id: "capability-completion",
+              url: `${fixture.capability.url}#issuecomment-completion`,
+              body: stdin!,
+              createdAt: "2026-09-07T11:00:00.000Z",
+              author: "Flow-Fly",
+              authorAssociation: "OWNER",
+            });
+            refreshCapability("open");
+            return Effect.succeed(output("commented\n"));
+          }
+          if (args[0] === "issue" && args[1] === "close") {
+            closeWrites += 1;
+            refreshCapability("closed");
+            return Effect.succeed(acknowledgedCloseOutput(fixture.capability));
+          }
+          if (args[0] === "issue" && args[1] === "reopen") {
+            reopenWrites += 1;
+            refreshCapability("open");
+            return Effect.succeed(output("reopened\n"));
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        Object.assign(deliveryTicket, completedTicket, { childCount: 1 });
+        const sql = yield* SqlClient.SqlClient;
+        yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: deliveryTicket.number,
+          scopeBody: deliveryTicket.body,
+          suffix: "capability-resolution-unavailable",
+        });
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+          workflowDirectorHandlers
+            .workflow_complete_capability({
+              resultingHead: reviewHead,
+              checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+              receipts,
+            })
+            .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+        const registered = yield* complete([]);
+        yield* observeReviewCheck({
+          threadId: started.director.threadId,
+          toolCallId: "resolution-unavailable-combined",
+          command: "vp test run combined.test.ts",
+          cwd: started.director.worktreePath,
+          startedAt: new Date(Date.parse(registered.completion.createdAt) + 1_000).toISOString(),
+          completedAt: new Date(Date.parse(registered.completion.createdAt) + 2_000).toISOString(),
+          exitCode: 0,
+        });
+        const completedResult = yield* complete([
+          { label: "combined", toolCallId: "resolution-unavailable-combined" },
+        ]);
+        expect(completedResult.disposition).toBe("completed");
+
+        const unavailableResolution = evidenceComment({
+          id: "unavailable-resolution",
+          createdAt: "2026-09-07T12:00:00.000Z",
+          body: [
+            "<!-- t3-workflow:v1 resolution -->",
+            "Outcome: resolved",
+            "## Summary",
+            "Delivered.",
+            "## Evidence",
+            "https://github.com/Flow-Fly/t3code/commit/abc is temporarily unavailable.",
+          ].join("\n"),
+        });
+        Object.assign(nestedTask, {
+          ...interpretWorkflowEvidence({
+            issue: {
+              id: nestedTask.id,
+              url: nestedTask.url,
+              number: nestedTask.number,
+              title: nestedTask.title,
+              kind: nestedTask.kind,
+              state: "closed",
+              stateReason: "completed",
+              labels: nestedTask.labels,
+              assignees: [],
+              body: nestedTask.body,
+              comments: [unavailableResolution],
+              reopenedAt: [],
+            },
+          }),
+        });
+        expect(nestedTask.readiness?.status).toBe("closed-unverified");
+        expect(nestedTask.evidence?.records[0]).toMatchObject({
+          scope: "current",
+          sourceAccess: "unavailable",
+        });
+
+        const uncertain = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(uncertain.completion?.authority).toBe("unknown");
+        expect(uncertain.status).not.toBe("completed");
+        expect(reopenWrites).toBe(0);
+        expect(fixture.capability.state).toBe("closed");
+
+        Object.assign(
+          nestedTask,
+          interpretWorkflowEvidence({
+            issue: {
+              id: nestedTask.id,
+              url: nestedTask.url,
+              number: nestedTask.number,
+              title: nestedTask.title,
+              kind: nestedTask.kind,
+              state: "closed",
+              stateReason: "completed",
+              labels: nestedTask.labels,
+              assignees: [],
+              body: nestedTask.body,
+              comments: [],
+              reopenedAt: [],
+            },
+            historyComplete: false,
+          }),
+        );
+        expect(nestedTask.readiness?.status).toBe("closed-unverified");
+        const truncated = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(truncated.completion?.authority).toBe("unknown");
+        expect(reopenWrites).toBe(0);
+
+        Object.assign(nestedTask, { readiness: undefined, evidence: undefined });
+        const missing = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(missing.completion?.authority).toBe("unknown");
+        expect(reopenWrites).toBe(0);
+
+        Object.assign(nestedTask, {
+          state: "open",
+          stateReason: null,
+          readiness: {
+            status: "blocked",
+            reasons: [{ kind: "reopened", message: "Required task reopened after acceptance." }],
+          },
+        });
+        const invalidated = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(invalidated.completion).toMatchObject({
+          status: "invalidated",
+          authority: "historical",
+        });
+        expect(reopenWrites).toBe(1);
+        expect(fixture.capability.state).toBe("open");
+        expect(commentWrites).toBe(1);
+        expect(closeWrites).toBe(1);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "prefers confirmed reopened work when another required resolution is unavailable",
+    () => {
+      const fixture = interpretedCapabilityFixture(2);
+      const test = harness({ ...fixture, processRunner: reviewProcessRunner() });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const sql = yield* SqlClient.SqlClient;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        const unavailableTicket = fixture.ticketDetails[0]!;
+        const reopenedTicket = fixture.ticketDetails[1]!;
+        const unavailableResolution = evidenceComment({
+          id: "mixed-unavailable-resolution",
+          createdAt: "2026-09-07T10:00:00.000Z",
+          body: [
+            "<!-- t3-workflow:v1 resolution -->",
+            "Outcome: resolved",
+            "## Summary",
+            "Delivered.",
+            "## Evidence",
+            "https://github.com/Flow-Fly/t3code/commit/abc is unavailable.",
+          ].join("\n"),
+        });
+        const staleResolution = evidenceComment({
+          id: "mixed-stale-resolution",
+          createdAt: "2026-09-07T10:00:00.000Z",
+          body: [
+            "<!-- t3-workflow:v1 resolution -->",
+            "Outcome: resolved",
+            "## Summary",
+            "Delivered before reopening.",
+            "## Evidence",
+            "https://github.com/Flow-Fly/t3code/commit/def",
+          ].join("\n"),
+        });
+        Object.assign(
+          unavailableTicket,
+          {
+            state: "closed",
+            stateReason: "completed",
+          },
+          interpretWorkflowEvidence({
+            issue: {
+              id: unavailableTicket.id,
+              url: unavailableTicket.url,
+              number: unavailableTicket.number,
+              title: unavailableTicket.title,
+              kind: unavailableTicket.kind,
+              state: "closed",
+              stateReason: "completed",
+              labels: unavailableTicket.labels,
+              assignees: [],
+              body: unavailableTicket.body,
+              comments: [unavailableResolution],
+              reopenedAt: [],
+            },
+            approvalComments: [fixture.source, fixture.breakdownRecord],
+          }),
+        );
+        Object.assign(
+          reopenedTicket,
+          {
+            state: "closed",
+            stateReason: "completed",
+          },
+          interpretWorkflowEvidence({
+            issue: {
+              id: reopenedTicket.id,
+              url: reopenedTicket.url,
+              number: reopenedTicket.number,
+              title: reopenedTicket.title,
+              kind: reopenedTicket.kind,
+              state: "closed",
+              stateReason: "completed",
+              labels: reopenedTicket.labels,
+              assignees: [],
+              body: reopenedTicket.body,
+              comments: [staleResolution],
+              reopenedAt: ["2026-09-07T11:00:00.000Z"],
+            },
+            approvalComments: [fixture.source, fixture.breakdownRecord],
+          }),
+        );
+        expect(unavailableTicket.readiness).toMatchObject({ status: "closed-unverified" });
+        expect(unavailableTicket.evidence?.records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: "resolution",
+              scope: "current",
+              sourceAccess: "unavailable",
+            }),
+          ]),
+        );
+        expect(reopenedTicket.readiness).toMatchObject({ status: "closed-unverified" });
+        expect(reopenedTicket.evidence?.records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "resolution", scope: "changed" }),
+          ]),
+        );
+
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const result = yield* workflowDirectorHandlers
+          .workflow_complete_capability({
+            resultingHead: reviewHead,
+            checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+            receipts: [],
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toMatchObject({ failure: "completion-pending" });
+          expect(result.failure.detail).toContain(`#${reopenedTicket.number}`);
+          expect(result.failure.detail).not.toContain(`#${unavailableTicket.number}`);
+        }
+        const attempts = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM workflow_capability_completions
+        `;
+        expect(attempts).toEqual([{ count: 0 }]);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("holds completion when published breakdown evidence is unavailable", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    const test = harness({ ...fixture, processRunner: reviewProcessRunner() });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const sql = yield* SqlClient.SqlClient;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const unavailableBreakdown = evidenceComment({
+        id: "unavailable-breakdown-approval",
+        createdAt: fixture.breakdownRecord.createdAt,
+        body: fixture.breakdownRecord.body.replace(
+          `Source: ${fixture.source.url}`,
+          "Source: unavailable",
+        ),
+      });
+      const resolution = evidenceComment({
+        id: "breakdown-outage-resolution",
+        createdAt: "2026-09-07T10:00:00.000Z",
+        body: [
+          "<!-- t3-workflow:v1 resolution -->",
+          "Outcome: resolved",
+          "## Summary",
+          "Delivered.",
+          "## Evidence",
+          "https://github.com/Flow-Fly/t3code/commit/abc",
+        ].join("\n"),
+      });
+      Object.assign(
+        deliveryTicket,
+        { state: "closed", stateReason: "completed" },
+        interpretWorkflowEvidence({
+          issue: {
+            id: deliveryTicket.id,
+            url: deliveryTicket.url,
+            number: deliveryTicket.number,
+            title: deliveryTicket.title,
+            kind: deliveryTicket.kind,
+            state: "closed",
+            stateReason: "completed",
+            labels: deliveryTicket.labels,
+            assignees: [],
+            body: deliveryTicket.body,
+            comments: [resolution],
+            reopenedAt: [],
+          },
+          approvalComments: [unavailableBreakdown],
+        }),
+      );
+      expect(deliveryTicket.readiness).toMatchObject({ status: "resolved" });
+      expect(deliveryTicket.evidence?.records).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            approvalKind: "ticket-breakdown",
+            scope: "current",
+            sourceAccess: "unavailable",
+          }),
+        ]),
+      );
+
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const result = yield* workflowDirectorHandlers
+        .workflow_complete_capability({
+          resultingHead: reviewHead,
+          checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+          receipts: [],
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.result,
+        );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({ failure: "completion-unavailable" });
+      }
+      const attempts = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM workflow_capability_completions
+      `;
+      expect(attempts).toEqual([{ count: 0 }]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("keeps a GitHub CLI already-closed result unowned", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    Object.assign(fixture.capability, {
+      title: `Closed issue ${repository}#${fixture.capability.number} (lookalike)`,
+    });
+    const completed = interpretedCapabilityFixture(1, new Set([1]));
+    const deliveryTicket = fixture.ticketDetails[0]!;
+    const completedTicket = completed.ticketDetails[0]!;
+    const nestedTask: WorkflowIssueDetail = {
+      ...completedTicket,
+      id: "issue-204",
+      number: 204,
+      title: "Nested delivery task",
+      url: `https://github.com/${repository}/issues/204`,
+      kind: "task",
+      parentNumber: completedTicket.number,
+      childCount: 0,
+      labels: [],
+    };
+    let commentWrites = 0;
+    let closeWrites = 0;
+    let reopenWrites = 0;
+    const completionComments: WorkflowEvidenceComment[] = [];
+    const refreshCapability = (state: "open" | "closed") => {
+      Object.assign(fixture.capability, {
+        state,
+        stateReason: state === "closed" ? "completed" : null,
+        ...interpretWorkflowEvidence({
+          issue: {
+            id: fixture.capability.id,
+            url: fixture.capability.url,
+            number: fixture.capability.number,
+            title: fixture.capability.title,
+            kind: fixture.capability.kind,
+            state,
+            stateReason: state === "closed" ? "completed" : null,
+            labels: fixture.capability.labels,
+            assignees: [],
+            body: fixture.capability.body,
+            comments: [
+              fixture.source,
+              fixture.specification,
+              fixture.breakdownRecord,
+              ...completionComments,
+            ],
+            reopenedAt: [],
+          },
+        }),
+      });
+    };
+    const test = harness({
+      ...fixture,
+      extraDetails: [nestedTask],
+      children: ({ parentNumber }) =>
+        Effect.succeed({
+          parentNumber,
+          children:
+            parentNumber === fixture.capability.number
+              ? [deliveryTicket]
+              : parentNumber === deliveryTicket.number
+                ? [nestedTask]
+                : [],
+          frontier: { status: "empty", message: "No work.", readyIssueIds: [] },
+        }),
+      processRunner: reviewProcessRunner(),
+      githubExecute: ({ args, stdin }) => {
+        if (args[0] === "issue" && args[1] === "comment") {
+          commentWrites += 1;
+          completionComments.push({
+            id: "capability-completion",
+            url: `${fixture.capability.url}#issuecomment-completion`,
+            body: stdin!,
+            createdAt: "2026-09-07T11:00:00.000Z",
+            author: "Flow-Fly",
+            authorAssociation: "OWNER",
+          });
+          refreshCapability("open");
+          return Effect.succeed(output("commented\n"));
+        }
+        if (args[0] === "issue" && args[1] === "close") {
+          closeWrites += 1;
+          refreshCapability("closed");
+          return Effect.succeed({
+            ...output(""),
+            stderr: `! Issue ${repository}#${fixture.capability.number} (${fixture.capability.title}) is already closed\n`,
+          });
+        }
+        if (args[0] === "issue" && args[1] === "reopen") {
+          reopenWrites += 1;
+          refreshCapability("open");
+          return Effect.succeed(output("reopened\n"));
+        }
+        return Effect.succeed(output(""));
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      Object.assign(deliveryTicket, completedTicket, { childCount: 1 });
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: deliveryTicket.number,
+        scopeBody: deliveryTicket.body,
+        suffix: "capability-close-noop",
+      });
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const complete = (receipts: ReadonlyArray<{ label: string; toolCallId: string }>) =>
+        workflowDirectorHandlers
+          .workflow_complete_capability({
+            resultingHead: reviewHead,
+            checks: [{ label: "combined", command: "vp test run combined.test.ts" }],
+            receipts,
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+      const registered = yield* complete([]);
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "close-noop-combined",
+        command: "vp test run combined.test.ts",
+        cwd: started.director.worktreePath,
+        startedAt: new Date(Date.parse(registered.completion.createdAt) + 1_000).toISOString(),
+        completedAt: new Date(Date.parse(registered.completion.createdAt) + 2_000).toISOString(),
+        exitCode: 0,
+      });
+      const completedResult = yield* complete([
+        { label: "combined", toolCallId: "close-noop-combined" },
+      ]);
+      expect(completedResult).toMatchObject({
+        disposition: "completed",
+        completion: { status: "completed", authority: "current" },
+      });
+      const ownership = yield* sql<{ readonly closeOwned: number }>`
+        SELECT close_owned AS "closeOwned" FROM workflow_capability_completions
+      `;
+      expect(ownership).toEqual([{ closeOwned: 0 }]);
+
+      Object.assign(nestedTask, {
+        state: "open",
+        stateReason: null,
+        readiness: {
+          status: "blocked",
+          reasons: [{ kind: "reopened", message: "Required task reopened after acceptance." }],
+        },
+      });
+      const status = yield* service.status({
+        projectId,
+        repository,
+        capabilityNumber: 17,
+      });
+      expect(status.completion).toMatchObject({
+        status: "invalidated",
+        authority: "historical",
+      });
+      expect(fixture.capability.state).toBe("closed");
+      expect(commentWrites).toBe(1);
+      expect(closeWrites).toBe(1);
+      expect(reopenWrites).toBe(0);
     }).pipe(Effect.provide(test.layer));
   });
 
