@@ -6,6 +6,15 @@ import {
   WorkflowWorkerPrepareInput,
   WorkflowWorkerPrepareResult,
   WorkflowWorkerStatus,
+  WorkflowReviewCheckReceiptInput,
+  WorkflowReviewDispositionInput,
+  WorkflowTicketResolveInput,
+  WorkflowTicketResolveResult,
+  WorkflowTicketReviewAssociateInput,
+  WorkflowTicketReviewPrepareInput,
+  WorkflowTicketReviewPrepareResult,
+  WorkflowTicketReviewReportInput,
+  WorkflowTicketReviewStatus,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
@@ -46,8 +55,71 @@ export const WorkflowReportWorkerHandoffTool = Tool.make("workflow_report_worker
   dependencies,
 });
 
+export const WorkflowPrepareTicketReviewTool = Tool.make("workflow_prepare_ticket_review", {
+  description:
+    "Register agreed checks against an associated implementation handoff and, after exact provider command receipts verify them, prepare a fresh Astra/medium code-review coordinator.",
+  parameters: WorkflowTicketReviewPrepareInput,
+  success: WorkflowTicketReviewPrepareResult,
+  failure: WorkflowWorkerFailure,
+  dependencies,
+});
+
+export const WorkflowRecordReviewChecksTool = Tool.make("workflow_record_review_checks", {
+  description:
+    "Bind registered checks to exact native Codex command start/completion receipts. Commands must run through the normal provider approval path in the capability worktree.",
+  parameters: WorkflowReviewCheckReceiptInput,
+  success: WorkflowTicketReviewStatus,
+  failure: WorkflowDirectorError,
+  dependencies,
+});
+
+export const WorkflowAssociateTicketReviewTool = Tool.make("workflow_associate_ticket_review", {
+  description:
+    "Associate a prepared ticket review with one fresh exact native reviewer child under this director.",
+  parameters: WorkflowTicketReviewAssociateInput,
+  success: WorkflowTicketReviewStatus,
+  failure: WorkflowDirectorError,
+  dependencies,
+});
+
+export const WorkflowReportTicketReviewTool = Tool.make("workflow_report_ticket_review", {
+  description:
+    "Record one associated coordinator's independent Standards and Spec results using two fresh exact native child identities. This does not dispose findings.",
+  parameters: WorkflowTicketReviewReportInput,
+  success: WorkflowTicketReviewStatus,
+  failure: WorkflowDirectorError,
+  dependencies,
+});
+
+export const WorkflowRecordReviewDispositionsTool = Tool.make(
+  "workflow_record_review_dispositions",
+  {
+    description:
+      "Record the director's separate source-validated disposition and rationale for review findings.",
+    parameters: WorkflowReviewDispositionInput,
+    success: WorkflowTicketReviewStatus,
+    failure: WorkflowDirectorError,
+    dependencies,
+  },
+);
+
+export const WorkflowResolveTicketTool = Tool.make("workflow_resolve_ticket", {
+  description:
+    "Resolve a delivery ticket only after committed clean work, provider-verified checks, settled independent review, dispositions, current scope, reconciled GitHub evidence, and a refreshed capability frontier.",
+  parameters: WorkflowTicketResolveInput,
+  success: WorkflowTicketResolveResult,
+  failure: WorkflowWorkerFailure,
+  dependencies,
+});
+
 export const WorkflowDirectorToolkit = Toolkit.make(
   WorkflowPrepareWorkerTool,
   WorkflowAssociateWorkerTool,
   WorkflowReportWorkerHandoffTool,
+  WorkflowPrepareTicketReviewTool,
+  WorkflowRecordReviewChecksTool,
+  WorkflowAssociateTicketReviewTool,
+  WorkflowReportTicketReviewTool,
+  WorkflowRecordReviewDispositionsTool,
+  WorkflowResolveTicketTool,
 );

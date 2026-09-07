@@ -49,6 +49,19 @@ const MARKERS = {
   reassessment: "<!-- t3-workflow:v1 reassessment -->",
 } as const;
 
+export function workflowEvidenceBodyFingerprint(body: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < body.length; index += 1) {
+    const code = body.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `${body.length}:${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
 function field(body: string, name: string): string | undefined {
   return new RegExp(`^${name}:\\s*(.+)$`, "imu").exec(body)?.[1]?.trim();
 }
@@ -304,6 +317,7 @@ function parseRecord(
       ? { outcome }
       : {}),
     ...(evidence ? { evidence } : {}),
+    bodyFingerprint: workflowEvidenceBodyFingerprint(comment.body),
   };
 }
 

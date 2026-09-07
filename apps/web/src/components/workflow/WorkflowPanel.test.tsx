@@ -29,6 +29,7 @@ const query = vi.hoisted(() => {
     directorActivities: new Array<{
       id: string;
       kind: string;
+      summary?: string;
       payload: unknown;
       createdAt: string;
     }>(),
@@ -505,6 +506,100 @@ vi.mock("~/state/query", () => ({
                   updatedAt: "2026-09-06T11:00:00.000Z",
                 },
               ],
+              reviews: [
+                {
+                  reviewId: "review-1",
+                  admissionId: "admission-1",
+                  ticketNumber: 11,
+                  implementationProviderThreadId: "provider-worker-1",
+                  fixedBase: "base-head",
+                  implementationHead: "final-head",
+                  status: "reported",
+                  association: "associated",
+                  providerThreadId: "review-coordinator-1",
+                  parentProviderThreadId: "director-thread",
+                  providerStatus: "interrupted",
+                  settlementEvidence: "native-closed",
+                  requestedProfile: {
+                    model: "gpt-6-astra",
+                    effort: "medium",
+                    skillPath: "/skills/code-review/SKILL.md",
+                  },
+                  observedProfile: { model: "gpt-6-astra", effort: "medium", match: "match" },
+                  checks: [
+                    {
+                      label: "focused",
+                      command: "vp test run focused.test.ts",
+                      toolCallId: "tool-1",
+                      exitCode: 0,
+                      output: "passed",
+                      startedHead: "final-head",
+                      finishedHead: "final-head",
+                      startedClean: true,
+                      finishedClean: true,
+                      status: "passed",
+                      verificationError: null,
+                    },
+                  ],
+                  axes: [
+                    {
+                      axis: "standards",
+                      providerThreadId: "standards-1",
+                      parentProviderThreadId: "review-coordinator-1",
+                      providerStatus: "interrupted",
+                      settlementEvidence: "native-closed",
+                      observedProfile: {
+                        model: "gpt-6-astra",
+                        effort: "medium",
+                        match: "match",
+                      },
+                    },
+                    {
+                      axis: "spec",
+                      providerThreadId: "spec-1",
+                      parentProviderThreadId: "review-coordinator-1",
+                      providerStatus: "interrupted",
+                      settlementEvidence: "native-closed",
+                      observedProfile: {
+                        model: "gpt-6-astra",
+                        effort: "medium",
+                        match: "match",
+                      },
+                    },
+                  ],
+                  findings: [
+                    {
+                      id: "finding-1",
+                      axis: "standards",
+                      severity: "low",
+                      summary: "Clarify the status copy.",
+                      location: "WorkflowFocusedMap.tsx",
+                      disposition: {
+                        outcome: "dismissed",
+                        rationale: "Existing copy is intentional.",
+                        evidenceSource: null,
+                        evidenceQuote: null,
+                        resultingReviewId: null,
+                      },
+                    },
+                  ],
+                  summary: "Both axes completed.",
+                  updatedAt: "2026-09-06T11:00:00.000Z",
+                },
+              ],
+              resolutions: [
+                {
+                  resolutionId: "resolution-1",
+                  reviewId: "review-1",
+                  ticketNumber: 11,
+                  finalHead: "final-head",
+                  status: "comment-uncertain",
+                  commentUrl: null,
+                  lastError: "GitHub has not returned the comment yet.",
+                  readyIssueIds: [],
+                  updatedAt: "2026-09-06T11:00:00.000Z",
+                },
+              ],
               observation: "accepted",
               actions: ["open"],
               createdAt: "2026-09-06T10:00:00.000Z",
@@ -941,7 +1036,6 @@ describe("WorkflowPanel browsing", () => {
       await act(() => rootButton!.props.onClick());
 
       const director = renderer!.root.findByProps({ "aria-label": "Capability director" });
-      expect(director.findByType("h4").children.join("")).toBe("Worker history");
       expect(director.findAllByType("li")[0]!.findAllByType("p")[0]!.children.join("")).toContain(
         "Ticket #11",
       );
@@ -952,6 +1046,23 @@ describe("WorkflowPanel browsing", () => {
           .map((paragraph) => paragraph.children.join(""))
           .join(" "),
       ).toContain("write reservation released");
+      expect(director.findAllByType("h4").map((heading) => heading.children.join(""))).toEqual([
+        "Worker history",
+        "Review history",
+        "Resolution history",
+      ]);
+      expect(
+        director
+          .findAllByType("li")
+          .map((item) => item.children.join(""))
+          .join(" "),
+      ).toContain("dismissed: Existing copy is intentional.");
+      expect(
+        director
+          .findAllByType("p")
+          .map((paragraph) => paragraph.children.join(""))
+          .join(" "),
+      ).toContain("comment-uncertain");
       expect(
         query.calls.some(
           (call) =>
@@ -981,6 +1092,17 @@ describe("WorkflowPanel browsing", () => {
       await act(() => renderer!.update(<WorkflowPanel {...props} />));
 
       expect(query.directorRefresh).toHaveBeenCalledTimes(1);
+
+      query.directorActivities.push({
+        id: "workflow-resolution-1",
+        kind: "tool.completed",
+        summary: "t3code · workflow_record_review_dispositions",
+        payload: { itemType: "mcp_tool_call", status: "completed" },
+        createdAt: "2026-09-06T11:01:02.000Z",
+      });
+      await act(() => renderer!.update(<WorkflowPanel {...props} />));
+
+      expect(query.directorRefresh).toHaveBeenCalledTimes(2);
     } finally {
       await act(() => renderer?.unmount());
     }

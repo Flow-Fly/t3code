@@ -23,6 +23,17 @@ import {
   type WorkflowWorkerPrepareInput,
   type WorkflowWorkerPrepareResult,
   type WorkflowWorkerStatus,
+  type WorkflowReviewDispositionInput,
+  type WorkflowReviewCheckReceiptInput,
+  type WorkflowReviewFinding,
+  type WorkflowTicketResolveInput,
+  type WorkflowTicketResolveResult,
+  type WorkflowTicketResolutionStatus,
+  type WorkflowTicketReviewAssociateInput,
+  type WorkflowTicketReviewPrepareInput,
+  type WorkflowTicketReviewPrepareResult,
+  type WorkflowTicketReviewReportInput,
+  type WorkflowTicketReviewStatus,
   type WorkflowEvidenceRecord,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
@@ -50,6 +61,7 @@ import { OrchestrationCommandReceiptRepository } from "../persistence/Services/O
 import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import { workflowEvidenceBodyFingerprint } from "./WorkflowEvidence.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
 const ADMISSION_LIMIT = 10;
@@ -57,6 +69,8 @@ const DIRECTOR_MODEL = "gpt-6-astra";
 const DIRECTOR_EFFORT = "high";
 const WORKER_MODEL = "gpt-5.6-sol";
 const WORKER_EFFORT = "high";
+const REVIEWER_MODEL = "gpt-6-astra";
+const REVIEWER_EFFORT = "medium";
 const REQUIRED_SKILLS = ["implement", "code-review"] as const;
 
 type Dispatch = (
@@ -138,6 +152,102 @@ const decodeWorkerRow = Schema.decodeUnknownEffect(WorkerRow);
 const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeStringArrayJson = Schema.decodeUnknownEffect(StringArrayJson);
 const encodeStringArrayJson = Schema.encodeUnknownSync(StringArrayJson);
+const decodeStringArrayJsonSync = Schema.decodeUnknownSync(StringArrayJson);
+
+const ReviewRow = Schema.Struct({
+  reviewId: Schema.String,
+  associationToken: Schema.String,
+  directorId: Schema.String,
+  admissionId: Schema.String,
+  implementationDispatchId: Schema.String,
+  ticketNumber: Schema.Number,
+  fixedBase: Schema.String,
+  implementationHead: Schema.String,
+  scopeBody: Schema.String,
+  requestedModel: Schema.String,
+  requestedEffort: Schema.String,
+  requestedSkillPath: Schema.String,
+  providerThreadId: Schema.NullOr(Schema.String),
+  status: Schema.String,
+  reportSummary: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+type ReviewRow = typeof ReviewRow.Type;
+const decodeReviewRow = Schema.decodeUnknownEffect(ReviewRow);
+
+const ObservationRow = Schema.Struct({
+  providerThreadId: Schema.String,
+  parentProviderThreadId: Schema.NullOr(Schema.String),
+  observedModel: Schema.NullOr(Schema.String),
+  observedEffort: Schema.NullOr(Schema.String),
+  providerStatus: Schema.String,
+  nativeLifecycle: Schema.NullOr(Schema.String),
+  firstObservedAt: Schema.String,
+});
+type ObservationRow = typeof ObservationRow.Type;
+const decodeObservationRow = Schema.decodeUnknownEffect(ObservationRow);
+
+const CheckRow = Schema.Struct({
+  reviewId: Schema.String,
+  label: Schema.String,
+  command: Schema.String,
+  toolCallId: Schema.NullOr(Schema.String),
+  exitCode: Schema.NullOr(Schema.Number),
+  output: Schema.String,
+  startedHead: Schema.String,
+  finishedHead: Schema.NullOr(Schema.String),
+  startedClean: Schema.Number,
+  finishedClean: Schema.NullOr(Schema.Number),
+  verificationStatus: Schema.String,
+  verificationError: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+});
+type CheckRow = typeof CheckRow.Type;
+const decodeCheckRow = Schema.decodeUnknownEffect(CheckRow);
+
+const FindingRow = Schema.Struct({
+  reviewId: Schema.String,
+  findingId: Schema.String,
+  axis: Schema.String,
+  severity: Schema.String,
+  summary: Schema.String,
+  location: Schema.NullOr(Schema.String),
+  disposition: Schema.NullOr(Schema.String),
+  dispositionRationale: Schema.NullOr(Schema.String),
+  dispositionEvidenceSource: Schema.NullOr(Schema.String),
+  dispositionEvidenceQuote: Schema.NullOr(Schema.String),
+  resultingReviewId: Schema.NullOr(Schema.String),
+});
+type FindingRow = typeof FindingRow.Type;
+const decodeFindingRow = Schema.decodeUnknownEffect(FindingRow);
+
+const ResolutionRow = Schema.Struct({
+  resolutionId: Schema.String,
+  reviewId: Schema.String,
+  ticketNumber: Schema.Number,
+  finalHead: Schema.String,
+  commentBody: Schema.String,
+  status: Schema.String,
+  commentUrl: Schema.NullOr(Schema.String),
+  frontierJson: Schema.NullOr(Schema.String),
+  lastError: Schema.NullOr(Schema.String),
+  updatedAt: Schema.String,
+});
+type ResolutionRow = typeof ResolutionRow.Type;
+const decodeResolutionRow = Schema.decodeUnknownEffect(ResolutionRow);
+
+const NativeCommandRow = Schema.Struct({
+  lifecycle: Schema.String,
+  command: Schema.String,
+  cwd: Schema.NullOr(Schema.String),
+  status: Schema.NullOr(Schema.String),
+  exitCode: Schema.NullOr(Schema.Number),
+  output: Schema.String,
+  createdAt: Schema.String,
+});
+type NativeCommandRow = typeof NativeCommandRow.Type;
+const decodeNativeCommandRow = Schema.decodeUnknownEffect(NativeCommandRow);
 
 function pathsOverlap(left: string, right: string) {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
@@ -336,10 +446,59 @@ export function workflowDirectorInstructions(input: {
     "",
     "Before every implementation delegation, call the host workflow_prepare_worker MCP tool with the durable ticket number, a plain ownership summary, and exact repository-relative write paths. It persists readiness, admission, slot and ownership before returning native spawn instructions.",
     "After native spawn, call workflow_associate_worker with the returned token and exact child provider thread id. When the child returns, call workflow_report_worker_handoff with its result, commits and checks. Provider idle or a finished turn is not a handoff, ticket resolution or proof that descendants settled.",
+    "After a successful implementation handoff, immediately call workflow_prepare_ticket_review with the fixed base, exact final implementation head and agreed command checks. Run its registered checks through the normal Codex command and approval path, bind their exact native item ids with workflow_record_review_checks, then repeat preparation. The host never runs those checks for you.",
+    "Use the prepared instructions to spawn one fresh Astra/medium $code-review coordinator, associate its exact child identity with workflow_associate_ticket_review, and require it to delegate fresh independent Standards and Spec axes. Report the coordinator and both exact axis identities with workflow_report_ticket_review.",
+    "Validate every reported finding against the source. Record each director judgment separately with workflow_record_review_dispositions. A fixed finding cites the later fresh review of its changed head. For owner acceptance, first send a readable decision prompt that includes the returned review and finding references, then cite the owner's exact user reply. Close the implementation and review child trees natively, then call workflow_resolve_ticket; retry a pending result so its stable GitHub evidence and closure can reconcile before treating the ticket as resolved.",
     `This batch admits at most ${ADMISSION_LIMIT} distinct delivery slices. Failed or blocked admitted slices keep their slot; retry and review reuse it; nested tasks reuse their parent slice. At the limit, stop new admissions, finish or settle admitted work, and wait for a successor.`,
     "Re-read live tracker state before each admission. Do not infer approval from labels, assignment, closure, silence or unavailable evidence.",
     "GitHub assignment is observational and is not a cross-environment atomic lock.",
     "Arbitrary provider collaboration outside the admission RPC cannot be host-enforced; keep all directed delivery inside the callable boundary.",
+  ].join("\n");
+}
+
+export function workflowTicketResolutionBody(input: {
+  readonly resolutionId: string;
+  readonly repository: string;
+  readonly ticketNumber: number;
+  readonly review: WorkflowTicketReviewStatus;
+  readonly dispositionReviewIds?: ReadonlyArray<string>;
+}) {
+  const coordinator = input.review.providerThreadId!;
+  const standards = input.review.axes.find((axis) => axis.axis === "standards")!;
+  const spec = input.review.axes.find((axis) => axis.axis === "spec")!;
+  const dispositions = input.review.findings.map(
+    (finding) =>
+      `- ${finding.id} (${finding.severity}, ${finding.axis}): ${finding.disposition?.outcome} — ${finding.disposition?.rationale}`,
+  );
+  return [
+    "## Resolution",
+    "<!-- t3-workflow:v1 resolution -->",
+    "Outcome: resolved",
+    `Source: https://github.com/${input.repository}/issues/${input.ticketNumber}`,
+    "",
+    "### Summary",
+    `Committed implementation at ${input.review.implementationHead} passed the registered checks and fresh independent Standards and Spec review.`,
+    "",
+    "### Evidence",
+    `- [Implementation commit](https://github.com/${input.repository}/commit/${input.review.implementationHead})`,
+    `- artifact: \`workflow-review:${input.review.reviewId}/checks\``,
+    `- thread: \`${coordinator}\` (review coordinator)`,
+    `- thread: \`${standards.providerThreadId}\` (Standards)`,
+    `- thread: \`${spec.providerThreadId}\` (Spec)`,
+    ...[
+      ...new Set([
+        ...(input.dispositionReviewIds ?? []),
+        ...(input.review.findings.length > 0 ? [input.review.reviewId] : []),
+      ]),
+    ].map((reviewId) => `- artifact: \`workflow-review:${reviewId}/dispositions\``),
+    `- artifact: \`workflow-resolution:${input.resolutionId}\``,
+    "",
+    "### Review results",
+    input.review.summary ?? "Independent review completed.",
+    ...(dispositions.length > 0 ? ["", ...dispositions] : []),
+    "",
+    "### Limits and staffing",
+    `Requested reviewer ${input.review.requestedProfile.model}/${input.review.requestedProfile.effort}; observed ${input.review.observedProfile.model ?? "unavailable"}/${input.review.observedProfile.effort ?? "unavailable"} (${input.review.observedProfile.match}).`,
   ].join("\n");
 }
 
@@ -378,6 +537,45 @@ export class WorkflowDirectorService extends Context.Service<
       providerInstanceId: ProviderInstanceId,
       input: WorkflowWorkerHandoffInput,
     ) => Effect.Effect<WorkflowWorkerStatus, WorkflowDirectorError>;
+    readonly prepareTicketReview: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewPrepareInput,
+    ) => Effect.Effect<
+      WorkflowTicketReviewPrepareResult,
+      WorkflowQueryError | WorkflowDirectorError
+    >;
+    readonly associateTicketReview: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewAssociateInput,
+    ) => Effect.Effect<WorkflowTicketReviewStatus, WorkflowDirectorError>;
+    readonly recordReviewChecks: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowReviewCheckReceiptInput,
+    ) => Effect.Effect<WorkflowTicketReviewStatus, WorkflowDirectorError>;
+    readonly reportTicketReview: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewReportInput,
+    ) => Effect.Effect<WorkflowTicketReviewStatus, WorkflowDirectorError>;
+    readonly recordReviewDispositions: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowReviewDispositionInput,
+    ) => Effect.Effect<WorkflowTicketReviewStatus, WorkflowDirectorError>;
+    readonly resolveTicket: (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketResolveInput,
+    ) => Effect.Effect<WorkflowTicketResolveResult, WorkflowQueryError | WorkflowDirectorError>;
   }
 >()("t3/workflow/WorkflowDirectorService") {}
 
@@ -558,6 +756,36 @@ export const make = Effect.gen(function* () {
       )
     );
   });
+
+  const verifiedUserSourceMessage = Effect.fn("WorkflowDirectorService.verifiedUserSourceMessage")(
+    function* (source: string) {
+      const reference = durableT3SourceReference(source);
+      if (!reference) return null;
+      const detail = yield* projection
+        .getThreadDetailById(ThreadId.make(reference.threadId), { activityKinds: [] })
+        .pipe(
+          Effect.mapError((error) =>
+            directorError(
+              "persistence-failed",
+              "A disposition source thread could not be read.",
+              String(error),
+            ),
+          ),
+        );
+      if (Option.isNone(detail)) return null;
+      const index = detail.value.messages.findIndex(
+        (message) => message.id === reference.messageId && message.role === "user",
+      );
+      if (index < 0) return null;
+      return {
+        message: detail.value.messages[index]!,
+        prompt:
+          detail.value.messages
+            .slice(0, index)
+            .findLast((message) => message.role === "assistant") ?? null,
+      };
+    },
+  );
 
   const currentApproval = Effect.fn("WorkflowDirectorService.currentApproval")(function* (
     capability: WorkflowIssueDetail,
@@ -1158,6 +1386,289 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const observations = Effect.fn("WorkflowDirectorService.observations")(function* (
+    directorId: string,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT provider_thread_id AS "providerThreadId",
+          parent_provider_thread_id AS "parentProviderThreadId",
+          observed_model AS "observedModel", observed_effort AS "observedEffort",
+          provider_status AS "providerStatus", native_lifecycle AS "nativeLifecycle",
+          first_observed_at AS "firstObservedAt"
+        FROM workflow_worker_observations WHERE director_id = ${directorId}
+      `,
+      "Provider child observations could not be read.",
+    );
+    return yield* Effect.forEach(rows, (candidate) => decodeObservationRow(candidate)).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "A provider child observation is invalid.",
+          String(error),
+        ),
+      ),
+    );
+  });
+
+  const reviewStatusFromRow = Effect.fn("WorkflowDirectorService.reviewStatusFromRow")(function* (
+    row: ReviewRow,
+  ): Effect.fn.Return<WorkflowTicketReviewStatus, WorkflowDirectorError> {
+    const observationRows = yield* observations(row.directorId);
+    const observationById = new Map(
+      observationRows.map((observation) => [observation.providerThreadId, observation]),
+    );
+    const coordinator = row.providerThreadId
+      ? (observationById.get(row.providerThreadId) ?? null)
+      : null;
+    const rawChecks = yield* persistence(
+      sql<Record<string, unknown>>`
+          SELECT review_id AS "reviewId", label, command, tool_call_id AS "toolCallId",
+            exit_code AS "exitCode", output, started_head AS "startedHead",
+            finished_head AS "finishedHead", started_clean AS "startedClean",
+            finished_clean AS "finishedClean", verification_status AS "verificationStatus",
+            verification_error AS "verificationError", created_at AS "createdAt"
+          FROM workflow_review_checks WHERE review_id = ${row.reviewId} ORDER BY rowid
+        `,
+      "Review check evidence could not be read.",
+    );
+    const checkRows = yield* Effect.forEach(rawChecks, (candidate) =>
+      decodeCheckRow(candidate),
+    ).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "Review check evidence is invalid.", String(error)),
+      ),
+    );
+    const checks = checkRows.map((check) => {
+      return {
+        label: check.label,
+        command: check.command,
+        toolCallId: check.toolCallId,
+        exitCode: check.exitCode,
+        output: check.output,
+        startedHead: check.startedHead,
+        finishedHead: check.finishedHead,
+        startedClean: check.startedClean === 1,
+        finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
+        status: check.verificationStatus as "pending" | "passed" | "failed",
+        verificationError: check.verificationError,
+      };
+    });
+    const rawAxes = yield* persistence(
+      sql<{ readonly axis: string; readonly providerThreadId: string }>`
+          SELECT axis, provider_thread_id AS "providerThreadId"
+          FROM workflow_review_axes WHERE review_id = ${row.reviewId} ORDER BY axis
+        `,
+      "Review identities could not be read.",
+    );
+    const axes = rawAxes.flatMap((axis) => {
+      const observed = observationById.get(axis.providerThreadId);
+      if (!observed || (axis.axis !== "standards" && axis.axis !== "spec")) return [];
+      const match =
+        !observed.observedModel || !observed.observedEffort
+          ? "unknown"
+          : observed.observedModel === REVIEWER_MODEL && observed.observedEffort === REVIEWER_EFFORT
+            ? "match"
+            : "mismatch";
+      return [
+        {
+          axis: axis.axis,
+          providerThreadId: axis.providerThreadId,
+          parentProviderThreadId: observed.parentProviderThreadId,
+          providerStatus: observed.providerStatus,
+          settlementEvidence: observed.nativeLifecycle === "closed" ? "native-closed" : null,
+          observedProfile: {
+            model: observed.observedModel,
+            effort: observed.observedEffort,
+            match,
+          },
+        } as const,
+      ];
+    });
+    const rawFindings = yield* persistence(
+      sql<Record<string, unknown>>`
+          SELECT review_id AS "reviewId", finding_id AS "findingId", axis, severity, summary,
+            location, disposition, disposition_rationale AS "dispositionRationale",
+            disposition_evidence_source AS "dispositionEvidenceSource",
+            disposition_evidence_quote AS "dispositionEvidenceQuote",
+            resulting_review_id AS "resultingReviewId"
+          FROM workflow_review_findings WHERE review_id = ${row.reviewId} ORDER BY rowid
+        `,
+      "Review findings could not be read.",
+    );
+    const findingRows = yield* Effect.forEach(rawFindings, (candidate) =>
+      decodeFindingRow(candidate),
+    ).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "Review findings are invalid.", String(error)),
+      ),
+    );
+    const findings = findingRows.map(
+      (finding) =>
+        ({
+          id: finding.findingId,
+          axis: finding.axis as WorkflowReviewFinding["axis"],
+          severity: finding.severity as WorkflowReviewFinding["severity"],
+          summary: finding.summary,
+          location: finding.location,
+          disposition:
+            finding.disposition && finding.dispositionRationale
+              ? {
+                  outcome: finding.disposition as NonNullable<
+                    WorkflowReviewFinding["disposition"]
+                  >["outcome"],
+                  rationale: finding.dispositionRationale,
+                  evidenceSource: finding.dispositionEvidenceSource,
+                  evidenceQuote: finding.dispositionEvidenceQuote,
+                  resultingReviewId: finding.resultingReviewId,
+                }
+              : null,
+        }) satisfies WorkflowReviewFinding,
+    );
+    const match =
+      !coordinator?.observedModel || !coordinator.observedEffort
+        ? "unknown"
+        : coordinator.observedModel === REVIEWER_MODEL &&
+            coordinator.observedEffort === REVIEWER_EFFORT
+          ? "match"
+          : "mismatch";
+    return {
+      reviewId: row.reviewId,
+      admissionId: row.admissionId,
+      ticketNumber: row.ticketNumber,
+      implementationProviderThreadId: yield* persistence(
+        sql<{ readonly providerThreadId: string }>`
+            SELECT provider_thread_id AS "providerThreadId" FROM workflow_worker_dispatches
+            WHERE dispatch_id = ${row.implementationDispatchId} LIMIT 1
+          `,
+        "The implementation identity for this review could not be read.",
+      ).pipe(
+        Effect.flatMap((identity) =>
+          identity[0]?.providerThreadId
+            ? Effect.succeed(identity[0].providerThreadId)
+            : Effect.fail(
+                directorError(
+                  "persistence-failed",
+                  "The reviewed implementation identity is missing.",
+                ),
+              ),
+        ),
+      ),
+      fixedBase: row.fixedBase,
+      implementationHead: row.implementationHead,
+      status: row.status as WorkflowTicketReviewStatus["status"],
+      association: row.providerThreadId ? "associated" : "unconfirmed",
+      providerThreadId: row.providerThreadId,
+      parentProviderThreadId: coordinator?.parentProviderThreadId ?? null,
+      providerStatus: coordinator?.providerStatus ?? "unconfirmed",
+      settlementEvidence: coordinator?.nativeLifecycle === "closed" ? "native-closed" : null,
+      requestedProfile: {
+        model: row.requestedModel,
+        effort: row.requestedEffort,
+        skillPath: row.requestedSkillPath,
+      },
+      observedProfile: {
+        model: coordinator?.observedModel ?? null,
+        effort: coordinator?.observedEffort ?? null,
+        match,
+      },
+      checks,
+      axes,
+      findings,
+      summary: row.reportSummary,
+      updatedAt: row.updatedAt,
+    };
+  });
+
+  const reviews = Effect.fn("WorkflowDirectorService.reviews")(function* (directorId: string) {
+    const rawRows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT review_id AS "reviewId", association_token AS "associationToken",
+          director_id AS "directorId", admission_id AS "admissionId",
+          implementation_dispatch_id AS "implementationDispatchId", ticket_number AS "ticketNumber",
+          fixed_base AS "fixedBase", implementation_head AS "implementationHead",
+          scope_body AS "scopeBody", requested_model AS "requestedModel",
+          requested_effort AS "requestedEffort", requested_skill_path AS "requestedSkillPath",
+          provider_thread_id AS "providerThreadId", status, report_summary AS "reportSummary",
+          created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM workflow_ticket_reviews WHERE director_id = ${directorId} ORDER BY created_at
+      `,
+      "Review history could not be read.",
+    );
+    const rows = yield* Effect.forEach(rawRows, (candidate) => decodeReviewRow(candidate)).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "A review history row is invalid.", String(error)),
+      ),
+    );
+    return yield* Effect.forEach(rows, reviewStatusFromRow);
+  });
+
+  const loadReview = Effect.fn("WorkflowDirectorService.loadReview")(function* (
+    directorId: string,
+    reviewId: string,
+  ) {
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT review_id AS "reviewId", association_token AS "associationToken",
+          director_id AS "directorId", admission_id AS "admissionId",
+          implementation_dispatch_id AS "implementationDispatchId", ticket_number AS "ticketNumber",
+          fixed_base AS "fixedBase", implementation_head AS "implementationHead",
+          scope_body AS "scopeBody", requested_model AS "requestedModel",
+          requested_effort AS "requestedEffort", requested_skill_path AS "requestedSkillPath",
+          provider_thread_id AS "providerThreadId", status, report_summary AS "reportSummary",
+          created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM workflow_ticket_reviews WHERE director_id = ${directorId} AND review_id = ${reviewId}
+        LIMIT 1
+      `,
+      "The ticket review could not be read.",
+    );
+    if (!rows[0]) {
+      return yield* directorError(
+        "review-incomplete",
+        "The ticket review is unknown to this director.",
+      );
+    }
+    return yield* decodeReviewRow(rows[0]).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "The ticket review record is invalid.", String(error)),
+      ),
+    );
+  });
+
+  const resolutionStatusFromRow = (row: ResolutionRow): WorkflowTicketResolutionStatus => ({
+    resolutionId: row.resolutionId,
+    reviewId: row.reviewId,
+    ticketNumber: row.ticketNumber,
+    finalHead: row.finalHead,
+    status: row.status as WorkflowTicketResolutionStatus["status"],
+    commentUrl: row.commentUrl,
+    lastError: row.lastError,
+    readyIssueIds: row.frontierJson ? decodeStringArrayJsonSync(row.frontierJson) : [],
+    updatedAt: row.updatedAt,
+  });
+
+  const resolutions = Effect.fn("WorkflowDirectorService.resolutions")(function* (
+    directorId: string,
+  ) {
+    const rawRows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT resolution_id AS "resolutionId", review_id AS "reviewId",
+          ticket_number AS "ticketNumber", final_head AS "finalHead",
+          comment_body AS "commentBody", status,
+          comment_url AS "commentUrl", frontier_json AS "frontierJson",
+          last_error AS "lastError", updated_at AS "updatedAt"
+        FROM workflow_ticket_resolution_intents WHERE director_id = ${directorId} ORDER BY created_at
+      `,
+      "Ticket resolution history could not be read.",
+    );
+    const rows = yield* Effect.forEach(rawRows, (candidate) => decodeResolutionRow(candidate)).pipe(
+      Effect.mapError((error) =>
+        directorError("persistence-failed", "A ticket resolution row is invalid.", String(error)),
+      ),
+    );
+    return rows.map(resolutionStatusFromRow);
+  });
+
   const reconcileDirector = Effect.fn("WorkflowDirectorService.reconcileDirector")(function* (
     row: DirectorRow,
   ) {
@@ -1288,6 +1799,8 @@ export const make = Effect.gen(function* () {
       admissionCount,
       admissionLimit: ADMISSION_LIMIT,
       workers: yield* workers(row.directorId),
+      reviews: yield* reviews(row.directorId),
+      resolutions: yield* resolutions(row.directorId),
       observation,
       actions,
       createdAt: row.createdAt,
@@ -2231,6 +2744,130 @@ export const make = Effect.gen(function* () {
     return { skillPath: implementSkills[0]!.path };
   });
 
+  const reviewerPreflight = Effect.fn("WorkflowDirectorService.reviewerPreflight")(function* (
+    row: DirectorRow,
+  ) {
+    const provider = yield* providerRegistry
+      .probeWorkspaceSnapshot({
+        instanceId:
+          row.requestedInstanceId as WorkflowDirectorStartInput["modelSelection"]["instanceId"],
+        cwd: row.worktreePath,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError("provider-unavailable", "Review provider preflight failed.", String(error)),
+        ),
+      );
+    const model = provider?.models.find((candidate) => candidate.slug === REVIEWER_MODEL);
+    const effort = model?.capabilities?.optionDescriptors?.find(
+      (descriptor) => descriptor.id === "reasoningEffort",
+    );
+    const skills = provider?.skills.filter(
+      (skill) => skill.name === "code-review" && skill.enabled,
+    );
+    if (
+      provider?.driver !== ProviderDriverKind.make("codex") ||
+      !model ||
+      effort?.type !== "select" ||
+      !effort.options.some((option) => option.id === REVIEWER_EFFORT) ||
+      skills?.length !== 1
+    ) {
+      return yield* directorError(
+        "provider-unavailable",
+        "The requested Astra/medium reviewer and one enabled code-review skill must pass preflight before dispatch.",
+      );
+    }
+    return { skillPath: skills[0]!.path };
+  });
+
+  const gitObservation = Effect.fn("WorkflowDirectorService.gitObservation")(function* (
+    cwd: string,
+  ) {
+    const head = yield* processRunner
+      .run({
+        command: "git",
+        args: ["rev-parse", "HEAD"],
+        cwd,
+        maxOutputBytes: 4_096,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "workspace-unavailable",
+            "The implementation HEAD could not be read.",
+            error.message,
+          ),
+        ),
+      );
+    const status = yield* processRunner
+      .run({
+        command: "git",
+        args: ["status", "--porcelain", "--untracked-files=normal"],
+        cwd,
+        maxOutputBytes: 100_000,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "workspace-unavailable",
+            "The capability worktree status could not be read.",
+            error.message,
+          ),
+        ),
+      );
+    if (head.code !== 0 || head.timedOut || status.code !== 0 || status.timedOut) {
+      return yield* directorError(
+        "workspace-unavailable",
+        "The capability worktree could not be verified.",
+        head.stderr.trim() || status.stderr.trim(),
+      );
+    }
+    return { head: head.stdout.trim(), clean: status.stdout.trim().length === 0 };
+  });
+
+  const verifyGitRange = Effect.fn("WorkflowDirectorService.verifyGitRange")(function* (
+    cwd: string,
+    fixedBase: string,
+    implementationHead: string,
+  ) {
+    if (!/^[0-9a-f]{40}$/iu.test(fixedBase) || !/^[0-9a-f]{40}$/iu.test(implementationHead)) {
+      return yield* directorError(
+        "stale-review",
+        "Review requires full fixed-base and implementation commit hashes.",
+      );
+    }
+    const range = yield* processRunner
+      .run({
+        command: "git",
+        args: ["merge-base", "--is-ancestor", fixedBase, implementationHead],
+        cwd,
+        maxOutputBytes: 4_096,
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "workspace-unavailable",
+            "The review commit range could not be verified.",
+            error.message,
+          ),
+        ),
+      );
+    const observed = yield* gitObservation(cwd);
+    if (
+      range.code !== 0 ||
+      range.timedOut ||
+      observed.head !== implementationHead ||
+      !observed.clean
+    ) {
+      return yield* directorError(
+        "stale-review",
+        "Review requires a committed, clean implementation at the exact final head.",
+        `Expected ${implementationHead}; observed ${observed.head}${observed.clean ? "" : " with uncommitted changes"}.`,
+      );
+    }
+    return observed;
+  });
+
   const prepareWorkerUnlocked = Effect.fn("WorkflowDirectorService.prepareWorker")(function* (
     environmentId: EnvironmentId,
     threadId: ThreadId,
@@ -2470,6 +3107,1258 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const reviewPreparationInstructions = (
+    review: WorkflowTicketReviewStatus,
+    associationToken: string,
+  ) =>
+    [
+      `Spawn one fresh review coordinator for ticket #${review.ticketNumber}.`,
+      `Request model ${REVIEWER_MODEL}, reasoning effort ${REVIEWER_EFFORT}, and $code-review at ${review.requestedProfile.skillPath}.`,
+      `Review exactly ${review.fixedBase}...${review.implementationHead} with independent Standards and Spec axes.`,
+      "Both axes must use fresh native children of the coordinator. Record their exact provider thread ids; titles are not identities.",
+      `After native spawn, call workflow_associate_ticket_review with token ${associationToken}.`,
+      "After both axes return, call workflow_report_ticket_review. Then record director dispositions separately before resolution.",
+    ].join("\n");
+
+  const prepareTicketReviewUnlocked = Effect.fn("WorkflowDirectorService.prepareTicketReview")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewPrepareInput,
+    ) {
+      const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const labels = input.checks.map((check) => check.label);
+      if (new Set(labels).size !== labels.length) {
+        return yield* directorError("checks-failed", "Agreed review check labels must be unique.");
+      }
+      const currentWorkers = yield* workers(row.directorId);
+      const implementation = currentWorkers.find(
+        (worker) =>
+          worker.providerThreadId === input.implementationProviderThreadId &&
+          worker.ticketNumber === input.ticketNumber &&
+          worker.association === "associated",
+      );
+      if (
+        !implementation?.dispatchId ||
+        !implementation.admissionId ||
+        implementation.handoff?.outcome !== "succeeded" ||
+        !implementation.handoff.commits.includes(input.implementationHead)
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          "Review requires an associated successful implementation handoff that names the final commit.",
+        );
+      }
+      const admission = (yield* admissions(row.directorId)).find(
+        (candidate) => candidate.admissionId === implementation.admissionId,
+      );
+      if (!admission) {
+        return yield* directorError(
+          "review-incomplete",
+          "The implementation admission is missing.",
+        );
+      }
+      const admissionResult = yield* admitUnlocked({
+        projectId: ProjectId.make(row.projectId),
+        directorId: row.directorId,
+        repository: row.repository as WorkflowDirectorAdmissionInput["repository"],
+        ticketNumber: input.ticketNumber,
+        purpose: "review",
+        ownership: admission.ownership,
+      });
+      if (!admissionResult.admission || admissionResult.admission.claimStatus !== "confirmed") {
+        return yield* directorError(
+          "claim-failed",
+          "Ticket ownership must remain confirmed before review.",
+          admissionResult.message,
+        );
+      }
+      const issue = yield* workflow.issueDetail({
+        projectId: ProjectId.make(row.projectId),
+        repository: row.repository as WorkflowIssueSummary["repository"],
+        number: input.ticketNumber,
+      });
+      if (issue.kind !== "ticket") {
+        return yield* directorError(
+          "not-ready",
+          "Only an approved delivery ticket can be reviewed.",
+        );
+      }
+      yield* verifyGitRange(row.worktreePath, input.fixedBase, input.implementationHead);
+      const { skillPath } = yield* reviewerPreflight(row);
+
+      const existingRows = yield* persistence(
+        sql<Record<string, unknown>>`
+          SELECT review_id AS "reviewId", association_token AS "associationToken",
+            director_id AS "directorId", admission_id AS "admissionId",
+            implementation_dispatch_id AS "implementationDispatchId", ticket_number AS "ticketNumber",
+            fixed_base AS "fixedBase", implementation_head AS "implementationHead",
+            scope_body AS "scopeBody", requested_model AS "requestedModel",
+            requested_effort AS "requestedEffort", requested_skill_path AS "requestedSkillPath",
+            provider_thread_id AS "providerThreadId", status, report_summary AS "reportSummary",
+            created_at AS "createdAt", updated_at AS "updatedAt"
+          FROM workflow_ticket_reviews
+          WHERE director_id = ${row.directorId} AND admission_id = ${admission.admissionId}
+            AND implementation_head = ${input.implementationHead}
+          ORDER BY created_at DESC LIMIT 1
+        `,
+        "Existing ticket review could not be read.",
+      );
+      if (existingRows[0]) {
+        const existing = yield* decodeReviewRow(existingRows[0]).pipe(
+          Effect.mapError((error) =>
+            directorError("persistence-failed", "The existing review is invalid.", String(error)),
+          ),
+        );
+        if (existing.fixedBase !== input.fixedBase || existing.scopeBody !== issue.body) {
+          return yield* directorError(
+            "stale-review",
+            "The existing review does not cover the current base or ticket scope.",
+          );
+        }
+        const storedChecks = (yield* reviewStatusFromRow(existing)).checks;
+        if (
+          storedChecks.length !== input.checks.length ||
+          storedChecks.some(
+            (check) =>
+              !input.checks.some(
+                (candidate) =>
+                  candidate.label === check.label && candidate.command === check.command,
+              ),
+          )
+        ) {
+          return yield* directorError(
+            "checks-failed",
+            "The agreed checks differ from the checks already registered for this review.",
+          );
+        }
+        const review = yield* reviewStatusFromRow(existing);
+        const checksReady = review.checks.every((check) => check.status === "passed");
+        if (checksReady && existing.status === "prepared") {
+          const updatedAt = DateTime.formatIso(yield* DateTime.now);
+          yield* persistence(
+            sql`
+              UPDATE workflow_ticket_reviews SET status = 'spawn-issued', updated_at = ${updatedAt}
+              WHERE review_id = ${existing.reviewId}
+            `,
+            "The durable review launch instruction could not be saved.",
+          );
+          const issued = yield* reviewStatusFromRow(
+            yield* loadReview(row.directorId, existing.reviewId),
+          );
+          return {
+            disposition: "prepared",
+            associationToken: existing.associationToken,
+            taskName: `review-${input.ticketNumber}-${existing.reviewId.slice(0, 8)}`,
+            instructions: reviewPreparationInstructions(issued, existing.associationToken),
+            review: issued,
+          } satisfies WorkflowTicketReviewPrepareResult;
+        }
+        return {
+          disposition: checksReady && existing.providerThreadId ? "existing" : "held",
+          associationToken: existing.associationToken,
+          taskName: `review-${input.ticketNumber}-${existing.reviewId.slice(0, 8)}`,
+          instructions:
+            existing.status === "spawn-issued"
+              ? `The review launch was already issued with token ${existing.associationToken}. Reconcile the exact native child and call workflow_associate_ticket_review; do not spawn a duplicate.`
+              : existing.status === "associated"
+                ? `Review coordinator ${existing.providerThreadId} is already associated. Wait for its fresh Standards and Spec axes, then call workflow_report_ticket_review.`
+                : existing.status === "reported"
+                  ? "The independent report is already durable. Validate findings, record remaining dispositions, close the child trees natively, and resolve the ticket."
+                  : [
+                      "Run each registered check through the normal Codex command path and approve it according to the provider policy.",
+                      ...review.checks
+                        .filter((check) => check.status !== "passed")
+                        .map((check) => `- ${check.label}: ${check.command}`),
+                      `Then call workflow_record_review_checks for review ${review.reviewId} with each exact native toolCallId, and repeat workflow_prepare_ticket_review.`,
+                    ].join("\n"),
+          review,
+        } satisfies WorkflowTicketReviewPrepareResult;
+      }
+
+      const previousReviews = yield* reviews(row.directorId);
+      const unsettled = previousReviews.find(
+        (review) =>
+          review.ticketNumber === input.ticketNumber &&
+          review.implementationHead !== input.implementationHead &&
+          (review.settlementEvidence !== "native-closed" ||
+            review.axes.some((axis) => axis.settlementEvidence !== "native-closed")),
+      );
+      if (unsettled) {
+        return yield* directorError(
+          "review-incomplete",
+          "A prior review attempt for this ticket still has live or unconfirmed provider work.",
+        );
+      }
+
+      const git = yield* gitObservation(row.worktreePath);
+      const reviewId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const associationToken = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const createdAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              INSERT INTO workflow_ticket_reviews (
+                review_id, association_token, director_id, batch_id, admission_id,
+                implementation_dispatch_id, repository, ticket_number, fixed_base,
+                implementation_head, scope_body, requested_model, requested_effort,
+                requested_skill_path, status, created_at, updated_at
+              ) VALUES (
+                ${reviewId}, ${associationToken}, ${row.directorId}, ${row.batchId},
+                ${admission.admissionId}, ${implementation.dispatchId}, ${row.repository},
+                ${input.ticketNumber}, ${input.fixedBase}, ${input.implementationHead}, ${issue.body},
+                ${REVIEWER_MODEL}, ${REVIEWER_EFFORT}, ${skillPath}, 'checks-pending',
+                ${createdAt}, ${createdAt}
+              )
+            `;
+            for (const check of input.checks) {
+              yield* sql`
+                INSERT INTO workflow_review_checks (
+                  review_id, label, command, output, started_head, started_clean,
+                  verification_status, created_at, updated_at
+                ) VALUES (
+                  ${reviewId}, ${check.label}, ${check.command}, '', ${git.head},
+                  ${git.clean ? 1 : 0}, 'pending', ${createdAt}, ${createdAt}
+                )
+              `;
+            }
+          }),
+        ),
+        "The review and its agreed checks could not be registered.",
+      );
+      const review = (yield* reviews(row.directorId)).find(
+        (candidate) => candidate.reviewId === reviewId,
+      )!;
+      return {
+        disposition: "held",
+        associationToken,
+        taskName: `review-${input.ticketNumber}-${reviewId.slice(0, 8)}`,
+        instructions: [
+          "Run each registered check through the normal Codex command path and approve it according to the provider policy.",
+          ...input.checks.map((check) => `- ${check.label}: ${check.command}`),
+          `Then call workflow_record_review_checks for review ${reviewId} with each exact native toolCallId, and repeat workflow_prepare_ticket_review.`,
+        ].join("\n"),
+        review,
+      } satisfies WorkflowTicketReviewPrepareResult;
+    },
+  );
+
+  const recordReviewChecksUnlocked = Effect.fn("WorkflowDirectorService.recordReviewChecks")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowReviewCheckReceiptInput,
+    ) {
+      const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const reviewRow = yield* loadReview(row.directorId, input.reviewId);
+      const receiptLabels = input.receipts.map((receipt) => receipt.label);
+      const receiptIds = input.receipts.map((receipt) => receipt.toolCallId);
+      if (
+        new Set(receiptLabels).size !== receiptLabels.length ||
+        new Set(receiptIds).size !== receiptIds.length
+      ) {
+        return yield* directorError(
+          "checks-failed",
+          "Each check label and native toolCallId may be bound only once per request.",
+        );
+      }
+      for (const receipt of input.receipts) {
+        const checkRows = yield* persistence(
+          sql<Record<string, unknown>>`
+            SELECT review_id AS "reviewId", label, command, tool_call_id AS "toolCallId",
+              exit_code AS "exitCode", output, started_head AS "startedHead",
+              finished_head AS "finishedHead", started_clean AS "startedClean",
+              finished_clean AS "finishedClean", verification_status AS "verificationStatus",
+              verification_error AS "verificationError", created_at AS "createdAt"
+            FROM workflow_review_checks
+            WHERE review_id = ${reviewRow.reviewId} AND label = ${receipt.label} LIMIT 1
+          `,
+          "The registered check could not be read.",
+        );
+        if (!checkRows[0]) {
+          return yield* directorError(
+            "checks-failed",
+            `No registered check is named ${receipt.label}.`,
+          );
+        }
+        const check = yield* decodeCheckRow(checkRows[0]).pipe(
+          Effect.mapError((error) =>
+            directorError("persistence-failed", "The registered check is invalid.", String(error)),
+          ),
+        );
+        if (
+          check.verificationStatus === "passed" &&
+          check.toolCallId &&
+          check.toolCallId !== receipt.toolCallId
+        ) {
+          return yield* directorError(
+            "checks-failed",
+            `Check ${receipt.label} is already bound to a different native command receipt.`,
+          );
+        }
+        if (check.verificationStatus === "passed" && check.toolCallId === receipt.toolCallId) {
+          continue;
+        }
+        const observationRows = yield* persistence(
+          sql<Record<string, unknown>>`
+            SELECT lifecycle, command, cwd, status, exit_code AS "exitCode", output,
+              created_at AS "createdAt"
+            FROM workflow_native_command_observations
+            WHERE thread_id = ${row.threadId} AND provider_instance_id = ${providerInstanceId}
+              AND tool_call_id = ${receipt.toolCallId}
+              AND created_at > ${check.createdAt}
+            ORDER BY created_at
+          `,
+          "The native check receipt could not be read.",
+        );
+        const nativeRows = yield* Effect.forEach(observationRows, (candidate) =>
+          decodeNativeCommandRow(candidate),
+        ).pipe(
+          Effect.mapError((error) =>
+            directorError(
+              "persistence-failed",
+              "Native command evidence is invalid.",
+              String(error),
+            ),
+          ),
+        );
+        const started = nativeRows.find((candidate) => candidate.lifecycle === "started");
+        const completed = nativeRows.findLast((candidate) => candidate.lifecycle === "completed");
+        if (!started || !completed || started.createdAt > completed.createdAt) {
+          return yield* directorError(
+            "review-incomplete",
+            `Native start and completion for check ${receipt.label} are not both durably observed after registration.`,
+          );
+        }
+        const git = yield* gitObservation(row.worktreePath);
+        const exitCode = completed.exitCode;
+        const accepted =
+          started.command === check.command &&
+          completed.command === check.command &&
+          started.cwd === row.worktreePath &&
+          completed.cwd === row.worktreePath &&
+          completed.status === "completed" &&
+          exitCode === 0 &&
+          check.startedHead === reviewRow.implementationHead &&
+          check.startedClean === 1 &&
+          git.head === reviewRow.implementationHead &&
+          git.clean;
+        const verificationError = accepted
+          ? null
+          : started.command !== check.command || completed.command !== check.command
+            ? "The observed native command does not match the registered command."
+            : started.cwd !== row.worktreePath || completed.cwd !== row.worktreePath
+              ? "The observed native command ran outside the capability worktree."
+              : completed.status !== "completed" || exitCode === null
+                ? "The native command completion status or exit code is unknown."
+                : exitCode !== 0
+                  ? `The native command exited with code ${exitCode}.`
+                  : check.startedHead !== reviewRow.implementationHead ||
+                      git.head !== reviewRow.implementationHead
+                    ? "The implementation HEAD changed while checks ran."
+                    : "The capability worktree was dirty before or after the check.";
+        const updatedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* persistence(
+          sql`
+            UPDATE workflow_review_checks SET tool_call_id = ${receipt.toolCallId},
+              exit_code = ${exitCode}, output = ${completed.output},
+              finished_head = ${git.head}, finished_clean = ${git.clean ? 1 : 0},
+              verification_status = ${accepted ? "passed" : "failed"},
+              verification_error = ${verificationError}, native_started_at = ${started.createdAt},
+              native_completed_at = ${completed.createdAt},
+              updated_at = ${updatedAt}
+            WHERE review_id = ${reviewRow.reviewId} AND label = ${receipt.label}
+          `,
+          "The verified native check receipt could not be saved.",
+        );
+        yield* persistence(
+          sql`
+            DELETE FROM workflow_native_command_observations
+            WHERE thread_id = ${row.threadId} AND provider_instance_id = ${providerInstanceId}
+              AND tool_call_id = ${receipt.toolCallId}
+          `,
+          "The compacted native check observation could not be released.",
+        );
+        if (!accepted) {
+          yield* persistence(
+            sql`
+              UPDATE workflow_ticket_reviews SET status = 'checks-failed', updated_at = ${updatedAt}
+              WHERE review_id = ${reviewRow.reviewId}
+            `,
+            "The failed check state could not be saved.",
+          );
+        }
+      }
+      const review = yield* reviewStatusFromRow(yield* loadReview(row.directorId, input.reviewId));
+      const status = review.checks.every((check) => check.status === "passed")
+        ? reviewRow.status === "reported"
+          ? "reported"
+          : "prepared"
+        : review.checks.some((check) => check.status === "failed")
+          ? "checks-failed"
+          : "checks-pending";
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+          UPDATE workflow_ticket_reviews SET status = ${status}, updated_at = ${updatedAt}
+          WHERE review_id = ${review.reviewId}
+        `,
+        "The review check state could not be saved.",
+      );
+      return yield* reviewStatusFromRow(yield* loadReview(row.directorId, input.reviewId));
+    },
+  );
+
+  const associateTicketReviewUnlocked = Effect.fn("WorkflowDirectorService.associateTicketReview")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewAssociateInput,
+    ) {
+      const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const reviewRows = yield* persistence(
+        sql<{ readonly reviewId: string }>`
+        SELECT review_id AS "reviewId" FROM workflow_ticket_reviews
+        WHERE director_id = ${row.directorId} AND association_token = ${input.associationToken}
+        LIMIT 1
+      `,
+        "The review association token could not be read.",
+      );
+      if (!reviewRows[0]) {
+        return yield* directorError(
+          "review-incomplete",
+          "This review association token is unknown or belongs to another director.",
+        );
+      }
+      const reviewRow = yield* loadReview(row.directorId, reviewRows[0].reviewId);
+      if (reviewRow.providerThreadId) {
+        if (reviewRow.providerThreadId !== input.providerThreadId) {
+          return yield* directorError(
+            "review-incomplete",
+            "This review is already associated with another exact provider child.",
+          );
+        }
+        return yield* reviewStatusFromRow(reviewRow);
+      }
+      if (reviewRow.status !== "spawn-issued" && reviewRow.status !== "associated") {
+        return yield* directorError(
+          "checks-failed",
+          "A reviewer cannot be associated until every registered check is verified.",
+        );
+      }
+      const observationRows = yield* observations(row.directorId);
+      const observed = observationRows.find(
+        (candidate) => candidate.providerThreadId === input.providerThreadId,
+      );
+      const implementation = (yield* workers(row.directorId)).find(
+        (worker) => worker.dispatchId === reviewRow.implementationDispatchId,
+      );
+      if (
+        !observed ||
+        !implementation?.providerThreadId ||
+        input.providerThreadId === implementation.providerThreadId ||
+        observed.firstObservedAt < reviewRow.createdAt ||
+        observed.observedModel !== REVIEWER_MODEL ||
+        observed.observedEffort !== REVIEWER_EFFORT
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          `Review association requires a fresh exact ${REVIEWER_MODEL}/${REVIEWER_EFFORT} child observed under this director and distinct from its implementation worker.`,
+        );
+      }
+      const byId = new Map(
+        observationRows.map((observation) => [observation.providerThreadId, observation]),
+      );
+      let parentId = observed.parentProviderThreadId;
+      const visited = new Set<string>();
+      while (parentId) {
+        if (parentId === implementation.providerThreadId) {
+          return yield* directorError(
+            "review-incomplete",
+            "The review coordinator cannot be an implementation-worker descendant.",
+          );
+        }
+        if (visited.has(parentId)) {
+          return yield* directorError("review-incomplete", "The review ancestry is cyclic.");
+        }
+        visited.add(parentId);
+        parentId = byId.get(parentId)?.parentProviderThreadId ?? null;
+      }
+      const workerReuse = (yield* workers(row.directorId)).some(
+        (worker) => worker.dispatchId && worker.providerThreadId === input.providerThreadId,
+      );
+      const reviewReuse = yield* persistence(
+        sql<{ readonly reviewId: string }>`
+        SELECT review_id AS "reviewId" FROM workflow_ticket_reviews
+        WHERE director_id = ${row.directorId} AND provider_thread_id = ${input.providerThreadId}
+          AND review_id <> ${reviewRow.reviewId} LIMIT 1
+      `,
+        "Existing reviewer identities could not be read.",
+      );
+      if (workerReuse || reviewReuse[0]) {
+        return yield* directorError(
+          "review-incomplete",
+          "Reviewer identity must be fresh and independent of prior implementation or review work.",
+        );
+      }
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+        UPDATE workflow_ticket_reviews SET provider_thread_id = ${input.providerThreadId},
+          status = 'associated', updated_at = ${updatedAt}
+        WHERE review_id = ${reviewRow.reviewId}
+      `,
+        "The exact reviewer identity could not be saved.",
+      );
+      return yield* reviewStatusFromRow(yield* loadReview(row.directorId, reviewRow.reviewId));
+    },
+  );
+
+  const reportTicketReviewUnlocked = Effect.fn("WorkflowDirectorService.reportTicketReview")(
+    function* (
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      providerInstanceId: ProviderInstanceId,
+      input: WorkflowTicketReviewReportInput,
+    ) {
+      const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+      const reviewRows = yield* persistence(
+        sql<{ readonly reviewId: string }>`
+          SELECT review_id AS "reviewId" FROM workflow_ticket_reviews
+          WHERE director_id = ${row.directorId} AND provider_thread_id = ${input.providerThreadId}
+          LIMIT 1
+        `,
+        "The associated ticket review could not be read.",
+      );
+      if (!reviewRows[0]) {
+        return yield* directorError(
+          "review-incomplete",
+          "Report review evidence only for an explicitly associated reviewer.",
+        );
+      }
+      const reviewRow = yield* loadReview(row.directorId, reviewRows[0].reviewId);
+      if (reviewRow.status !== "associated" && reviewRow.status !== "reported") {
+        return yield* directorError("review-incomplete", "This reviewer is not ready to report.");
+      }
+      if (
+        input.standardsReviewerThreadId === input.specReviewerThreadId ||
+        input.standardsReviewerThreadId === input.providerThreadId ||
+        input.specReviewerThreadId === input.providerThreadId
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          "Standards and Spec require distinct fresh child reviewer identities.",
+        );
+      }
+      const findingIds = input.findings.map((finding) => finding.id);
+      if (new Set(findingIds).size !== findingIds.length) {
+        return yield* directorError("review-incomplete", "Review finding ids must be unique.");
+      }
+      const observationRows = yield* observations(row.directorId);
+      const byId = new Map(
+        observationRows.map((observation) => [observation.providerThreadId, observation]),
+      );
+      const standards = byId.get(input.standardsReviewerThreadId);
+      const spec = byId.get(input.specReviewerThreadId);
+      if (
+        !standards ||
+        !spec ||
+        standards.parentProviderThreadId !== input.providerThreadId ||
+        spec.parentProviderThreadId !== input.providerThreadId ||
+        standards.firstObservedAt < reviewRow.createdAt ||
+        spec.firstObservedAt < reviewRow.createdAt ||
+        standards.observedModel !== REVIEWER_MODEL ||
+        standards.observedEffort !== REVIEWER_EFFORT ||
+        spec.observedModel !== REVIEWER_MODEL ||
+        spec.observedEffort !== REVIEWER_EFFORT
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          "Both review axes must be fresh exact native children of this review coordinator.",
+        );
+      }
+      const implementationIds = new Set(
+        (yield* workers(row.directorId)).flatMap((worker) =>
+          worker.dispatchId && worker.providerThreadId ? [worker.providerThreadId] : [],
+        ),
+      );
+      if (
+        implementationIds.has(input.standardsReviewerThreadId) ||
+        implementationIds.has(input.specReviewerThreadId)
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          "Review axes cannot reuse implementation identities.",
+        );
+      }
+      const reusedAxes = yield* persistence(
+        sql<{ readonly providerThreadId: string }>`
+          SELECT a.provider_thread_id AS "providerThreadId" FROM workflow_review_axes a
+          JOIN workflow_ticket_reviews r ON r.review_id = a.review_id
+          WHERE r.director_id = ${row.directorId} AND a.review_id <> ${reviewRow.reviewId}
+            AND a.provider_thread_id IN (${input.standardsReviewerThreadId}, ${input.specReviewerThreadId})
+        `,
+        "Prior review axis identities could not be read.",
+      );
+      if (reusedAxes.length > 0) {
+        return yield* directorError(
+          "review-incomplete",
+          "Standards and Spec reviewer identities must be fresh for this implementation head.",
+        );
+      }
+      if (reviewRow.status === "reported") {
+        const existing = yield* reviewStatusFromRow(reviewRow);
+        const sameAxes =
+          existing.axes.some(
+            (axis) =>
+              axis.axis === "standards" &&
+              axis.providerThreadId === input.standardsReviewerThreadId,
+          ) &&
+          existing.axes.some(
+            (axis) => axis.axis === "spec" && axis.providerThreadId === input.specReviewerThreadId,
+          );
+        const sameFindings =
+          existing.findings.length === input.findings.length &&
+          existing.findings.every((finding) =>
+            input.findings.some(
+              (candidate) =>
+                candidate.id === finding.id &&
+                candidate.axis === finding.axis &&
+                candidate.severity === finding.severity &&
+                candidate.summary === finding.summary &&
+                (candidate.location ?? null) === finding.location,
+            ),
+          );
+        if (sameAxes && sameFindings && existing.summary === input.summary) return existing;
+        return yield* directorError(
+          "review-incomplete",
+          "This review already has different durable report evidence.",
+        );
+      }
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`
+              INSERT INTO workflow_review_axes (review_id, axis, provider_thread_id)
+              VALUES (${reviewRow.reviewId}, 'standards', ${input.standardsReviewerThreadId})
+            `;
+            yield* sql`
+              INSERT INTO workflow_review_axes (review_id, axis, provider_thread_id)
+              VALUES (${reviewRow.reviewId}, 'spec', ${input.specReviewerThreadId})
+            `;
+            for (const finding of input.findings) {
+              yield* sql`
+                INSERT INTO workflow_review_findings (
+                  review_id, finding_id, axis, severity, summary, location, updated_at
+                ) VALUES (
+                  ${reviewRow.reviewId}, ${finding.id}, ${finding.axis}, ${finding.severity},
+                  ${finding.summary}, ${finding.location ?? null}, ${updatedAt}
+                )
+              `;
+            }
+            yield* sql`
+              UPDATE workflow_ticket_reviews SET status = 'reported',
+                report_summary = ${input.summary}, updated_at = ${updatedAt}
+              WHERE review_id = ${reviewRow.reviewId}
+            `;
+          }),
+        ),
+        "The independent review report could not be saved.",
+      );
+      return yield* reviewStatusFromRow(yield* loadReview(row.directorId, reviewRow.reviewId));
+    },
+  );
+
+  const recordReviewDispositionsUnlocked = Effect.fn(
+    "WorkflowDirectorService.recordReviewDispositions",
+  )(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowReviewDispositionInput,
+  ) {
+    const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    const reviewRow = yield* loadReview(row.directorId, input.reviewId);
+    if (reviewRow.status !== "reported") {
+      return yield* directorError(
+        "review-incomplete",
+        "Director dispositions require a durable independent review report.",
+      );
+    }
+    const ids = input.dispositions.map((disposition) => disposition.findingId);
+    if (new Set(ids).size !== ids.length) {
+      return yield* directorError(
+        "review-incomplete",
+        "Each finding may be disposed once per request.",
+      );
+    }
+    const existing = yield* reviewStatusFromRow(reviewRow);
+    for (const disposition of input.dispositions) {
+      const finding = existing.findings.find((candidate) => candidate.id === disposition.findingId);
+      if (!finding) {
+        return yield* directorError(
+          "review-incomplete",
+          `Finding ${disposition.findingId} is not part of this review.`,
+        );
+      }
+      if (
+        finding.disposition &&
+        (finding.disposition.outcome !== disposition.outcome ||
+          finding.disposition.rationale !== disposition.rationale ||
+          finding.disposition.evidenceSource !== (disposition.evidenceSource ?? null) ||
+          finding.disposition.evidenceQuote !== (disposition.evidenceQuote ?? null) ||
+          finding.disposition.resultingReviewId !== (disposition.resultingReviewId ?? null))
+      ) {
+        return yield* directorError(
+          "review-incomplete",
+          `Finding ${disposition.findingId} already has a different durable disposition.`,
+        );
+      }
+      if (disposition.outcome === "fixed") {
+        if (
+          !disposition.resultingReviewId ||
+          disposition.resultingReviewId === reviewRow.reviewId
+        ) {
+          return yield* directorError(
+            "review-incomplete",
+            "A fixed finding requires a distinct later review of the resulting implementation head.",
+          );
+        }
+        const resultingRow = yield* loadReview(row.directorId, disposition.resultingReviewId);
+        const resulting = yield* reviewStatusFromRow(resultingRow);
+        if (
+          resulting.ticketNumber !== existing.ticketNumber ||
+          resultingRow.createdAt <= reviewRow.createdAt ||
+          resulting.implementationHead === existing.implementationHead ||
+          resulting.status !== "reported" ||
+          resulting.checks.length === 0 ||
+          !resulting.checks.every((check) => check.status === "passed") ||
+          resulting.axes.length !== 2
+        ) {
+          return yield* directorError(
+            "review-incomplete",
+            "The cited fix review must be a later independent review with verified checks on a changed head.",
+          );
+        }
+      } else if (disposition.resultingReviewId) {
+        return yield* directorError(
+          "review-incomplete",
+          "Only a fixed finding may cite a resulting review.",
+        );
+      }
+      if (disposition.outcome === "owner-accepted") {
+        if (!disposition.evidenceSource || !disposition.evidenceQuote) {
+          return yield* directorError(
+            "review-incomplete",
+            "Owner acceptance requires a durable user message source and retained quote.",
+          );
+        }
+        const message = yield* verifiedUserSourceMessage(disposition.evidenceSource);
+        if (
+          !message ||
+          !message.message.text.includes(disposition.evidenceQuote) ||
+          message.message.createdAt <= reviewRow.createdAt ||
+          !message.prompt ||
+          message.prompt.createdAt < reviewRow.createdAt ||
+          !message.prompt.text.includes(reviewRow.reviewId) ||
+          !message.prompt.text.includes(disposition.findingId)
+        ) {
+          return yield* directorError(
+            "review-incomplete",
+            "The cited owner reply must match its retained quote and follow the recorded decision prompt for this finding.",
+          );
+        }
+      } else if (disposition.evidenceSource || disposition.evidenceQuote) {
+        return yield* directorError(
+          "review-incomplete",
+          "Only owner acceptance may cite a user decision source.",
+        );
+      }
+    }
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql.withTransaction(
+        Effect.forEach(
+          input.dispositions,
+          (disposition) =>
+            sql`
+            UPDATE workflow_review_findings SET disposition = ${disposition.outcome},
+              disposition_rationale = ${disposition.rationale},
+              disposition_evidence_source = ${disposition.evidenceSource ?? null},
+              disposition_evidence_quote = ${disposition.evidenceQuote ?? null},
+              resulting_review_id = ${disposition.resultingReviewId ?? null},
+              updated_at = ${updatedAt}
+            WHERE review_id = ${reviewRow.reviewId} AND finding_id = ${disposition.findingId}
+          `,
+        ),
+      ),
+      "Director review dispositions could not be saved.",
+    );
+    return yield* reviewStatusFromRow(yield* loadReview(row.directorId, reviewRow.reviewId));
+  });
+
+  const resolveTicketUnlocked = Effect.fn("WorkflowDirectorService.resolveTicket")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowTicketResolveInput,
+  ) {
+    const row = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    const reviewRow = yield* loadReview(row.directorId, input.reviewId);
+    const review = yield* reviewStatusFromRow(reviewRow);
+    if (
+      review.status !== "reported" ||
+      review.checks.length === 0 ||
+      !review.checks.every((check) => check.status === "passed") ||
+      review.axes.length !== 2 ||
+      !review.axes.some((axis) => axis.axis === "standards") ||
+      !review.axes.some((axis) => axis.axis === "spec")
+    ) {
+      return yield* directorError(
+        "review-incomplete",
+        "Resolution requires verified checks and a durable independent Standards and Spec report.",
+      );
+    }
+    const unresolved = review.findings.filter((finding) => !finding.disposition);
+    const priorUnresolved = yield* persistence(
+      sql<{ readonly reviewId: string; readonly findingId: string }>`
+        SELECT f.review_id AS "reviewId", f.finding_id AS "findingId"
+        FROM workflow_review_findings f
+        JOIN workflow_ticket_reviews r ON r.review_id = f.review_id
+        WHERE r.director_id = ${row.directorId} AND r.ticket_number = ${review.ticketNumber}
+          AND r.created_at <= ${reviewRow.createdAt} AND f.disposition IS NULL
+      `,
+      "Prior review finding dispositions could not be read.",
+    );
+    if (unresolved.length > 0 || priorUnresolved.length > 0) {
+      return yield* directorError(
+        "review-incomplete",
+        "Every finding from this review history needs a separate director disposition before resolution.",
+        priorUnresolved.map((finding) => `${finding.reviewId}/${finding.findingId}`).join(", "),
+      );
+    }
+    const dispositionRows = yield* persistence(
+      sql<{ readonly reviewId: string }>`
+        SELECT DISTINCT f.review_id AS "reviewId"
+        FROM workflow_review_findings f
+        JOIN workflow_ticket_reviews r ON r.review_id = f.review_id
+        WHERE r.director_id = ${row.directorId} AND r.ticket_number = ${review.ticketNumber}
+          AND r.created_at <= ${reviewRow.createdAt} AND f.disposition IS NOT NULL
+        ORDER BY r.created_at
+      `,
+      "Review disposition evidence could not be read.",
+    );
+    for (const finding of review.findings) {
+      const disposition = finding.disposition!;
+      if (disposition.outcome === "fixed") {
+        if (!disposition.resultingReviewId) {
+          return yield* directorError(
+            "review-incomplete",
+            `Finding ${finding.id} has no resulting review evidence.`,
+          );
+        }
+        const resultingRow = yield* loadReview(row.directorId, disposition.resultingReviewId);
+        const resulting = yield* reviewStatusFromRow(resultingRow);
+        if (
+          resulting.ticketNumber !== review.ticketNumber ||
+          resultingRow.createdAt <= reviewRow.createdAt ||
+          resulting.implementationHead === review.implementationHead ||
+          resulting.status !== "reported" ||
+          resulting.checks.length === 0 ||
+          !resulting.checks.every((check) => check.status === "passed") ||
+          resulting.axes.length !== 2
+        ) {
+          return yield* directorError(
+            "review-incomplete",
+            `Finding ${finding.id} no longer has valid later review evidence.`,
+          );
+        }
+      }
+      if (disposition.outcome === "owner-accepted") {
+        if (!disposition.evidenceSource || !disposition.evidenceQuote) {
+          return yield* directorError(
+            "review-incomplete",
+            `Finding ${finding.id} has no owner decision evidence.`,
+          );
+        }
+        const message = yield* verifiedUserSourceMessage(disposition.evidenceSource);
+        if (
+          !message ||
+          !message.message.text.includes(disposition.evidenceQuote) ||
+          message.message.createdAt <= reviewRow.createdAt ||
+          !message.prompt ||
+          message.prompt.createdAt < reviewRow.createdAt ||
+          !message.prompt.text.includes(review.reviewId) ||
+          !message.prompt.text.includes(finding.id)
+        ) {
+          return yield* directorError(
+            "review-incomplete",
+            `Finding ${finding.id} no longer has a verified owner decision.`,
+          );
+        }
+      }
+    }
+    const currentWorkers = yield* workers(row.directorId);
+    const implementation = currentWorkers.find(
+      (worker) => worker.dispatchId === reviewRow.implementationDispatchId,
+    );
+    if (!implementation || implementation.writeReservation !== "released") {
+      return yield* directorError(
+        "review-incomplete",
+        "The implementation worker is still live, idle, or has unconfirmed descendants.",
+      );
+    }
+    const observationRows = yield* observations(row.directorId);
+    const coordinator = review.providerThreadId;
+    const coordinatorObservation = observationRows.find(
+      (observation) => observation.providerThreadId === coordinator,
+    );
+    if (!coordinator || coordinatorObservation?.nativeLifecycle !== "closed") {
+      return yield* directorError(
+        "review-incomplete",
+        "The review coordinator has not reached exact native closure.",
+      );
+    }
+    const byId = new Map(
+      observationRows.map((observation) => [observation.providerThreadId, observation]),
+    );
+    for (const observation of observationRows) {
+      let parentId = observation.parentProviderThreadId;
+      const visited = new Set<string>();
+      while (parentId) {
+        if (parentId === coordinator) {
+          if (observation.nativeLifecycle !== "closed") {
+            return yield* directorError(
+              "review-incomplete",
+              "A review descendant remains live or unconfirmed.",
+              observation.providerThreadId,
+            );
+          }
+          break;
+        }
+        if (visited.has(parentId)) {
+          return yield* directorError("review-incomplete", "Review ancestry is cyclic.");
+        }
+        visited.add(parentId);
+        parentId = byId.get(parentId)?.parentProviderThreadId ?? null;
+      }
+    }
+    yield* verifyGitRange(row.worktreePath, review.fixedBase, review.implementationHead);
+    const issue = yield* workflow.issueDetail({
+      projectId: ProjectId.make(row.projectId),
+      repository: row.repository as WorkflowIssueSummary["repository"],
+      number: review.ticketNumber,
+    });
+    if (issue.body !== reviewRow.scopeBody) {
+      return yield* directorError(
+        "stale-review",
+        "The ticket scope changed after review preparation and requires renewed approval and review.",
+      );
+    }
+
+    const existingIntentRows = yield* persistence(
+      sql<Record<string, unknown>>`
+        SELECT resolution_id AS "resolutionId", review_id AS "reviewId",
+          ticket_number AS "ticketNumber", final_head AS "finalHead",
+          comment_body AS "commentBody", status,
+          comment_url AS "commentUrl", frontier_json AS "frontierJson",
+          last_error AS "lastError", updated_at AS "updatedAt"
+        FROM workflow_ticket_resolution_intents WHERE review_id = ${review.reviewId} LIMIT 1
+      `,
+      "The ticket resolution intent could not be read.",
+    );
+    let resolutionRow: ResolutionRow;
+    if (existingIntentRows[0]) {
+      resolutionRow = yield* decodeResolutionRow(existingIntentRows[0]).pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "persistence-failed",
+            "The ticket resolution intent is invalid.",
+            String(error),
+          ),
+        ),
+      );
+    } else {
+      const admission = (yield* admissions(row.directorId)).find(
+        (candidate) => candidate.admissionId === review.admissionId,
+      );
+      if (!admission) {
+        return yield* directorError(
+          "review-incomplete",
+          "The reviewed ticket admission is missing.",
+        );
+      }
+      const admissionResult = yield* admitUnlocked({
+        projectId: ProjectId.make(row.projectId),
+        directorId: row.directorId,
+        repository: row.repository as WorkflowDirectorAdmissionInput["repository"],
+        ticketNumber: review.ticketNumber,
+        purpose: "review",
+        ownership: admission.ownership,
+      });
+      if (!admissionResult.admission || admissionResult.admission.claimStatus !== "confirmed") {
+        return yield* directorError(
+          "claim-failed",
+          "Ticket ownership must remain confirmed before resolution.",
+          admissionResult.message,
+        );
+      }
+      const resolutionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const commentBody = workflowTicketResolutionBody({
+        resolutionId,
+        repository: row.repository,
+        ticketNumber: review.ticketNumber,
+        review,
+        dispositionReviewIds: dispositionRows.map((candidate) => candidate.reviewId),
+      });
+      const createdAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+          INSERT INTO workflow_ticket_resolution_intents (
+            resolution_id, director_id, admission_id, review_id, repository, ticket_number,
+            scope_body, final_head, comment_body, status, created_at, updated_at
+          ) VALUES (
+            ${resolutionId}, ${row.directorId}, ${review.admissionId}, ${review.reviewId},
+            ${row.repository}, ${review.ticketNumber}, ${reviewRow.scopeBody},
+            ${review.implementationHead}, ${commentBody}, 'comment-pending', ${createdAt}, ${createdAt}
+          )
+        `,
+        "The pending ticket resolution could not be saved before its GitHub write.",
+      );
+      resolutionRow = {
+        resolutionId,
+        reviewId: review.reviewId,
+        ticketNumber: review.ticketNumber,
+        finalHead: review.implementationHead,
+        commentBody,
+        status: "comment-pending",
+        commentUrl: null,
+        frontierJson: null,
+        lastError: null,
+        updatedAt: createdAt,
+      };
+    }
+
+    const evidenceMarker = `workflow-resolution:${resolutionRow.resolutionId}`;
+    const matchingResolution = (detail: WorkflowIssueDetail) =>
+      detail.evidence?.records.find(
+        (record) =>
+          record.kind === "resolution" &&
+          record.state === "current" &&
+          record.scope === "current" &&
+          record.sourceAccess !== "unavailable" &&
+          record.outcome === "resolved" &&
+          record.bodyFingerprint === workflowEvidenceBodyFingerprint(resolutionRow.commentBody) &&
+          record.evidence?.includes(evidenceMarker),
+      );
+    let refreshed = issue;
+    let record = matchingResolution(refreshed);
+    const confirmResolutionAuthority = Effect.fn(
+      "WorkflowDirectorService.confirmResolutionAuthority",
+    )(function* () {
+      const admission = (yield* admissions(row.directorId)).find(
+        (candidate) => candidate.admissionId === review.admissionId,
+      );
+      if (!admission) {
+        return yield* directorError(
+          "review-incomplete",
+          "The reviewed ticket admission is missing.",
+        );
+      }
+      const result = yield* admitUnlocked({
+        projectId: ProjectId.make(row.projectId),
+        directorId: row.directorId,
+        repository: row.repository as WorkflowDirectorAdmissionInput["repository"],
+        ticketNumber: review.ticketNumber,
+        purpose: "review",
+        ownership: admission.ownership,
+      });
+      if (!result.admission || result.admission.claimStatus !== "confirmed") {
+        return yield* directorError(
+          "claim-failed",
+          "Current ticket ownership and readiness must be confirmed before a new GitHub write.",
+          result.message,
+        );
+      }
+    });
+    if (
+      resolutionRow.status === "comment-pending" ||
+      resolutionRow.status === "comment-uncertain"
+    ) {
+      if (refreshed.evidence?.historyComplete === false) {
+        return {
+          disposition: "pending",
+          resolution: resolutionStatusFromRow(resolutionRow),
+        } satisfies WorkflowTicketResolveResult;
+      }
+      if (!record && resolutionRow.status === "comment-uncertain") {
+        return {
+          disposition: "pending",
+          resolution: resolutionStatusFromRow(resolutionRow),
+        } satisfies WorkflowTicketResolveResult;
+      }
+      if (!record) {
+        yield* confirmResolutionAuthority();
+        const attemptedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* persistence(
+          sql`
+            UPDATE workflow_ticket_resolution_intents SET status = 'comment-uncertain',
+              updated_at = ${attemptedAt} WHERE resolution_id = ${resolutionRow.resolutionId}
+          `,
+          "The pending comment attempt could not be retained before its GitHub write.",
+        );
+        resolutionRow = { ...resolutionRow, status: "comment-uncertain", updatedAt: attemptedAt };
+        const comment = yield* executeGitHub(row.worktreePath, [
+          "issue",
+          "comment",
+          String(review.ticketNumber),
+          "--repo",
+          row.repository,
+          "--body",
+          resolutionRow.commentBody,
+        ]).pipe(Effect.result);
+        refreshed = yield* workflow.issueDetail({
+          projectId: ProjectId.make(row.projectId),
+          repository: row.repository as WorkflowIssueSummary["repository"],
+          number: review.ticketNumber,
+        });
+        record = matchingResolution(refreshed);
+        if (!record) {
+          const updatedAt = DateTime.formatIso(yield* DateTime.now);
+          const lastError =
+            comment._tag === "Failure"
+              ? comment.failure.message
+              : "GitHub did not return the persisted resolution evidence yet.";
+          yield* persistence(
+            sql`
+              UPDATE workflow_ticket_resolution_intents SET status = 'comment-uncertain',
+                last_error = ${lastError},
+                updated_at = ${updatedAt} WHERE resolution_id = ${resolutionRow.resolutionId}
+            `,
+            "The pending resolution result could not be retained.",
+          );
+          return {
+            disposition: "pending",
+            resolution: {
+              ...resolutionStatusFromRow(resolutionRow),
+              status: "comment-uncertain",
+              lastError,
+              updatedAt,
+            },
+          } satisfies WorkflowTicketResolveResult;
+        }
+      }
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+          UPDATE workflow_ticket_resolution_intents SET status = 'close-pending',
+            comment_url = ${record.url}, last_error = NULL, updated_at = ${updatedAt}
+          WHERE resolution_id = ${resolutionRow.resolutionId}
+        `,
+        "The reconciled resolution comment could not be saved.",
+      );
+      resolutionRow = {
+        ...resolutionRow,
+        status: "close-pending",
+        commentUrl: record.url,
+        updatedAt,
+      };
+    }
+
+    if (
+      resolutionRow.status === "close-uncertain" &&
+      (refreshed.state !== "closed" || refreshed.stateReason !== "completed")
+    ) {
+      return {
+        disposition: "pending",
+        resolution: resolutionStatusFromRow(resolutionRow),
+      } satisfies WorkflowTicketResolveResult;
+    }
+    if (refreshed.state !== "closed" || refreshed.stateReason !== "completed") {
+      yield* confirmResolutionAuthority();
+      const attemptedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* persistence(
+        sql`
+          UPDATE workflow_ticket_resolution_intents SET status = 'close-uncertain',
+            updated_at = ${attemptedAt} WHERE resolution_id = ${resolutionRow.resolutionId}
+        `,
+        "The pending closure attempt could not be retained before its GitHub write.",
+      );
+      resolutionRow = { ...resolutionRow, status: "close-uncertain", updatedAt: attemptedAt };
+      yield* executeGitHub(row.worktreePath, [
+        "issue",
+        "close",
+        String(review.ticketNumber),
+        "--repo",
+        row.repository,
+        "--reason",
+        "completed",
+      ]).pipe(Effect.result);
+    }
+    refreshed = yield* workflow.issueDetail({
+      projectId: ProjectId.make(row.projectId),
+      repository: row.repository as WorkflowIssueSummary["repository"],
+      number: review.ticketNumber,
+    });
+    record = matchingResolution(refreshed);
+    if (
+      refreshed.state !== "closed" ||
+      refreshed.stateReason !== "completed" ||
+      refreshed.readiness?.status !== "resolved" ||
+      !record
+    ) {
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      const lastError = "GitHub resolution closure is still unconfirmed.";
+      yield* persistence(
+        sql`
+          UPDATE workflow_ticket_resolution_intents SET last_error = ${lastError},
+            updated_at = ${updatedAt} WHERE resolution_id = ${resolutionRow.resolutionId}
+        `,
+        "The unconfirmed closure could not be retained.",
+      );
+      return {
+        disposition: "pending",
+        resolution: {
+          ...resolutionStatusFromRow(resolutionRow),
+          lastError,
+          updatedAt,
+        },
+      } satisfies WorkflowTicketResolveResult;
+    }
+    const frontier = yield* workflow.children({
+      projectId: ProjectId.make(row.projectId),
+      repository: row.repository as WorkflowIssueSummary["repository"],
+      parentNumber: row.capabilityNumber,
+    });
+    const readyIssueIds = frontier.frontier?.readyIssueIds ?? [];
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* persistence(
+      sql`
+        UPDATE workflow_ticket_resolution_intents SET status = 'resolved',
+          comment_url = ${record.url}, frontier_json = ${encodeStringArrayJson(readyIssueIds)},
+          last_error = NULL, updated_at = ${updatedAt}
+        WHERE resolution_id = ${resolutionRow.resolutionId}
+      `,
+      "The confirmed ticket resolution and refreshed frontier could not be saved.",
+    );
+    return {
+      disposition: "resolved",
+      resolution: {
+        ...resolutionStatusFromRow(resolutionRow),
+        status: "resolved",
+        commentUrl: record.url,
+        lastError: null,
+        readyIssueIds,
+        updatedAt,
+      },
+    } satisfies WorkflowTicketResolveResult;
+  });
+
   return WorkflowDirectorService.of({
     start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
     status: (input) => lock.withPermits(1)(statusUnlocked(input)),
@@ -2486,6 +4375,30 @@ export const make = Effect.gen(function* () {
     reportWorkerHandoff: (environmentId, threadId, providerInstanceId, input) =>
       lock.withPermits(1)(
         reportWorkerHandoffUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    prepareTicketReview: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        prepareTicketReviewUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    recordReviewChecks: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        recordReviewChecksUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    associateTicketReview: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        associateTicketReviewUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    reportTicketReview: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        reportTicketReviewUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    recordReviewDispositions: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        recordReviewDispositionsUnlocked(environmentId, threadId, providerInstanceId, input),
+      ),
+    resolveTicket: (environmentId, threadId, providerInstanceId, input) =>
+      lock.withPermits(1)(
+        resolveTicketUnlocked(environmentId, threadId, providerInstanceId, input),
       ),
   });
 });

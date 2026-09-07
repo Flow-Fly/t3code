@@ -4,11 +4,13 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeItemId,
   type ProviderRuntimeEvent,
   type ProviderSession,
   RuntimeTaskId,
   type OrchestrationCommand,
   type ServerProvider,
+  type ThreadId,
   type WorkflowIssueDetail,
   type WorkflowIssueSummary,
 } from "@t3tools/contracts";
@@ -21,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -50,8 +53,10 @@ import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { workflowDirectorHandlers } from "../mcp/toolkits/workflow/handlers.ts";
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
 import { recordWorkflowWorkerObservation } from "./WorkflowWorkerPersistence.ts";
+import { recordWorkflowCheckObservation } from "./WorkflowCheckObservation.ts";
 import {
   interpretWorkflowEvidence,
+  workflowEvidenceBodyFingerprint,
   type WorkflowBlockerEvidence,
   type WorkflowEvidenceComment,
 } from "./WorkflowEvidence.ts";
@@ -585,6 +590,39 @@ function reinterpretTicket(
     },
     approvalComments,
     ...(options.blockers ? { blockers: options.blockers } : {}),
+  });
+}
+
+function updateTicketEvidence(
+  ticket: WorkflowIssueDetail,
+  approvalComments: ReadonlyArray<WorkflowEvidenceComment>,
+  input: {
+    readonly assignees: ReadonlyArray<string>;
+    readonly comments?: ReadonlyArray<WorkflowEvidenceComment>;
+    readonly state?: "open" | "closed";
+  },
+) {
+  const state = input.state ?? "open";
+  Object.assign(ticket, {
+    state,
+    stateReason: state === "closed" ? "completed" : null,
+    ...interpretWorkflowEvidence({
+      issue: {
+        id: ticket.id,
+        url: ticket.url,
+        number: ticket.number,
+        title: ticket.title,
+        kind: ticket.kind,
+        state,
+        stateReason: state === "closed" ? "completed" : null,
+        labels: ticket.labels,
+        assignees: input.assignees,
+        body: ticket.body,
+        comments: input.comments ?? [],
+        reopenedAt: [],
+      },
+      approvalComments,
+    }),
   });
 }
 
@@ -2597,4 +2635,1032 @@ describe("WorkflowDirectorService", () => {
       expect(forgedParent._tag).toBe("Failure");
     }).pipe(Effect.provide(test.layer));
   });
+});
+
+describe("workflowTicketResolutionBody", () => {
+  it("keeps staffing limits outside the parsed completion evidence", () => {
+    const body = WorkflowDirectorService.workflowTicketResolutionBody({
+      resolutionId: "resolution-1",
+      repository,
+      ticketNumber: 18,
+      review: {
+        reviewId: "review-1",
+        admissionId: "admission-1",
+        ticketNumber: 18,
+        implementationProviderThreadId: "implementation-1",
+        fixedBase: "a".repeat(40),
+        implementationHead: "b".repeat(40),
+        status: "reported",
+        association: "associated",
+        providerThreadId: "review-coordinator",
+        parentProviderThreadId: "provider-director",
+        providerStatus: "idle",
+        settlementEvidence: "native-closed",
+        requestedProfile: {
+          model: "gpt-6-astra",
+          effort: "medium",
+          skillPath: "/skills/code-review/SKILL.md",
+        },
+        observedProfile: { model: null, effort: null, match: "unknown" },
+        checks: [
+          {
+            label: "focused tests",
+            command: "vp test run focused.test.ts",
+            toolCallId: "tool-1",
+            exitCode: 0,
+            output: "passed",
+            startedHead: "b".repeat(40),
+            finishedHead: "b".repeat(40),
+            startedClean: true,
+            finishedClean: true,
+            status: "passed",
+            verificationError: null,
+          },
+        ],
+        axes: [
+          {
+            axis: "standards",
+            providerThreadId: "standards-1",
+            parentProviderThreadId: "review-coordinator",
+            providerStatus: "idle",
+            settlementEvidence: "native-closed",
+            observedProfile: { model: null, effort: null, match: "unknown" },
+          },
+          {
+            axis: "spec",
+            providerThreadId: "spec-1",
+            parentProviderThreadId: "review-coordinator",
+            providerStatus: "idle",
+            settlementEvidence: "native-closed",
+            observedProfile: { model: null, effort: null, match: "unknown" },
+          },
+        ],
+        findings: [],
+        summary: "No findings.",
+        updatedAt: "2026-09-07T10:00:00.000Z",
+      },
+    });
+    const parsed = interpretWorkflowEvidence({
+      issue: {
+        id: "issue-18",
+        url: ticket.url,
+        number: ticket.number,
+        title: ticket.title,
+        kind: ticket.kind,
+        state: "closed",
+        stateReason: "completed",
+        labels: ticket.labels,
+        assignees: ["Flow-Fly"],
+        body: ticketDetail.body,
+        comments: [
+          {
+            id: "resolution-comment",
+            url: `${ticket.url}#issuecomment-resolution`,
+            body,
+            createdAt: "2026-09-07T10:00:00.000Z",
+            author: "Flow-Fly",
+            authorAssociation: "OWNER",
+          },
+        ],
+        reopenedAt: [],
+      },
+    });
+
+    expect(body).toContain("observed unavailable/unavailable");
+    expect(parsed.readiness.status).toBe("resolved");
+    expect(parsed.evidence.records[0]).toMatchObject({
+      sourceAccess: "reported",
+      scope: "current",
+      bodyFingerprint: workflowEvidenceBodyFingerprint(body),
+    });
+    expect(parsed.evidence.records[0]?.evidence).not.toContain("unavailable");
+  });
+});
+
+const reviewBase = "a".repeat(40);
+const reviewHead = "b".repeat(40);
+const encodeReviewStrings = Schema.encodeUnknownSync(
+  Schema.fromJsonString(Schema.Array(Schema.String)),
+);
+
+function reviewProcessRunner(
+  head = reviewHead,
+  clean = true,
+): ProcessRunner.ProcessRunner["Service"] {
+  return {
+    run: ({ args }) => {
+      if (args[0] === "remote") {
+        return Effect.succeed(processOutput(`fork\tgit@github.com:${repository}.git (fetch)\n`));
+      }
+      if (args[0] === "rev-parse") return Effect.succeed(processOutput(`${head}\n`));
+      if (args[0] === "status")
+        return Effect.succeed(processOutput(clean ? "" : " M changed.ts\n"));
+      return Effect.succeed(processOutput(""));
+    },
+  };
+}
+
+function claimTicket(
+  detail: WorkflowIssueDetail,
+  approvalComments: ReadonlyArray<WorkflowEvidenceComment>,
+) {
+  Object.assign(detail, reinterpretTicket(detail, approvalComments, { assignees: ["Flow-Fly"] }));
+}
+
+function seedReportedReview(
+  sql: SqlClient.SqlClient,
+  input: {
+    readonly directorId: string;
+    readonly batchId: string;
+    readonly ticketNumber: number;
+    readonly scopeBody: string;
+    readonly suffix: string;
+    readonly head?: string;
+    readonly checkStatus?: "pending" | "passed" | "failed";
+    readonly workerClosed?: boolean;
+    readonly unresolvedFinding?: boolean;
+    readonly createdAt?: string;
+    readonly admissionId?: string;
+  },
+) {
+  const head = input.head ?? reviewHead;
+  const checkStatus = input.checkStatus ?? "passed";
+  const workerClosed = input.workerClosed ?? true;
+  const admissionId = input.admissionId ?? `admission-${input.suffix}`;
+  const dispatchId = `dispatch-${input.suffix}`;
+  const workerId = `worker-${input.suffix}`;
+  const reviewId = `review-${input.suffix}`;
+  const coordinatorId = `reviewer-${input.suffix}`;
+  const standardsId = `standards-${input.suffix}`;
+  const specId = `spec-${input.suffix}`;
+  const createdAt = input.createdAt ?? "2026-09-07T09:03:00.000Z";
+  return Effect.gen(function* () {
+    if (!input.admissionId) {
+      yield* sql`
+        INSERT INTO workflow_director_admissions (
+          admission_id, director_id, batch_id, repository, ticket_id, ticket_number, slot_ticket_number,
+          purpose, ownership, claim_login, claim_status, created_at, updated_at
+        ) VALUES (
+          ${admissionId}, ${input.directorId}, ${input.batchId}, ${repository}, ${`ticket-${input.suffix}`}, ${input.ticketNumber},
+          ${input.ticketNumber}, 'implement', ${`ticket-${input.suffix}`}, 'Flow-Fly', 'confirmed',
+          '2026-09-07T09:00:00.000Z', '2026-09-07T09:00:00.000Z'
+        )
+      `;
+    }
+    yield* sql`
+      INSERT INTO workflow_worker_dispatches (
+        dispatch_id, association_token, director_id, batch_id, admission_id, repository,
+        ticket_number, ownership, write_paths_json, requested_model, requested_effort,
+        requested_skill_path, provider_thread_id, status, handoff_summary,
+        handoff_commits_json, handoff_checks_json, created_at, updated_at
+      ) VALUES (
+        ${dispatchId}, ${`worker-token-${input.suffix}`}, ${input.directorId}, ${input.batchId},
+        ${admissionId}, ${repository}, ${input.ticketNumber}, ${`ticket-${input.suffix}`},
+        ${encodeReviewStrings([`ticket-${input.suffix}`])}, 'gpt-5.6-sol', 'high',
+        '/skills/implement/SKILL.md', ${workerId}, 'reported-succeeded', 'Implemented.',
+        ${encodeReviewStrings([head])}, ${encodeReviewStrings(["focused"])},
+        '2026-09-07T09:01:00.000Z', '2026-09-07T09:01:00.000Z'
+      )
+    `;
+    yield* sql`
+      INSERT INTO workflow_worker_observations (
+        director_id, provider_thread_id, parent_provider_thread_id, observed_model,
+        observed_effort, provider_status, native_lifecycle, last_event_kind,
+        first_observed_at, updated_at
+      ) VALUES (
+        ${input.directorId}, ${workerId}, 'provider-director', 'gpt-5.6-sol', 'high',
+        ${workerClosed ? "interrupted" : "idle"}, ${workerClosed ? "closed" : null},
+        ${workerClosed ? "task.completed" : "task.updated"},
+        '2026-09-07T09:01:00.000Z', '2026-09-07T09:02:00.000Z'
+      )
+    `;
+    yield* sql`
+      INSERT INTO workflow_ticket_reviews (
+        review_id, association_token, director_id, batch_id, admission_id,
+        implementation_dispatch_id, repository, ticket_number, fixed_base,
+        implementation_head, scope_body, requested_model, requested_effort,
+        requested_skill_path, provider_thread_id, status, report_summary, created_at, updated_at
+      ) VALUES (
+        ${reviewId}, ${`review-token-${input.suffix}`}, ${input.directorId}, ${input.batchId},
+        ${admissionId}, ${dispatchId}, ${repository}, ${input.ticketNumber}, ${reviewBase}, ${head},
+        ${input.scopeBody}, 'gpt-6-astra', 'medium', '/skills/code-review/SKILL.md',
+        ${coordinatorId}, 'reported', 'Independent review completed.',
+        ${createdAt}, ${createdAt}
+      )
+    `;
+    yield* sql`
+      INSERT INTO workflow_review_checks (
+        review_id, label, command, tool_call_id, exit_code, output, started_head,
+        finished_head, started_clean, finished_clean, verification_status,
+        verification_error, native_started_at, native_completed_at, created_at, updated_at
+      ) VALUES (
+        ${reviewId}, 'focused', 'vp test run focused.test.ts', ${`tool-${input.suffix}`},
+        ${checkStatus === "pending" ? null : checkStatus === "passed" ? 0 : 1}, ${checkStatus}, ${head}, ${checkStatus === "pending" ? null : head}, 1, ${checkStatus === "pending" ? null : 1},
+        ${checkStatus}, ${checkStatus === "failed" ? "The native command exited with code 1." : null},
+        ${checkStatus === "pending" ? null : "2026-09-07T09:03:10.000Z"}, ${checkStatus === "pending" ? null : "2026-09-07T09:03:20.000Z"},
+        ${createdAt}, ${createdAt}
+      )
+    `;
+    for (const [providerThreadId, parentProviderThreadId] of [
+      [coordinatorId, "provider-director"],
+      [standardsId, coordinatorId],
+      [specId, coordinatorId],
+    ] as const) {
+      yield* sql`
+        INSERT INTO workflow_worker_observations (
+          director_id, provider_thread_id, parent_provider_thread_id, observed_model,
+          observed_effort, provider_status, native_lifecycle, last_event_kind,
+          first_observed_at, updated_at
+        ) VALUES (
+          ${input.directorId}, ${providerThreadId}, ${parentProviderThreadId},
+          'gpt-6-astra', 'medium', 'interrupted', 'closed', 'task.completed',
+          ${createdAt}, ${createdAt}
+        )
+      `;
+    }
+    yield* sql`
+      INSERT INTO workflow_review_axes (review_id, axis, provider_thread_id)
+      VALUES (${reviewId}, 'standards', ${standardsId}), (${reviewId}, 'spec', ${specId})
+    `;
+    if (input.unresolvedFinding) {
+      yield* sql`
+        INSERT INTO workflow_review_findings (
+          review_id, finding_id, axis, severity, summary, updated_at
+        ) VALUES (
+          ${reviewId}, 'finding-1', 'standards', 'high', 'A confirmed issue.',
+          ${createdAt}
+        )
+      `;
+    }
+    return { reviewId, admissionId };
+  });
+}
+
+function observeReviewCheck(input: {
+  readonly threadId: ThreadId;
+  readonly toolCallId: string;
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly startedAt?: string;
+  readonly completedAt?: string;
+  readonly status?: "completed" | "declined" | "failed" | "inProgress";
+  readonly exitCode?: number;
+}) {
+  const base = {
+    provider: ProviderDriverKind.make("codex"),
+    providerInstanceId: instanceId,
+    threadId: input.threadId,
+    itemId: RuntimeItemId.make(input.toolCallId),
+  } as const;
+  const command = input.command ?? "vp test run focused.test.ts";
+  const cwd = input.cwd ?? "/tmp/t3code-workflow-17";
+  return Effect.gen(function* () {
+    yield* recordWorkflowCheckObservation({
+      ...base,
+      type: "item.started",
+      eventId: EventId.make(`${input.toolCallId}-started`),
+      createdAt: input.startedAt ?? "2026-09-07T09:04:00.000Z",
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        data: { item: { type: "commandExecution", command, cwd } },
+      },
+    });
+    yield* recordWorkflowCheckObservation({
+      ...base,
+      type: "item.completed",
+      eventId: EventId.make(`${input.toolCallId}-completed`),
+      createdAt: input.completedAt ?? "2026-09-07T09:04:10.000Z",
+      payload: {
+        itemType: "command_execution",
+        status: input.status ?? "completed",
+        data: {
+          item: {
+            type: "commandExecution",
+            command,
+            cwd,
+            status: input.status ?? "completed",
+            ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+            aggregatedOutput: "focused output",
+          },
+        },
+      },
+    });
+  });
+}
+
+describe("delivery ticket review resolution", () => {
+  it.effect(
+    "binds only post-registration native check receipts and retains explicit verification verdicts",
+    () => {
+      const fixture = interpretedCapabilityFixture(7);
+      const test = harness({
+        ...fixture,
+        processRunner: reviewProcessRunner(),
+        githubExecute: ({ args }) =>
+          Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        for (const detail of fixture.ticketDetails) {
+          claimTicket(detail, [fixture.source, fixture.breakdownRecord]);
+        }
+        const sql = yield* SqlClient.SqlClient;
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const scenarios = [
+          {
+            suffix: "crossing",
+            startedAt: "2026-09-07T09:02:59.000Z",
+            completedAt: "2026-09-07T09:04:00.000Z",
+          },
+          { suffix: "command", command: "vp test run another.test.ts", exitCode: 0 },
+          { suffix: "cwd", cwd: "/tmp/elsewhere", exitCode: 0 },
+          { suffix: "exit", exitCode: 1 },
+          { suffix: "unknown" },
+          { suffix: "success", exitCode: 0 },
+        ] as const;
+        const outcomes = [];
+        for (const [index, scenario] of scenarios.entries()) {
+          const seeded = yield* seedReportedReview(sql, {
+            directorId: started.director.directorId,
+            batchId: started.director.batchId,
+            ticketNumber: fixture.ticketDetails[index]!.number,
+            scopeBody: fixture.ticketDetails[index]!.body,
+            suffix: scenario.suffix,
+            checkStatus: "pending",
+          });
+          const toolCallId = `native-${scenario.suffix}`;
+          yield* observeReviewCheck({
+            threadId: started.director.threadId,
+            toolCallId,
+            cwd: started.director.worktreePath,
+            ...scenario,
+          });
+          outcomes.push(
+            yield* workflowDirectorHandlers
+              .workflow_record_review_checks({
+                reviewId: seeded.reviewId,
+                receipts: [{ label: "focused", toolCallId }],
+              })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                Effect.result,
+              ),
+          );
+        }
+
+        expect(outcomes[0]?._tag).toBe("Failure");
+        expect(
+          outcomes
+            .slice(1)
+            .map((outcome) =>
+              outcome._tag === "Success" ? outcome.success.checks[0]?.status : null,
+            ),
+        ).toEqual(["failed", "failed", "failed", "failed", "passed"]);
+
+        const wrongCommand = outcomes[1]!;
+        if (wrongCommand._tag === "Failure") return yield* wrongCommand.failure;
+        const prepared = yield* workflowDirectorHandlers
+          .workflow_prepare_ticket_review({
+            ticketNumber: wrongCommand.success.ticketNumber,
+            implementationProviderThreadId: wrongCommand.success.implementationProviderThreadId,
+            fixedBase: wrongCommand.success.fixedBase,
+            implementationHead: wrongCommand.success.implementationHead,
+            checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(prepared.disposition).toBe("held");
+        expect(prepared.review.status).toBe("checks-failed");
+        const resolve = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: wrongCommand.success.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(resolve._tag).toBe("Failure");
+
+        const successful = outcomes[5]!;
+        if (successful._tag === "Failure") return yield* successful.failure;
+        const recovered = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: successful.success.reviewId,
+            receipts: [{ label: "focused", toolCallId: "native-success" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(recovered.checks[0]).toMatchObject({
+          status: "passed",
+          toolCallId: "native-success",
+          startedHead: reviewHead,
+          finishedHead: reviewHead,
+        });
+        expect(recovered.status).toBe("reported");
+        const receiptRetryResolution = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: recovered.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(receiptRetryResolution._tag).toBe("Success");
+
+        const launch = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: fixture.ticketDetails[6]!.number,
+          scopeBody: fixture.ticketDetails[6]!.body,
+          suffix: "launch",
+        });
+        yield* sql`DELETE FROM workflow_review_axes WHERE review_id = ${launch.reviewId}`;
+        yield* sql`
+          UPDATE workflow_ticket_reviews SET status = 'prepared', provider_thread_id = NULL
+          WHERE review_id = ${launch.reviewId}
+        `;
+        const launchInput = {
+          ticketNumber: fixture.ticketDetails[6]!.number,
+          implementationProviderThreadId: "worker-launch",
+          fixedBase: reviewBase,
+          implementationHead: reviewHead,
+          checks: [{ label: "focused", command: "vp test run focused.test.ts" }],
+        } as const;
+        const issued = yield* workflowDirectorHandlers
+          .workflow_prepare_ticket_review(launchInput)
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        const retried = yield* workflowDirectorHandlers
+          .workflow_prepare_ticket_review(launchInput)
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(issued).toMatchObject({
+          disposition: "prepared",
+          review: { status: "spawn-issued" },
+        });
+        expect(retried).toMatchObject({
+          disposition: "held",
+          associationToken: issued.associationToken,
+          review: { status: "spawn-issued", providerThreadId: null },
+        });
+        expect(retried.instructions).toContain("do not spawn a duplicate");
+        const associated = yield* workflowDirectorHandlers
+          .workflow_associate_ticket_review({
+            associationToken: issued.associationToken,
+            providerThreadId: "reviewer-launch",
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(associated.status).toBe("associated");
+        const reported = yield* workflowDirectorHandlers
+          .workflow_report_ticket_review({
+            providerThreadId: "reviewer-launch",
+            standardsReviewerThreadId: "standards-launch",
+            specReviewerThreadId: "spec-launch",
+            summary: "Fresh independent Standards and Spec review completed.",
+            findings: [
+              {
+                id: "finding-launch",
+                axis: "standards",
+                severity: "low",
+                summary: "A checked non-blocking observation.",
+              },
+            ],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(reported).toMatchObject({ status: "reported", findings: [{ disposition: null }] });
+        const associatedAgain = yield* workflowDirectorHandlers
+          .workflow_associate_ticket_review({
+            associationToken: issued.associationToken,
+            providerThreadId: "reviewer-launch",
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(associatedAgain.status).toBe("reported");
+        const changedReport = yield* workflowDirectorHandlers
+          .workflow_report_ticket_review({
+            providerThreadId: "reviewer-launch",
+            standardsReviewerThreadId: "standards-launch",
+            specReviewerThreadId: "spec-launch",
+            summary: "Fresh independent Standards and Spec review completed.",
+            findings: [
+              {
+                id: "finding-launch",
+                axis: "standards",
+                severity: "high",
+                summary: "A changed report must not replace durable evidence.",
+              },
+            ],
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(changedReport._tag).toBe("Failure");
+        const disposed = yield* workflowDirectorHandlers
+          .workflow_record_review_dispositions({
+            reviewId: reported.reviewId,
+            dispositions: [
+              {
+                findingId: "finding-launch",
+                outcome: "dismissed",
+                rationale: "Source validation confirms this is not a blocker.",
+              },
+            ],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(disposed.findings[0]?.disposition?.outcome).toBe("dismissed");
+        const handlerResolution = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: reported.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(handlerResolution._tag).toBe("Success");
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("holds failed checks, unresolved findings, idle workers and stale review heads", () => {
+    const fixture = interpretedCapabilityFixture(4);
+    const test = harness({
+      ...fixture,
+      processRunner: reviewProcessRunner(),
+      githubExecute: ({ args }) =>
+        Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      for (const detail of fixture.ticketDetails) {
+        claimTicket(detail, [fixture.source, fixture.breakdownRecord]);
+      }
+      const sql = yield* SqlClient.SqlClient;
+      const cases = [
+        { suffix: "failed", checkStatus: "failed" as const },
+        { suffix: "finding", unresolvedFinding: true },
+        { suffix: "idle", workerClosed: false },
+        { suffix: "stale", head: "c".repeat(40) },
+      ];
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const results = [];
+      for (const [index, scenario] of cases.entries()) {
+        const seeded = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: fixture.ticketDetails[index]!.number,
+          scopeBody: fixture.ticketDetails[index]!.body,
+          ...scenario,
+        });
+        results.push(
+          yield* workflowDirectorHandlers
+            .workflow_resolve_ticket({ reviewId: seeded.reviewId })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.result,
+            ),
+        );
+      }
+      expect(results.map((result) => result._tag)).toEqual([
+        "Failure",
+        "Failure",
+        "Failure",
+        "Failure",
+      ]);
+      expect(
+        results.map((result) =>
+          result._tag === "Failure" && "failure" in result.failure ? result.failure.failure : null,
+        ),
+      ).toEqual(["review-incomplete", "review-incomplete", "review-incomplete", "stale-review"]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect(
+    "rejects receipts when the registered head changes or the worktree becomes dirty",
+    () => {
+      const fixture = interpretedCapabilityFixture(2);
+      let currentHead = reviewHead;
+      let clean = true;
+      const test = harness({
+        ...fixture,
+        processRunner: {
+          run: ({ args }) => {
+            if (args[0] === "remote") {
+              return Effect.succeed(
+                processOutput(`fork\tgit@github.com:${repository}.git (fetch)\n`),
+              );
+            }
+            if (args[0] === "rev-parse") return Effect.succeed(processOutput(`${currentHead}\n`));
+            if (args[0] === "status")
+              return Effect.succeed(processOutput(clean ? "" : " M file.ts\n"));
+            return Effect.succeed(processOutput(""));
+          },
+        },
+        githubExecute: ({ args }) =>
+          Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        for (const detail of fixture.ticketDetails) {
+          claimTicket(detail, [fixture.source, fixture.breakdownRecord]);
+        }
+        const sql = yield* SqlClient.SqlClient;
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const reviews = [];
+        for (const [index, suffix] of ["changed-head", "dirty"].entries()) {
+          reviews.push(
+            yield* seedReportedReview(sql, {
+              directorId: started.director.directorId,
+              batchId: started.director.batchId,
+              ticketNumber: fixture.ticketDetails[index]!.number,
+              scopeBody: fixture.ticketDetails[index]!.body,
+              suffix,
+              checkStatus: "pending",
+            }),
+          );
+          yield* observeReviewCheck({
+            threadId: started.director.threadId,
+            toolCallId: `native-${suffix}`,
+            cwd: started.director.worktreePath,
+            exitCode: 0,
+          });
+        }
+
+        currentHead = "c".repeat(40);
+        const changedHead = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: reviews[0]!.reviewId,
+            receipts: [{ label: "focused", toolCallId: "native-changed-head" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        currentHead = reviewHead;
+        clean = false;
+        const dirty = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: reviews[1]!.reviewId,
+            receipts: [{ label: "focused", toolCallId: "native-dirty" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+
+        expect(changedHead.checks[0]).toMatchObject({
+          status: "failed",
+          verificationError: "The implementation HEAD changed while checks ran.",
+        });
+        expect(dirty.checks[0]).toMatchObject({
+          status: "failed",
+          verificationError: "The capability worktree was dirty before or after the check.",
+        });
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("requires later review evidence for fixes and a contextual owner user decision", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const test = harness({
+      ...fixture,
+      processRunner: reviewProcessRunner(),
+      threadDetail: () =>
+        Effect.succeed(
+          Option.some({
+            messages: [
+              {
+                id: "decision-prompt",
+                role: "assistant",
+                text: "Should this risk be accepted?",
+                createdAt: "2026-09-07T09:04:00.000Z",
+              },
+              {
+                id: "assistant-decision",
+                role: "assistant",
+                text: "Accept the risk.",
+                createdAt: "2026-09-07T09:05:00.000Z",
+              },
+              {
+                id: "contextual-prompt",
+                role: "assistant",
+                text: "Decision requested for review-disposition finding-1: accept this low risk?",
+                createdAt: "2026-09-07T09:06:00.000Z",
+              },
+              {
+                id: "owner-decision",
+                role: "user",
+                text: "I accept this low risk for the current delivery.",
+                createdAt: "2026-09-07T09:07:00.000Z",
+              },
+            ],
+          } as never),
+        ),
+      githubExecute: ({ args }) =>
+        Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      claimTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord]);
+      const sql = yield* SqlClient.SqlClient;
+      const seeded = yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: fixture.ticketDetails[0]!.number,
+        scopeBody: fixture.ticketDetails[0]!.body,
+        suffix: "disposition",
+        unresolvedFinding: true,
+      });
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const fixed = yield* workflowDirectorHandlers
+        .workflow_record_review_dispositions({
+          reviewId: seeded.reviewId,
+          dispositions: [
+            {
+              findingId: "finding-1",
+              outcome: "fixed",
+              rationale: "Claimed fixed without a changed-head review.",
+              resultingReviewId: seeded.reviewId,
+            },
+          ],
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.result,
+        );
+      const ownerAccepted = yield* workflowDirectorHandlers
+        .workflow_record_review_dispositions({
+          reviewId: seeded.reviewId,
+          dispositions: [
+            {
+              findingId: "finding-1",
+              outcome: "owner-accepted",
+              rationale: "The director cites an assistant message.",
+              evidenceSource: `T3 Code thread \`owner-thread\`, user message \`assistant-decision\`.`,
+              evidenceQuote: "Accept the risk.",
+            },
+          ],
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.result,
+        );
+      expect(fixed._tag).toBe("Failure");
+      expect(ownerAccepted._tag).toBe("Failure");
+      const confirmed = yield* workflowDirectorHandlers
+        .workflow_record_review_dispositions({
+          reviewId: seeded.reviewId,
+          dispositions: [
+            {
+              findingId: "finding-1",
+              outcome: "owner-accepted",
+              rationale: "The owner accepted the remaining low risk.",
+              evidenceSource: `T3 Code thread \`owner-thread\`, user message \`owner-decision\`.`,
+              evidenceQuote: "I accept this low risk for the current delivery.",
+            },
+          ],
+        })
+        .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+      expect(confirmed.findings[0]?.disposition).toMatchObject({
+        outcome: "owner-accepted",
+        evidenceQuote: "I accept this low risk for the current delivery.",
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect(
+    "reconciles uncertain writes, revalidates authority and advances only the live frontier",
+    () => {
+      const fixture = interpretedCapabilityFixture(3);
+      const ticket = fixture.ticketDetails[0]!;
+      let claimLogin = "Flow-Fly";
+      let commentWrites = 0;
+      let closeWrites = 0;
+      let pendingBody: string | null = null;
+      const resolutionComments: WorkflowEvidenceComment[] = [];
+      const approvals = [fixture.source, fixture.breakdownRecord];
+      const test = harness({
+        ...fixture,
+        processRunner: reviewProcessRunner(),
+        githubExecute: ({ args }) => {
+          if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+          if (args[0] === "issue" && args[1] === "view") {
+            return Effect.succeed(output(`${claimLogin}\n`));
+          }
+          if (args[0] === "issue" && args[1] === "comment") {
+            commentWrites += 1;
+            pendingBody = args[args.indexOf("--body") + 1] ?? null;
+            return Effect.succeed(output("comment accepted without a readable response\n"));
+          }
+          if (args[0] === "issue" && args[1] === "close") {
+            closeWrites += 1;
+            updateTicketEvidence(ticket, approvals, {
+              assignees: ["Flow-Fly"],
+              comments: resolutionComments,
+              state: "closed",
+            });
+            return Effect.succeed(output("closed\n"));
+          }
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        updateTicketEvidence(ticket, approvals, { assignees: ["Flow-Fly"] });
+        updateTicketEvidence(fixture.ticketDetails[2]!, approvals, { assignees: ["Other"] });
+        const sql = yield* SqlClient.SqlClient;
+        const seeded = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: ticket.number,
+          scopeBody: ticket.body,
+          suffix: "resolution",
+        });
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const resolve = () =>
+          workflowDirectorHandlers
+            .workflow_resolve_ticket({ reviewId: seeded.reviewId })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.result,
+            );
+
+        const first = yield* resolve();
+        Object.assign(ticket, {
+          evidence: ticket.evidence
+            ? { ...ticket.evidence, historyComplete: false }
+            : ticket.evidence,
+        });
+        const second = yield* resolve();
+        expect(first._tag).toBe("Success");
+        expect(second._tag).toBe("Success");
+        expect(commentWrites).toBe(1);
+        expect(closeWrites).toBe(0);
+        expect(pendingBody).not.toBeNull();
+
+        resolutionComments.push({
+          id: "resolution-readback",
+          url: `${ticket.url}#issuecomment-resolution-readback`,
+          body: pendingBody!,
+          createdAt: "2026-09-07T10:00:00.000Z",
+          author: "Flow-Fly",
+          authorAssociation: "OWNER",
+        });
+        claimLogin = "Other";
+        updateTicketEvidence(ticket, approvals, {
+          assignees: ["Other"],
+          comments: resolutionComments,
+        });
+        const lostAuthority = yield* resolve();
+        expect(lostAuthority._tag).toBe("Failure");
+        expect(closeWrites).toBe(0);
+
+        claimLogin = "Flow-Fly";
+        updateTicketEvidence(ticket, approvals, {
+          assignees: ["Flow-Fly"],
+          comments: resolutionComments,
+        });
+        const final = yield* resolve();
+        if (final._tag === "Failure") return yield* final.failure;
+        expect(final.success.disposition).toBe("resolved");
+        expect(final.success.resolution.readyIssueIds).toEqual([fixture.ticketDetails[1]!.id]);
+        expect(commentWrites).toBe(1);
+        expect(closeWrites).toBe(1);
+
+        const rows = yield* sql<{ readonly commentBody: string; readonly status: string }>`
+          SELECT comment_body AS "commentBody", status
+          FROM workflow_ticket_resolution_intents WHERE review_id = ${seeded.reviewId}
+        `;
+        expect(rows[0]).toEqual({ commentBody: pendingBody, status: "resolved" });
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect(
+    "carries prior findings into a corrected-head review until their fixes are evidenced",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const test = harness({
+        ...fixture,
+        processRunner: reviewProcessRunner("c".repeat(40)),
+        githubExecute: ({ args }) =>
+          Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        claimTicket(fixture.ticketDetails[0]!, [fixture.source, fixture.breakdownRecord]);
+        const sql = yield* SqlClient.SqlClient;
+        const first = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          scopeBody: fixture.ticketDetails[0]!.body,
+          suffix: "review-a",
+          head: reviewHead,
+          unresolvedFinding: true,
+          createdAt: "2026-09-07T09:03:00.000Z",
+        });
+        const second = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          scopeBody: fixture.ticketDetails[0]!.body,
+          suffix: "review-b",
+          admissionId: first.admissionId,
+          head: "c".repeat(40),
+          createdAt: "2026-09-07T09:06:00.000Z",
+        });
+        const invocation: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          threadId: started.director.threadId,
+          providerInstanceId: instanceId,
+          providerSessionId: "provider-session-director",
+          capabilities: new Set(["preview"]),
+          issuedAt: 1,
+        };
+        const before = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: second.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(before._tag).toBe("Failure");
+
+        const disposition = yield* workflowDirectorHandlers
+          .workflow_record_review_dispositions({
+            reviewId: first.reviewId,
+            dispositions: [
+              {
+                findingId: "finding-1",
+                outcome: "fixed",
+                rationale: "The corrected head received a fresh independent review.",
+                resultingReviewId: second.reviewId,
+              },
+            ],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(disposition.findings[0]?.disposition).toMatchObject({
+          outcome: "fixed",
+          resultingReviewId: second.reviewId,
+        });
+
+        const after = yield* workflowDirectorHandlers
+          .workflow_resolve_ticket({ reviewId: second.reviewId })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(after._tag).toBe("Success");
+        if (after._tag === "Success") expect(after.success.disposition).toBe("pending");
+        const resolution = yield* sql<{ readonly body: string }>`
+        SELECT comment_body AS body FROM workflow_ticket_resolution_intents
+        WHERE review_id = ${second.reviewId}
+      `;
+        expect(resolution[0]?.body).toContain(`workflow-review:${first.reviewId}/dispositions`);
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
 });

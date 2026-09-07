@@ -37,6 +37,19 @@ descendant close. An idle or finished turn, a handoff alone, or a child with an 
 keeps overlapping work held. Later execution or status activity makes stale close evidence
 inapplicable; metadata-only updates preserve it.
 
+After a successful implementation handoff, the director registers the agreed checks against the
+exact committed head. Run those commands through Codex normally so any provider approval still
+applies; Workflow accepts only the matching native command start and completion from the capability
+worktree. It then prepares a fresh Astra/medium review with separate Standards and Spec reviewers.
+Workflow keeps their exact identities, findings and the director's later dispositions beside the
+worker history. A changed head, failed or unobserved check, idle child, live review descendant, or
+undisposed finding prevents resolution.
+
+Resolving a ticket writes a versioned GitHub evidence comment before closing it, confirms both from
+fresh tracker data, and refreshes the capability frontier. If a write result is uncertain, the
+resolution stays pending. Retry it to reconcile the same evidence record; Workflow does not infer
+completion from a label or closed issue alone.
+
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the
 GitHub assignment; it does not stop another agent or make the assignment an atomic lock.

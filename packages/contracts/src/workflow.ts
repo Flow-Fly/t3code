@@ -149,6 +149,7 @@ export const WorkflowEvidenceRecord = Schema.Struct({
     Schema.Literals(["resolved", "cancelled", "out-of-scope", "cleared", "scope-change"]),
   ),
   evidence: Schema.optionalKey(TrimmedNonEmptyString),
+  bodyFingerprint: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type WorkflowEvidenceRecord = typeof WorkflowEvidenceRecord.Type;
 
@@ -448,6 +449,111 @@ export const WorkflowWorkerStatus = Schema.Struct({
 });
 export type WorkflowWorkerStatus = typeof WorkflowWorkerStatus.Type;
 
+export const WorkflowReviewCheckInput = Schema.Struct({
+  label: TrimmedNonEmptyString,
+  command: TrimmedNonEmptyString,
+});
+export type WorkflowReviewCheckInput = typeof WorkflowReviewCheckInput.Type;
+
+export const WorkflowReviewCheck = Schema.Struct({
+  label: TrimmedNonEmptyString,
+  command: TrimmedNonEmptyString,
+  toolCallId: Schema.NullOr(TrimmedNonEmptyString),
+  exitCode: Schema.NullOr(Schema.Number),
+  output: Schema.String,
+  startedHead: TrimmedNonEmptyString,
+  finishedHead: Schema.NullOr(TrimmedNonEmptyString),
+  startedClean: Schema.Boolean,
+  finishedClean: Schema.NullOr(Schema.Boolean),
+  status: Schema.Literals(["pending", "passed", "failed"]),
+  verificationError: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type WorkflowReviewCheck = typeof WorkflowReviewCheck.Type;
+
+export const WorkflowReviewAxis = Schema.Literals(["standards", "spec"]);
+export type WorkflowReviewAxis = typeof WorkflowReviewAxis.Type;
+
+export const WorkflowReviewFindingSeverity = Schema.Literals(["critical", "high", "medium", "low"]);
+export type WorkflowReviewFindingSeverity = typeof WorkflowReviewFindingSeverity.Type;
+
+export const WorkflowReviewFindingDisposition = Schema.Struct({
+  outcome: Schema.Literals(["fixed", "dismissed", "owner-accepted"]),
+  rationale: TrimmedNonEmptyString,
+  evidenceSource: Schema.NullOr(TrimmedNonEmptyString),
+  evidenceQuote: Schema.NullOr(TrimmedNonEmptyString),
+  resultingReviewId: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type WorkflowReviewFindingDisposition = typeof WorkflowReviewFindingDisposition.Type;
+
+export const WorkflowReviewFinding = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  axis: WorkflowReviewAxis,
+  severity: WorkflowReviewFindingSeverity,
+  summary: TrimmedNonEmptyString,
+  location: Schema.NullOr(TrimmedNonEmptyString),
+  disposition: Schema.NullOr(WorkflowReviewFindingDisposition),
+});
+export type WorkflowReviewFinding = typeof WorkflowReviewFinding.Type;
+
+export const WorkflowReviewIdentity = Schema.Struct({
+  axis: WorkflowReviewAxis,
+  providerThreadId: TrimmedNonEmptyString,
+  parentProviderThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  providerStatus: TrimmedNonEmptyString,
+  settlementEvidence: Schema.NullOr(Schema.Literal("native-closed")),
+  observedProfile: WorkflowWorkerObservedProfile,
+});
+export type WorkflowReviewIdentity = typeof WorkflowReviewIdentity.Type;
+
+export const WorkflowTicketReviewStatus = Schema.Struct({
+  reviewId: TrimmedNonEmptyString,
+  admissionId: TrimmedNonEmptyString,
+  ticketNumber: PositiveInt,
+  implementationProviderThreadId: TrimmedNonEmptyString,
+  fixedBase: TrimmedNonEmptyString,
+  implementationHead: TrimmedNonEmptyString,
+  status: Schema.Literals([
+    "checks-pending",
+    "checks-failed",
+    "prepared",
+    "spawn-issued",
+    "associated",
+    "reported",
+  ]),
+  association: Schema.Literals(["associated", "unconfirmed"]),
+  providerThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  parentProviderThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  providerStatus: TrimmedNonEmptyString,
+  settlementEvidence: Schema.NullOr(Schema.Literal("native-closed")),
+  requestedProfile: WorkflowWorkerRequestedProfile,
+  observedProfile: WorkflowWorkerObservedProfile,
+  checks: Schema.Array(WorkflowReviewCheck),
+  axes: Schema.Array(WorkflowReviewIdentity),
+  findings: Schema.Array(WorkflowReviewFinding),
+  summary: Schema.NullOr(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+export type WorkflowTicketReviewStatus = typeof WorkflowTicketReviewStatus.Type;
+
+export const WorkflowTicketResolutionStatus = Schema.Struct({
+  resolutionId: TrimmedNonEmptyString,
+  reviewId: TrimmedNonEmptyString,
+  ticketNumber: PositiveInt,
+  finalHead: TrimmedNonEmptyString,
+  status: Schema.Literals([
+    "comment-pending",
+    "comment-uncertain",
+    "close-pending",
+    "close-uncertain",
+    "resolved",
+  ]),
+  commentUrl: Schema.NullOr(TrimmedNonEmptyString),
+  lastError: Schema.NullOr(TrimmedNonEmptyString),
+  readyIssueIds: Schema.Array(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+export type WorkflowTicketResolutionStatus = typeof WorkflowTicketResolutionStatus.Type;
+
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
   batchId: TrimmedNonEmptyString,
@@ -465,6 +571,8 @@ export const WorkflowDirectorStatus = Schema.Struct({
   admissionCount: Schema.Number,
   admissionLimit: PositiveInt,
   workers: Schema.Array(WorkflowWorkerStatus),
+  reviews: Schema.optionalKey(Schema.Array(WorkflowTicketReviewStatus)),
+  resolutions: Schema.optionalKey(Schema.Array(WorkflowTicketResolutionStatus)),
   observation: TrimmedNonEmptyString,
   actions: Schema.Array(Schema.Literals(["open", "resume", "retry"])),
   createdAt: IsoDateTime,
@@ -564,6 +672,84 @@ export const WorkflowWorkerHandoffInput = Schema.Struct({
 });
 export type WorkflowWorkerHandoffInput = typeof WorkflowWorkerHandoffInput.Type;
 
+export const WorkflowTicketReviewPrepareInput = Schema.Struct({
+  ticketNumber: PositiveInt,
+  implementationProviderThreadId: TrimmedNonEmptyString,
+  fixedBase: TrimmedNonEmptyString,
+  implementationHead: TrimmedNonEmptyString,
+  checks: Schema.Array(WorkflowReviewCheckInput).check(Schema.isMinLength(1)),
+});
+export type WorkflowTicketReviewPrepareInput = typeof WorkflowTicketReviewPrepareInput.Type;
+
+export const WorkflowTicketReviewPrepareResult = Schema.Struct({
+  disposition: Schema.Literals(["prepared", "existing", "held"]),
+  associationToken: TrimmedNonEmptyString,
+  taskName: TrimmedNonEmptyString,
+  instructions: TrimmedNonEmptyString,
+  review: WorkflowTicketReviewStatus,
+});
+export type WorkflowTicketReviewPrepareResult = typeof WorkflowTicketReviewPrepareResult.Type;
+
+export const WorkflowTicketReviewAssociateInput = Schema.Struct({
+  associationToken: TrimmedNonEmptyString,
+  providerThreadId: TrimmedNonEmptyString,
+});
+export type WorkflowTicketReviewAssociateInput = typeof WorkflowTicketReviewAssociateInput.Type;
+
+export const WorkflowReviewCheckReceiptInput = Schema.Struct({
+  reviewId: TrimmedNonEmptyString,
+  receipts: Schema.Array(
+    Schema.Struct({
+      label: TrimmedNonEmptyString,
+      toolCallId: TrimmedNonEmptyString,
+    }),
+  ).check(Schema.isMinLength(1)),
+});
+export type WorkflowReviewCheckReceiptInput = typeof WorkflowReviewCheckReceiptInput.Type;
+
+export const WorkflowTicketReviewReportInput = Schema.Struct({
+  providerThreadId: TrimmedNonEmptyString,
+  standardsReviewerThreadId: TrimmedNonEmptyString,
+  specReviewerThreadId: TrimmedNonEmptyString,
+  summary: TrimmedNonEmptyString,
+  findings: Schema.Array(
+    Schema.Struct({
+      id: TrimmedNonEmptyString,
+      axis: WorkflowReviewAxis,
+      severity: WorkflowReviewFindingSeverity,
+      summary: TrimmedNonEmptyString,
+      location: Schema.optional(TrimmedNonEmptyString),
+    }),
+  ),
+});
+export type WorkflowTicketReviewReportInput = typeof WorkflowTicketReviewReportInput.Type;
+
+export const WorkflowReviewDispositionInput = Schema.Struct({
+  reviewId: TrimmedNonEmptyString,
+  dispositions: Schema.Array(
+    Schema.Struct({
+      findingId: TrimmedNonEmptyString,
+      outcome: Schema.Literals(["fixed", "dismissed", "owner-accepted"]),
+      rationale: TrimmedNonEmptyString,
+      evidenceSource: Schema.optional(TrimmedNonEmptyString),
+      evidenceQuote: Schema.optional(TrimmedNonEmptyString),
+      resultingReviewId: Schema.optional(TrimmedNonEmptyString),
+    }),
+  ),
+});
+export type WorkflowReviewDispositionInput = typeof WorkflowReviewDispositionInput.Type;
+
+export const WorkflowTicketResolveInput = Schema.Struct({
+  reviewId: TrimmedNonEmptyString,
+});
+export type WorkflowTicketResolveInput = typeof WorkflowTicketResolveInput.Type;
+
+export const WorkflowTicketResolveResult = Schema.Struct({
+  disposition: Schema.Literals(["resolved", "pending"]),
+  resolution: WorkflowTicketResolutionStatus,
+});
+export type WorkflowTicketResolveResult = typeof WorkflowTicketResolveResult.Type;
+
 export const WorkflowDirectorFailure = Schema.Literals([
   "not-ready",
   "approval-unavailable",
@@ -579,6 +765,10 @@ export const WorkflowDirectorFailure = Schema.Literals([
   "claim-failed",
   "persistence-failed",
   "dispatch-failed",
+  "review-incomplete",
+  "stale-review",
+  "checks-failed",
+  "resolution-pending",
 ]);
 export type WorkflowDirectorFailure = typeof WorkflowDirectorFailure.Type;
 

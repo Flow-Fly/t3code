@@ -191,8 +191,18 @@ function WorkflowDetails(props: {
       ? scopeThreadRef(directorQuery.data.environmentId, directorQuery.data.threadId)
       : null,
   );
-  const workerActivityRevision =
+  const directorActivityRevision =
     directorThread?.activities.findLast((activity) => {
+      if (
+        activity.kind === "tool.completed" &&
+        activity.summary.includes("workflow_") &&
+        typeof activity.payload === "object" &&
+        activity.payload !== null &&
+        "itemType" in activity.payload &&
+        activity.payload.itemType === "mcp_tool_call"
+      ) {
+        return true;
+      }
       if (
         activity.kind !== "task.started" &&
         activity.kind !== "task.updated" &&
@@ -204,14 +214,14 @@ function WorkflowDetails(props: {
         typeof activity.payload === "object" && activity.payload !== null ? activity.payload : null;
       return payload && "timelineBypass" in payload && payload.timelineBypass === true;
     })?.id ?? null;
-  const lastWorkerActivityRevision = useRef<string | null>(null);
+  const lastDirectorActivityRevision = useRef<string | null>(null);
   const refreshDirectorQuery = directorQuery.refresh;
   useEffect(() => {
-    if (workerActivityRevision === null) return;
-    if (lastWorkerActivityRevision.current === workerActivityRevision) return;
-    lastWorkerActivityRevision.current = workerActivityRevision;
+    if (directorActivityRevision === null) return;
+    if (lastDirectorActivityRevision.current === directorActivityRevision) return;
+    lastDirectorActivityRevision.current = directorActivityRevision;
     refreshDirectorQuery();
-  }, [refreshDirectorQuery, workerActivityRevision]);
+  }, [refreshDirectorQuery, directorActivityRevision]);
   const recoveryQuery = useEnvironmentQuery(
     !hasBreakdownApproval &&
       (props.issue.kind === "decision" ||
@@ -590,6 +600,96 @@ function WorkflowDetails(props: {
                         worker.
                       </p>
                     )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {(director.reviews?.length ?? 0) > 0 ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Review history</h4>
+              <ul className="mt-1 space-y-2">
+                {director.reviews?.map((review) => (
+                  <li className="rounded-sm bg-muted/50 p-1.5 text-xs" key={review.reviewId}>
+                    <p>
+                      Ticket #{review.ticketNumber} · review {review.status}
+                    </p>
+                    <p className="mt-0.5 break-all text-muted-foreground">
+                      {review.fixedBase}…{review.implementationHead}
+                    </p>
+                    <p className="mt-0.5 text-muted-foreground">
+                      Coordinator {review.providerThreadId ?? "not associated"} · requested{" "}
+                      {review.requestedProfile.model}/{review.requestedProfile.effort} · observed{" "}
+                      {review.observedProfile.model ?? "unknown"}/
+                      {review.observedProfile.effort ?? "unknown"} ({review.observedProfile.match})
+                      {review.settlementEvidence === "native-closed"
+                        ? " · native close observed"
+                        : ""}
+                    </p>
+                    <p className="mt-0.5 text-muted-foreground">
+                      Checks{" "}
+                      {review.checks.map((check) => `${check.label}: ${check.status}`).join(", ")}
+                    </p>
+                    {review.axes.length > 0 ? (
+                      <p className="mt-0.5 text-muted-foreground">
+                        {review.axes
+                          .map(
+                            (axis) =>
+                              `${axis.axis} ${axis.providerThreadId} (${axis.providerStatus}${axis.settlementEvidence === "native-closed" ? ", closed" : ""})`,
+                          )
+                          .join(" · ")}
+                      </p>
+                    ) : null}
+                    {review.summary ? (
+                      <p className="mt-0.5 text-muted-foreground">{review.summary}</p>
+                    ) : null}
+                    {review.findings.length > 0 ? (
+                      <ul className="mt-1 space-y-1 border-border border-t pt-1">
+                        {review.findings.map((finding) => (
+                          <li key={finding.id}>
+                            {finding.severity} {finding.axis} · {finding.summary} ·{" "}
+                            {finding.disposition
+                              ? `${finding.disposition.outcome}: ${finding.disposition.rationale}`
+                              : "awaiting director disposition"}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {(director.resolutions?.length ?? 0) > 0 ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Resolution history</h4>
+              <ul className="mt-1 space-y-1">
+                {director.resolutions?.map((resolution) => (
+                  <li
+                    className="rounded-sm bg-muted/50 p-1.5 text-xs"
+                    key={resolution.resolutionId}
+                  >
+                    <p>
+                      Ticket #{resolution.ticketNumber} · {resolution.status}
+                    </p>
+                    {resolution.commentUrl ? (
+                      <a
+                        className="mt-0.5 inline-block text-info hover:underline"
+                        href={resolution.commentUrl}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                      >
+                        Resolution evidence
+                      </a>
+                    ) : null}
+                    {resolution.lastError ? (
+                      <p className="mt-0.5 text-destructive">{resolution.lastError}</p>
+                    ) : null}
+                    {resolution.status === "resolved" ? (
+                      <p className="mt-0.5 text-muted-foreground">
+                        Refreshed eligible work: {resolution.readyIssueIds.join(", ") || "none"}
+                      </p>
+                    ) : null}
                   </li>
                 ))}
               </ul>
