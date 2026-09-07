@@ -2922,6 +2922,7 @@ function observeReviewCheck(input: {
   readonly cwd?: string;
   readonly startedAt?: string;
   readonly completedAt?: string;
+  readonly repeatedStartAt?: string;
   readonly status?: "completed" | "declined" | "failed" | "inProgress";
   readonly exitCode?: number;
 }) {
@@ -2965,6 +2966,18 @@ function observeReviewCheck(input: {
         },
       },
     });
+    if (!input.repeatedStartAt) return;
+    yield* recordWorkflowCheckObservation({
+      ...base,
+      type: "item.started",
+      eventId: EventId.make(`${input.toolCallId}-started-repeated`),
+      createdAt: input.repeatedStartAt,
+      payload: {
+        itemType: "command_execution",
+        status: "inProgress",
+        data: { item: { type: "commandExecution", command, cwd } },
+      },
+    });
   });
 }
 
@@ -2997,6 +3010,32 @@ describe("delivery ticket review resolution", () => {
           capabilities: new Set(["preview"]),
           issuedAt: 1,
         };
+        const replayed = yield* seedReportedReview(sql, {
+          directorId: started.director.directorId,
+          batchId: started.director.batchId,
+          ticketNumber: fixture.ticketDetails[0]!.number,
+          scopeBody: fixture.ticketDetails[0]!.body,
+          suffix: "replayed-start",
+          checkStatus: "pending",
+        });
+        yield* observeReviewCheck({
+          threadId: started.director.threadId,
+          toolCallId: "native-replayed-start",
+          cwd: started.director.worktreePath,
+          exitCode: 0,
+          repeatedStartAt: "2026-09-07T09:04:20.000Z",
+        });
+        const replayedReceipt = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: replayed.reviewId,
+            receipts: [{ label: "focused", toolCallId: "native-replayed-start" }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(replayedReceipt.checks[0]).toMatchObject({
+          status: "passed",
+          toolCallId: "native-replayed-start",
+        });
+
         const scenarios = [
           {
             suffix: "crossing",
@@ -3018,6 +3057,7 @@ describe("delivery ticket review resolution", () => {
             scopeBody: fixture.ticketDetails[index]!.body,
             suffix: scenario.suffix,
             checkStatus: "pending",
+            ...(index === 0 ? { admissionId: replayed.admissionId } : {}),
           });
           const toolCallId = `native-${scenario.suffix}`;
           yield* observeReviewCheck({

@@ -15,7 +15,7 @@ import { recordWorkflowCheckObservation } from "./WorkflowCheckObservation.ts";
 const layer = it.layer(SqlitePersistenceMemory);
 
 layer("WorkflowCheckObservation", (it) => {
-  it.effect("retains compact native start and completion under the exact provider session", () =>
+  it.effect("retains compact native completion through exact start replay", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`
@@ -117,6 +117,23 @@ layer("WorkflowCheckObservation", (it) => {
           },
         },
       });
+      yield* recordWorkflowCheckObservation({
+        ...base,
+        type: "item.started",
+        eventId: EventId.make("check-started"),
+        createdAt: "2026-09-07T10:00:00.000Z",
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          data: {
+            item: {
+              type: "commandExecution",
+              command: "vp test run focused.test.ts",
+              cwd: "/tmp/capability",
+            },
+          },
+        },
+      });
 
       const rows = yield* sql<{
         readonly lifecycle: string;
@@ -145,7 +162,7 @@ layer("WorkflowCheckObservation", (it) => {
     }),
   );
 
-  it.effect("captures only bounded candidates for the current latest review attempt", () =>
+  it.effect("retains only the newest bounded candidates for the current latest review", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`
@@ -373,6 +390,11 @@ layer("WorkflowCheckObservation", (it) => {
           `2026-09-07T11:01:0${index * 2 + 3}.000Z`,
         );
       }
+      yield* observe(
+        "candidate-late-old",
+        "vp test run active.test.ts",
+        "2026-09-07T11:00:59.000Z",
+      );
       yield* recordWorkflowCheckObservation({
         type: "item.completed",
         eventId: EventId.make("completion-without-start"),

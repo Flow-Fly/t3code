@@ -109,7 +109,29 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
         LIMIT 1
       `;
       if (!started[0]) return;
-    } else {
+    }
+    yield* sql`
+      INSERT INTO workflow_native_command_observations (
+        thread_id, provider_instance_id, tool_call_id, lifecycle, command, cwd,
+        status, exit_code, output, created_at
+      ) VALUES (
+        ${event.threadId}, ${event.providerInstanceId}, ${event.itemId},
+        ${event.type === "item.started" ? "started" : "completed"}, ${item.command},
+        ${cwd}, ${event.payload.status ?? item.status ?? null},
+        ${item.exitCode ?? null}, ${(item.aggregatedOutput ?? "").slice(-4_000)}, ${event.createdAt}
+      )
+      ON CONFLICT(thread_id, provider_instance_id, tool_call_id, lifecycle) DO UPDATE SET
+        command = excluded.command, cwd = excluded.cwd, status = excluded.status,
+        exit_code = excluded.exit_code, output = excluded.output, created_at = excluded.created_at
+      WHERE (
+        excluded.lifecycle = 'started'
+        AND excluded.created_at < workflow_native_command_observations.created_at
+      ) OR (
+        excluded.lifecycle = 'completed'
+        AND excluded.created_at >= workflow_native_command_observations.created_at
+      )
+    `;
+    if (event.type === "item.started") {
       yield* sql`
         DELETE FROM workflow_native_command_observations
         WHERE thread_id = ${event.threadId}
@@ -131,24 +153,9 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
               )
             GROUP BY candidate.tool_call_id
             ORDER BY MAX(candidate.created_at) DESC, candidate.tool_call_id DESC
-            LIMIT -1 OFFSET ${Math.max(registered - 1, 0)}
+            LIMIT -1 OFFSET ${registered}
           )
       `;
     }
-    yield* sql`
-    INSERT INTO workflow_native_command_observations (
-      thread_id, provider_instance_id, tool_call_id, lifecycle, command, cwd,
-      status, exit_code, output, created_at
-    ) VALUES (
-      ${event.threadId}, ${event.providerInstanceId}, ${event.itemId},
-      ${event.type === "item.started" ? "started" : "completed"}, ${item.command},
-      ${cwd}, ${event.payload.status ?? item.status ?? null},
-      ${item.exitCode ?? null}, ${(item.aggregatedOutput ?? "").slice(-4_000)}, ${event.createdAt}
-    )
-    ON CONFLICT(thread_id, provider_instance_id, tool_call_id, lifecycle) DO UPDATE SET
-      command = excluded.command, cwd = excluded.cwd, status = excluded.status,
-      exit_code = excluded.exit_code, output = excluded.output, created_at = excluded.created_at
-    WHERE excluded.created_at >= workflow_native_command_observations.created_at
-  `;
   },
 );
