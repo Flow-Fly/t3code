@@ -2982,6 +2982,112 @@ function observeReviewCheck(input: {
 }
 
 describe("delivery ticket review resolution", () => {
+  it.effect("retains receipts across staggered check registrations", () => {
+    const fixture = interpretedCapabilityFixture(2);
+    const test = harness({
+      ...fixture,
+      processRunner: reviewProcessRunner(),
+      githubExecute: ({ args }) =>
+        Effect.succeed(output(args[0] === "api" || args[1] === "view" ? "Flow-Fly\n" : "")),
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      for (const detail of fixture.ticketDetails) {
+        claimTicket(detail, [fixture.source, fixture.breakdownRecord]);
+      }
+      const sql = yield* SqlClient.SqlClient;
+      const invocation: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        threadId: started.director.threadId,
+        providerInstanceId: instanceId,
+        providerSessionId: "provider-session-director",
+        capabilities: new Set(["preview"]),
+        issuedAt: 1,
+      };
+      const earlier = yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: fixture.ticketDetails[0]!.number,
+        scopeBody: fixture.ticketDetails[0]!.body,
+        suffix: "capacity-earlier",
+        checkStatus: "pending",
+        createdAt: "2026-09-07T09:03:00.000Z",
+      });
+      const later = yield* seedReportedReview(sql, {
+        directorId: started.director.directorId,
+        batchId: started.director.batchId,
+        ticketNumber: fixture.ticketDetails[1]!.number,
+        scopeBody: fixture.ticketDetails[1]!.body,
+        suffix: "capacity-later",
+        checkStatus: "pending",
+        createdAt: "2026-09-07T09:03:30.000Z",
+      });
+
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "native-before-registrations",
+        cwd: started.director.worktreePath,
+        startedAt: "2026-09-07T09:02:00.000Z",
+        completedAt: "2026-09-07T09:02:10.000Z",
+        exitCode: 0,
+      });
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "native-capacity-earlier",
+        cwd: started.director.worktreePath,
+        startedAt: "2026-09-07T09:04:00.000Z",
+        completedAt: "2026-09-07T09:04:05.000Z",
+        exitCode: 0,
+      });
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "native-capacity-later",
+        cwd: started.director.worktreePath,
+        startedAt: "2026-09-07T09:04:10.000Z",
+        completedAt: "2026-09-07T09:04:15.000Z",
+        exitCode: 0,
+      });
+      yield* observeReviewCheck({
+        threadId: started.director.threadId,
+        toolCallId: "native-between-registrations",
+        cwd: started.director.worktreePath,
+        startedAt: "2026-09-07T09:03:10.000Z",
+        completedAt: "2026-09-07T09:03:20.000Z",
+        exitCode: 0,
+      });
+
+      for (const toolCallId of ["native-before-registrations", "native-between-registrations"]) {
+        const rejected = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId: earlier.reviewId,
+            receipts: [{ label: "focused", toolCallId }],
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.result,
+          );
+        expect(rejected._tag).toBe("Failure");
+      }
+
+      for (const [reviewId, toolCallId] of [
+        [earlier.reviewId, "native-capacity-earlier"],
+        [later.reviewId, "native-capacity-later"],
+      ] as const) {
+        const receipt = yield* workflowDirectorHandlers
+          .workflow_record_review_checks({
+            reviewId,
+            receipts: [{ label: "focused", toolCallId }],
+          })
+          .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
+        expect(receipt.checks[0]).toMatchObject({ status: "passed", toolCallId });
+      }
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect(
     "binds only post-registration native check receipts and retains explicit verification verdicts",
     () => {

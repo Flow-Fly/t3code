@@ -73,8 +73,12 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
           )
         )
     `;
-    const active = yield* sql<{ readonly registered: number }>`
-    SELECT COUNT(*) AS registered
+    const active = yield* sql<{
+      readonly eligible: number;
+      readonly registered: number;
+    }>`
+    SELECT COUNT(*) AS registered,
+      COUNT(CASE WHEN ${event.createdAt} > c.created_at THEN 1 END) AS eligible
     FROM workflow_directors d
     JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
     JOIN workflow_review_checks c ON c.review_id = r.review_id
@@ -84,7 +88,6 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
       AND c.verification_status <> 'passed'
       AND c.command = ${item.command}
       AND d.worktree_path = ${cwd}
-      AND ${event.createdAt} > c.created_at
       AND NOT EXISTS (
         SELECT 1 FROM workflow_ticket_reviews newer
         WHERE newer.director_id = r.director_id
@@ -96,7 +99,8 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
       )
   `;
     const registered = active[0]?.registered ?? 0;
-    if (registered === 0) return;
+    const eligible = active[0]?.eligible ?? 0;
+    if (eligible === 0) return;
     if (event.type === "item.completed") {
       const started = yield* sql<{ readonly observed: number }>`
         SELECT 1 AS observed FROM workflow_native_command_observations
