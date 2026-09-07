@@ -143,6 +143,7 @@ import {
   WorkflowAdoptionUndoInput,
   WorkflowIssueDetail,
   WorkflowIssueDetailInput,
+  WorkflowMonitorInput,
   WorkflowLocateInput,
   WorkflowLocateResult,
   WorkflowDirectorAdmissionInput,
@@ -164,6 +165,7 @@ import {
   WorkflowRootsResult,
   WorkflowSearchInput,
   WorkflowSearchResult,
+  WorkflowSyncState,
   WorkflowStartError,
   WorkflowStartInput,
   WorkflowStartResult,
@@ -407,6 +409,8 @@ export const WS_METHODS = {
   workflowIssueDetail: "workflow.issueDetail",
   workflowSearch: "workflow.search",
   workflowLocate: "workflow.locate",
+  workflowWatch: "workflow.watch",
+  workflowRefresh: "workflow.refresh",
   workflowStart: "workflow.start",
   workflowRecovery: "workflow.recovery",
   workflowRecover: "workflow.recover",
@@ -865,6 +869,19 @@ export const WsWorkflowLocateRpc = Rpc.make(WS_METHODS.workflowLocate, {
   payload: WorkflowLocateInput,
   success: WorkflowLocateResult,
   error: WorkflowRpcError,
+});
+
+export const WsWorkflowWatchRpc = Rpc.make(WS_METHODS.workflowWatch, {
+  payload: WorkflowMonitorInput,
+  success: WorkflowSyncState,
+  error: Schema.Union([WorkflowQueryError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsWorkflowRefreshRpc = Rpc.make(WS_METHODS.workflowRefresh, {
+  payload: WorkflowMonitorInput,
+  success: WorkflowSyncState,
+  error: Schema.Union([WorkflowQueryError, EnvironmentAuthorizationError]),
 });
 
 export const WsWorkflowStartRpc = Rpc.make(WS_METHODS.workflowStart, {
@@ -1447,6 +1464,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowIssueDetailRpc,
   WsWorkflowSearchRpc,
   WsWorkflowLocateRpc,
+  WsWorkflowWatchRpc,
+  WsWorkflowRefreshRpc,
   WsWorkflowStartRpc,
   WsWorkflowRecoveryRpc,
   WsWorkflowRecoverRpc,

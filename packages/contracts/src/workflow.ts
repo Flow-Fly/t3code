@@ -188,6 +188,34 @@ export type WorkflowIssueSummary = typeof WorkflowIssueSummary.Type;
 export const WorkflowRepositoriesInput = Schema.Struct({ projectId: ProjectId });
 export type WorkflowRepositoriesInput = typeof WorkflowRepositoriesInput.Type;
 
+export const WorkflowMonitorInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+});
+export type WorkflowMonitorInput = typeof WorkflowMonitorInput.Type;
+
+export const WorkflowSyncStatus = Schema.Literals([
+  "refreshing",
+  "fresh",
+  "stale",
+  "access-denied",
+  "unavailable",
+  "rate-limited",
+]);
+export type WorkflowSyncStatus = typeof WorkflowSyncStatus.Type;
+
+export const WorkflowSyncState = Schema.Struct({
+  repository: WorkflowRepositoryNameWithOwner,
+  status: WorkflowSyncStatus,
+  lastAttemptAt: Schema.NullOr(IsoDateTime),
+  lastSuccessfulAt: Schema.NullOr(IsoDateTime),
+  cacheAgeMs: Schema.NullOr(Schema.Number),
+  retryAt: Schema.NullOr(IsoDateTime),
+  revision: Schema.Number,
+  message: TrimmedNonEmptyString,
+});
+export type WorkflowSyncState = typeof WorkflowSyncState.Type;
+
 export const WorkflowRepositoriesResult = Schema.Struct({
   projectId: ProjectId,
   projectTitle: TrimmedNonEmptyString,

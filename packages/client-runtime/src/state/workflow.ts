@@ -1,9 +1,13 @@
-import { WS_METHODS } from "@t3tools/contracts";
+import { WS_METHODS, type EnvironmentId, type WorkflowMonitorInput } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
-import { createAtomCommandScheduler, createEnvironmentRpcCommand } from "./runtime.ts";
+import {
+  createAtomCommandScheduler,
+  createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentRpcSubscriptionAtomFamily,
+} from "./runtime.ts";
 
 /** Environment-targeted GitHub browsing. Each query is executed by the selected server. */
 export function createWorkflowEnvironmentAtoms<R, E>(
@@ -14,7 +18,24 @@ export function createWorkflowEnvironmentAtoms<R, E>(
     mode: "serial" as const,
     key: ({ environmentId }: { readonly environmentId: string }) => environmentId,
   };
+  const sync = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+    label: "environment-data:workflow:sync",
+    tag: WS_METHODS.workflowWatch,
+    idleTtlMs: 0,
+  });
+  const syncTrigger = ({
+    environmentId,
+    input,
+  }: {
+    readonly environmentId: EnvironmentId;
+    readonly input: WorkflowMonitorInput;
+  }) =>
+    sync({
+      environmentId,
+      input: { projectId: input.projectId, repository: input.repository },
+    });
   return {
+    sync,
     repositories: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:workflow:repositories",
       tag: WS_METHODS.workflowRepositories,
@@ -24,16 +45,22 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       label: "environment-data:workflow:roots",
       tag: WS_METHODS.workflowRoots,
       staleTimeMs: 30_000,
+      idleTtlMs: 0,
+      refreshTrigger: syncTrigger,
     }),
     children: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:workflow:children",
       tag: WS_METHODS.workflowChildren,
       staleTimeMs: 30_000,
+      idleTtlMs: 0,
+      refreshTrigger: syncTrigger,
     }),
     issueDetail: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:workflow:issue-detail",
       tag: WS_METHODS.workflowIssueDetail,
       staleTimeMs: 30_000,
+      idleTtlMs: 0,
+      refreshTrigger: syncTrigger,
     }),
     search: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:workflow:search",
@@ -44,6 +71,16 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       label: "environment-data:workflow:locate",
       tag: WS_METHODS.workflowLocate,
       staleTimeMs: 30_000,
+    }),
+    refresh: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:refresh",
+      tag: WS_METHODS.workflowRefresh,
+      scheduler: commandScheduler,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.repository.toLowerCase()]),
+      },
     }),
     start: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:start",

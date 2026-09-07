@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   filterWorkflowRoots,
+  listenForWorkflowBrowserReturn,
   resolveWorkflowRepository,
   workflowIssueBrief,
   workflowIssueStateLabel,
@@ -111,5 +112,26 @@ describe("Workflow panel browsing", () => {
         "## Source map\n\n[Map](https://github.com/acme/repo/issues/1)\n\n## Specification\n\n[Spec](https://github.com/acme/repo/issues/2)\n\n## Notes\n\n[Mention](https://github.com/acme/repo/issues/3)",
       ).map(({ relationship }) => relationship),
     ).toEqual(["source", "specification", "reference"]);
+  });
+
+  it("refreshes on browser focus and visible return until its listener is removed", () => {
+    const windowTarget = new EventTarget();
+    const documentTarget = new EventTarget() as EventTarget & { visibilityState: string };
+    documentTarget.visibilityState = "visible";
+    let refreshes = 0;
+    const stop = listenForWorkflowBrowserReturn(documentTarget, windowTarget, () => {
+      refreshes += 1;
+    });
+
+    windowTarget.dispatchEvent(new Event("focus"));
+    documentTarget.visibilityState = "hidden";
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    documentTarget.visibilityState = "visible";
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    expect(refreshes).toBe(2);
+
+    stop();
+    windowTarget.dispatchEvent(new Event("focus"));
+    expect(refreshes).toBe(2);
   });
 });

@@ -4,12 +4,14 @@ import type {
   ThreadId,
   WorkflowRepository,
   WorkflowSearchMatch,
+  WorkflowSyncState,
 } from "@t3tools/contracts";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { useEnvironmentQuery } from "~/state/query";
+import { useAtomCommand } from "~/state/use-atom-command";
 import { workflowEnvironment } from "~/state/workflow";
 import {
   selectWorkflowMapView,
@@ -21,7 +23,11 @@ import {
 import { WorkflowFocusedMap } from "./WorkflowFocusedMap";
 import { WorkflowAdoptionPanel } from "./WorkflowAdoptionPanel";
 import { foldIdentity, issueIdentity } from "./WorkflowMap.logic";
-import { filterWorkflowRoots, resolveWorkflowRepository } from "./WorkflowPanel.logic";
+import {
+  filterWorkflowRoots,
+  listenForWorkflowBrowserReturn,
+  resolveWorkflowRepository,
+} from "./WorkflowPanel.logic";
 
 interface WorkflowPanelProps {
   environmentId: EnvironmentId;
@@ -82,6 +88,50 @@ function RepositoryPicker(props: {
   );
 }
 
+function WorkflowSyncNotice(props: {
+  state: WorkflowSyncState | null;
+  error: string | null;
+  retry: () => void;
+}) {
+  if (props.state?.status === "fresh" && props.error === null) return null;
+  const title = props.error
+    ? "Workflow connection interrupted"
+    : props.state === null || props.state.status === "refreshing"
+      ? "Refreshing Workflow…"
+      : props.state?.status === "stale"
+        ? "Workflow data may be stale"
+        : props.state?.status === "access-denied"
+          ? "GitHub access unavailable"
+          : props.state?.status === "rate-limited"
+            ? "GitHub rate limit reached"
+            : "GitHub is unavailable";
+  const detail = props.error ?? props.state?.message ?? "Waiting for the first GitHub sync.";
+  const lastSuccess = props.state?.lastSuccessfulAt
+    ? ` Last synced ${new Date(props.state.lastSuccessfulAt).toLocaleString()}.`
+    : "";
+  const retryAt = props.state?.retryAt
+    ? ` Automatic retry ${new Date(props.state.retryAt).toLocaleString()}.`
+    : "";
+  return (
+    <div
+      className="flex items-center gap-3 border-b border-border bg-muted/40 px-3 py-2 text-xs"
+      role="status"
+    >
+      <p className="min-w-0 flex-1">
+        <span className="font-medium">{title}</span>{" "}
+        <span className="text-muted-foreground">
+          {detail}
+          {lastSuccess}
+          {retryAt}
+        </span>
+      </p>
+      <Button size="xs" variant="outline" onClick={props.retry}>
+        Retry
+      </Button>
+    </div>
+  );
+}
+
 export function WorkflowPanel(props: WorkflowPanelProps) {
   const repositoriesQuery = useEnvironmentQuery(
     props.supported === true
@@ -104,6 +154,28 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
         })
       : null,
   );
+  const syncQuery = useEnvironmentQuery(
+    repository
+      ? workflowEnvironment.sync({
+          environmentId: props.environmentId,
+          input: { projectId: props.projectId, repository },
+        })
+      : null,
+  );
+  const refreshWorkflow = useAtomCommand(workflowEnvironment.refresh, {
+    reportFailure: false,
+  });
+  const retryWorkflow = useCallback(() => {
+    if (!repository) return;
+    void refreshWorkflow({
+      environmentId: props.environmentId,
+      input: { projectId: props.projectId, repository },
+    });
+  }, [repository, props.environmentId, props.projectId, refreshWorkflow]);
+  useEffect(() => {
+    if (!repository || typeof document === "undefined" || typeof window === "undefined") return;
+    return listenForWorkflowBrowserReturn(document, window, retryWorkflow);
+  }, [repository, retryWorkflow]);
   const [rootSearch, setRootSearch] = useState("");
   const [adopting, setAdopting] = useState(false);
   const adoptButtonRef = useRef<HTMLButtonElement>(null);
@@ -321,7 +393,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           projectId={props.projectId}
           {...(props.planningThreadId ? { planningThreadId: props.planningThreadId } : {})}
           root={focusedRoot}
-          onRefreshRoot={rootsQuery.refresh}
+          onRefreshRoot={retryWorkflow}
           onNavigateMatch={navigateToMatch}
         />
       </>
@@ -333,6 +405,13 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
       aria-label="Workflow"
     >
       {header}
+      {repository ? (
+        <WorkflowSyncNotice
+          state={syncQuery.data ?? null}
+          error={syncQuery.error}
+          retry={retryWorkflow}
+        />
+      ) : null}
       {content}
     </section>
   );

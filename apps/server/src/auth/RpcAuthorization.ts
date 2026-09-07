@@ -68,6 +68,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.pullRequestsListStats]: AuthOrchestrationReadScope,
   [WS_METHODS.workflowRepositories]: AuthOrchestrationReadScope,
   [WS_METHODS.workflowRoots]: AuthOrchestrationReadScope,
+  [WS_METHODS.workflowWatch]: AuthOrchestrationReadScope,
+  [WS_METHODS.workflowRefresh]: AuthOrchestrationReadScope,
   [WS_METHODS.workflowChildren]: AuthOrchestrationReadScope,
   [WS_METHODS.workflowIssueDetail]: AuthOrchestrationReadScope,
   [WS_METHODS.workflowSearch]: AuthOrchestrationReadScope,

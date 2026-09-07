@@ -4,6 +4,27 @@ import type {
   WorkflowRepository,
 } from "@t3tools/contracts";
 
+interface WorkflowBrowserEventSource {
+  addEventListener(type: string, listener: EventListener): void;
+  removeEventListener(type: string, listener: EventListener): void;
+}
+
+export function listenForWorkflowBrowserReturn(
+  documentSource: WorkflowBrowserEventSource & { readonly visibilityState: string },
+  windowSource: WorkflowBrowserEventSource,
+  refresh: () => void,
+): () => void {
+  const refreshWhenVisible = () => {
+    if (documentSource.visibilityState === "visible") refresh();
+  };
+  documentSource.addEventListener("visibilitychange", refreshWhenVisible);
+  windowSource.addEventListener("focus", refreshWhenVisible);
+  return () => {
+    documentSource.removeEventListener("visibilitychange", refreshWhenVisible);
+    windowSource.removeEventListener("focus", refreshWhenVisible);
+  };
+}
+
 export function resolveWorkflowRepository(
   selected: string | null,
   repositories: ReadonlyArray<WorkflowRepository>,

@@ -24,6 +24,8 @@ const query = vi.hoisted(() => {
     planningKind: null as "map" | "capability" | null,
     startFailure: false,
     startCalls: new Array<unknown>(),
+    refreshCalls: new Array<unknown>(),
+    syncStatus: "fresh" as "fresh" | "stale" | "rate-limited" | "unavailable",
     navigateCalls: new Array<unknown>(),
     threadDetailRefs: new Array<unknown>(),
     directorActivities: new Array<{
@@ -95,6 +97,7 @@ vi.mock("~/state/entities", () => ({
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: { label: string }) => async (request: unknown) => {
     query.startCalls.push(request);
+    if (command.label === "workflow:refresh") query.refreshCalls.push(request);
     if (command.label === "workflow:start" && query.startFailure) {
       return { _tag: "Failure", cause: Cause.fail(new Error("Planning link is unavailable.")) };
     }
@@ -146,6 +149,7 @@ vi.mock("~/state/workflow", () => ({
   workflowEnvironment: {
     repositories: (request: unknown) => query.descriptor("repositories", request),
     roots: (request: unknown) => query.descriptor("roots", request),
+    sync: (request: unknown) => query.descriptor("sync", request),
     children: (request: unknown) => query.descriptor("children", request),
     issueDetail: (request: unknown) => query.descriptor("detail", request),
     search: (request: unknown) => query.descriptor("search", request),
@@ -156,6 +160,7 @@ vi.mock("~/state/workflow", () => ({
     recover: { label: "workflow:recover", run: vi.fn() },
     directorStart: { label: "workflow:director-start", run: vi.fn() },
     directorResume: { label: "workflow:director-resume", run: vi.fn() },
+    refresh: { label: "workflow:refresh", run: vi.fn() },
   },
 }));
 
@@ -237,6 +242,21 @@ vi.mock("~/state/query", () => ({
                       ]
                     : []),
                 ],
+        },
+      };
+    }
+    if (descriptor.kind === "sync") {
+      return {
+        ...idle,
+        data: {
+          repository: "Flow-Fly/t3code",
+          status: query.syncStatus,
+          lastAttemptAt: "2026-09-06T10:00:00.000Z",
+          lastSuccessfulAt: "2026-09-06T10:00:00.000Z",
+          cacheAgeMs: 0,
+          retryAt: null,
+          revision: 1,
+          message: "Workflow is current with GitHub.",
         },
       };
     }
@@ -724,6 +744,8 @@ beforeEach(() => {
   query.planningKind = null;
   query.startFailure = false;
   query.startCalls.length = 0;
+  query.refreshCalls.length = 0;
+  query.syncStatus = "fresh";
   query.navigateCalls.length = 0;
   query.threadDetailRefs.length = 0;
   query.directorActivities.length = 0;
@@ -1149,7 +1171,7 @@ describe("WorkflowPanel browsing", () => {
       );
       expect(renderer!.root.findByType("article").findAllByType("li")).toHaveLength(2);
       expect(new Set(query.calls.map((call) => call.kind))).toEqual(
-        new Set(["repositories", "roots", "children", "detail", "directorStatus"]),
+        new Set(["repositories", "roots", "sync", "children", "detail", "directorStatus"]),
       );
       expect(query.calls.find((call) => call.kind === "repositories")?.request).toEqual({
         environmentId: draft.environmentId,
@@ -1513,6 +1535,36 @@ describe("WorkflowPanel browsing", () => {
       y: 34,
       zoom: 0.6,
     });
+    await act(() => renderer?.unmount());
+  });
+
+  it("keeps cached workflow data visible while sync is stale and retries from the notice", async () => {
+    query.syncStatus = "rate-limited";
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={EnvironmentId.make("remote-environment")}
+          environmentLabel="Remote environment"
+          projectId={ProjectId.make("project-draft")}
+          projectTitle="Draft project"
+          supported
+        />,
+      );
+    });
+
+    const notice = renderer!.root.findByProps({ role: "status" });
+    expect(notice.findByProps({ className: "font-medium" }).children.join("")).toContain(
+      "GitHub rate limit reached",
+    );
+    expect(renderer!.root.findByProps({ "aria-label": "Workflow roots" })).toBeDefined();
+    await act(() => notice.findByType("button").props.onClick());
+    expect(query.refreshCalls).toEqual([
+      {
+        environmentId: "remote-environment",
+        input: { projectId: "project-draft", repository: "flow-fly/t3code" },
+      },
+    ]);
     await act(() => renderer?.unmount());
   });
 });

@@ -123,6 +123,7 @@ import * as WorkflowService from "./workflow/WorkflowService.ts";
 import * as WorkflowAdoptionService from "./workflow/WorkflowAdoptionService.ts";
 import * as WorkflowStartService from "./workflow/WorkflowStartService.ts";
 import * as WorkflowDirectorService from "./workflow/WorkflowDirectorService.ts";
+import * as WorkflowMonitor from "./workflow/WorkflowMonitor.ts";
 import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
@@ -542,6 +543,7 @@ const makeWsRpcLayer = (
       const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
       const workflowStart = yield* WorkflowStartService.WorkflowStartService;
       const workflowDirector = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const workflowMonitor = yield* WorkflowMonitor.WorkflowMonitor;
       const canReplayPersistedRange = Effect.fnUntraced(function* (
         afterSequence: number,
         headSequence: number,
@@ -2148,15 +2150,15 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowRoots]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowRoots, workflow.roots(input), {
+          observeRpcEffect(WS_METHODS.workflowRoots, workflowMonitor.roots(input), {
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowChildren]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowChildren, workflow.children(input), {
+          observeRpcEffect(WS_METHODS.workflowChildren, workflowMonitor.children(input), {
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowIssueDetail]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowIssueDetail, workflow.issueDetail(input), {
+          observeRpcEffect(WS_METHODS.workflowIssueDetail, workflowMonitor.issueDetail(input), {
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowSearch]: (input) =>
@@ -2167,10 +2169,20 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowLocate, workflow.locate(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowWatch]: (input) =>
+          observeRpcStream(WS_METHODS.workflowWatch, workflowMonitor.watch(input), {
+            "rpc.aggregate": "workflow",
+          }),
+        [WS_METHODS.workflowRefresh]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowRefresh, workflowMonitor.refresh(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.workflowStart]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowStart,
-            workflowStart.start(input, dispatchNormalizedCommand),
+            workflowStart
+              .start(input, dispatchNormalizedCommand)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
             { "rpc.aggregate": "workflow" },
           ),
         [WS_METHODS.workflowRecovery]: (input) =>
@@ -2180,13 +2192,17 @@ const makeWsRpcLayer = (
         [WS_METHODS.workflowRecover]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowRecover,
-            workflowStart.recover(input, dispatchNormalizedCommand),
+            workflowStart
+              .recover(input, dispatchNormalizedCommand)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
             { "rpc.aggregate": "workflow" },
           ),
         [WS_METHODS.workflowDirectorStart]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowDirectorStart,
-            workflowDirector.start(input, dispatchNormalizedCommand),
+            workflowDirector
+              .start(input, dispatchNormalizedCommand)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
             { "rpc.aggregate": "workflow" },
           ),
         [WS_METHODS.workflowDirectorStatus]: (input) =>
@@ -2196,21 +2212,31 @@ const makeWsRpcLayer = (
         [WS_METHODS.workflowDirectorResume]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowDirectorResume,
-            workflowDirector.resume(input, dispatchNormalizedCommand),
+            workflowDirector
+              .resume(input, dispatchNormalizedCommand)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
             { "rpc.aggregate": "workflow" },
           ),
         [WS_METHODS.workflowDirectorAdmit]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowDirectorAdmit, workflowDirector.admit(input), {
-            "rpc.aggregate": "workflow",
-          }),
+          observeRpcEffect(
+            WS_METHODS.workflowDirectorAdmit,
+            workflowDirector
+              .admit(input)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.workflowAdoptionPreview]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionPreview, workflowAdoption.preview(input), {
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowAdoptionApply]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowAdoptionApply, workflowAdoption.apply(input), {
-            "rpc.aggregate": "workflow",
-          }),
+          observeRpcEffect(
+            WS_METHODS.workflowAdoptionApply,
+            workflowAdoption
+              .apply(input)
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.workflowAdoptionHistory]: (input) =>
           observeRpcEffect(WS_METHODS.workflowAdoptionHistory, workflowAdoption.history(input), {
             "rpc.aggregate": "workflow",
@@ -2220,9 +2246,13 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "workflow",
           }),
         [WS_METHODS.workflowAdoptionUndo]: (input) =>
-          observeRpcEffect(WS_METHODS.workflowAdoptionUndo, workflowAdoption.undo(input), {
-            "rpc.aggregate": "workflow",
-          }),
+          observeRpcEffect(
+            WS_METHODS.workflowAdoptionUndo,
+            workflowAdoption
+              .undo(input)
+              .pipe(Effect.ensuring(workflowMonitor.invalidateAll.pipe(Effect.ignore))),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.pullRequestsListStats]: (input) =>
           observeRpcEffect(WS_METHODS.pullRequestsListStats, pullRequests.listStats(input), {
             "rpc.aggregate": "pull-requests",
@@ -3007,6 +3037,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
     const workflowAdoption = yield* WorkflowAdoptionService.WorkflowAdoptionService;
     const workflowStart = yield* WorkflowStartService.WorkflowStartService;
     const workflowDirector = yield* WorkflowDirectorService.WorkflowDirectorService;
+    const workflowMonitor = yield* WorkflowMonitor.WorkflowMonitor;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -3057,6 +3088,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               Layer.provide(
                 Layer.succeed(WorkflowDirectorService.WorkflowDirectorService, workflowDirector),
               ),
+              Layer.provide(Layer.succeed(WorkflowMonitor.WorkflowMonitor, workflowMonitor)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(
