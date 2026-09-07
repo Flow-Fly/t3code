@@ -2102,7 +2102,10 @@ const make = Effect.gen(function* () {
       if (
         event.type === "task.started" ||
         event.type === "task.updated" ||
-        event.type === "task.completed"
+        event.type === "task.completed" ||
+        event.type === "turn.started" ||
+        event.type === "turn.completed" ||
+        event.type === "turn.aborted"
       ) {
         yield* recordWorkflowWorkerObservation(event);
       }

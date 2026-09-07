@@ -65,6 +65,7 @@ import {
   type TerminalError,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
+  WorkflowDirectorError,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -2209,6 +2210,25 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowDirectorStatus, workflowDirector.status(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowDirectorReassessmentRetry]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.workflowDirectorReassessmentRetry,
+            workflowDirector
+              .retryReassessment(input, (command) =>
+                dispatchNormalizedCommand(command).pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new WorkflowDirectorError({
+                        failure: "dispatch-failed",
+                        message: "The reassessment interrupt command could not be submitted.",
+                        detail: String(error),
+                      }),
+                  ),
+                ),
+              )
+              .pipe(Effect.ensuring(workflowMonitor.invalidate(input).pipe(Effect.ignore))),
+            { "rpc.aggregate": "workflow" },
+          ),
         [WS_METHODS.workflowDirectorResume]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowDirectorResume,

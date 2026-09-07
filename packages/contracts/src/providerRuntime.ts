@@ -664,6 +664,31 @@ const taskAgentLinkageFields = {
   agentPath: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Explicit native child-thread closure, distinct from an interrupted turn. */
   nativeLifecycle: Schema.optional(Schema.Literal("closed")),
+  /** Current native child turn identity, independent of an interrupt request. */
+  nativeTurn: Schema.optional(
+    Schema.Struct({
+      sessionId: TrimmedNonEmptyStringSchema,
+      turnId: TrimmedNonEmptyStringSchema,
+      status: Schema.Literals(["running", "completed", "failed", "interrupted"]),
+    }),
+  ),
+  /** Native provider evidence for one exact child-turn interruption attempt. */
+  nativeInterruption: Schema.optional(
+    Schema.Struct({
+      attemptId: TrimmedNonEmptyStringSchema,
+      sessionId: TrimmedNonEmptyStringSchema,
+      turnId: TrimmedNonEmptyStringSchema,
+      requestStatus: Schema.Literals([
+        "not-issued",
+        "requested",
+        "acknowledged",
+        "failed",
+        "unknown",
+      ]),
+      completionStatus: Schema.optional(Schema.Literal("interrupted")),
+      detail: Schema.optional(TrimmedNonEmptyStringSchema),
+    }),
+  ),
   /**
    * Set on provider-synthesized child-agent events (Codex) whose activity
    * belongs in the Agents surface, never the parent timeline.

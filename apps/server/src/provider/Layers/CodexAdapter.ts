@@ -1062,6 +1062,61 @@ function mapCollabAgentEvent(
   const title = knownName ?? agentThreadId;
   const model = typeof payload.model === "string" ? payload.model.trim() : "";
   const effort = typeof payload.effort === "string" ? payload.effort.trim() : "";
+  const nativeInterruption = (() => {
+    const attemptId =
+      typeof payload.interruptAttemptId === "string" ? payload.interruptAttemptId : "";
+    const sessionId = typeof payload.nativeSessionId === "string" ? payload.nativeSessionId : "";
+    const turnId = typeof payload.nativeTurnId === "string" ? payload.nativeTurnId : "";
+    const requestStatus:
+      | "not-issued"
+      | "requested"
+      | "acknowledged"
+      | "failed"
+      | "unknown"
+      | undefined =
+      payload.interruptRequestStatus === "not-issued" ||
+      payload.interruptRequestStatus === "requested" ||
+      payload.interruptRequestStatus === "acknowledged" ||
+      payload.interruptRequestStatus === "failed" ||
+      payload.interruptRequestStatus === "unknown"
+        ? payload.interruptRequestStatus
+        : undefined;
+    if (!attemptId || !sessionId || !turnId || !requestStatus) return undefined;
+    return {
+      attemptId,
+      sessionId,
+      turnId,
+      requestStatus,
+      ...(payload.interruptCompletionStatus === "interrupted"
+        ? { completionStatus: "interrupted" as const }
+        : {}),
+      ...(typeof payload.interruptDetail === "string" && payload.interruptDetail.trim()
+        ? { detail: payload.interruptDetail.trim() }
+        : {}),
+    };
+  })();
+  const nativeTurn = (() => {
+    const sessionId = typeof payload.nativeSessionId === "string" ? payload.nativeSessionId : "";
+    const turnId = typeof payload.nativeTurnId === "string" ? payload.nativeTurnId : "";
+    const status: "running" | "completed" | "failed" | "interrupted" | undefined =
+      payload.nativeTurnStatus === "running" ||
+      payload.nativeTurnStatus === "completed" ||
+      payload.nativeTurnStatus === "failed" ||
+      payload.nativeTurnStatus === "interrupted"
+        ? payload.nativeTurnStatus
+        : undefined;
+    if (
+      !sessionId ||
+      !turnId ||
+      (status !== "running" &&
+        status !== "completed" &&
+        status !== "failed" &&
+        status !== "interrupted")
+    ) {
+      return undefined;
+    }
+    return { sessionId, turnId, status };
+  })();
   // Identity repeated on every status patch so rows are self-describing when
   // the start row ages out of activity retention (review finding: a
   // reconstructed agent had a UUID name and no role/path).
@@ -1072,9 +1127,21 @@ function mapCollabAgentEvent(
     ...(effort ? { effort } : {}),
     ...(agentPath ? { agentPath } : {}),
     timelineBypass: true,
+    ...(nativeTurn ? { nativeTurn } : {}),
+    ...(nativeInterruption ? { nativeInterruption } : {}),
   } as const;
 
   switch (event.method) {
+    case "collabAgent/interruptRequested":
+    case "collabAgent/interruptAcknowledged":
+    case "collabAgent/interruptFailed":
+      return [
+        {
+          ...base,
+          type: "task.updated",
+          payload: { taskId, ...linkage },
+        },
+      ];
     case "collabAgent/started":
       return [
         {
@@ -1153,11 +1220,28 @@ function mapCollabAgentEvent(
           : turnStatus === "interrupted"
             ? ("interrupted" as const)
             : ("idle" as const);
+      const matchingNativeInterruption =
+        nativeInterruption &&
+        turnStatus === "interrupted" &&
+        typeof turn?.id === "string" &&
+        turn.id === nativeInterruption.turnId
+          ? {
+              ...nativeInterruption,
+              completionStatus: "interrupted" as const,
+            }
+          : nativeInterruption;
       return [
         {
           ...base,
           type: "task.updated",
-          payload: { taskId, status, ...linkage },
+          payload: {
+            taskId,
+            status,
+            ...linkage,
+            ...(matchingNativeInterruption
+              ? { nativeInterruption: matchingNativeInterruption }
+              : {}),
+          },
         },
       ];
     }

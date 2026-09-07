@@ -110,6 +110,12 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       tag: WS_METHODS.workflowDirectorStatus,
       staleTimeMs: 0,
     }),
+    directorReassessmentRetry: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:workflow:director-reassessment-retry",
+      tag: WS_METHODS.workflowDirectorReassessmentRetry,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     directorResume: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:director-resume",
       tag: WS_METHODS.workflowDirectorResume,

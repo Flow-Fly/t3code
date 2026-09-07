@@ -18,6 +18,7 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -135,16 +136,20 @@ function directorStatus(
 
 function monitorLayer(input: {
   readonly loadRoots: WorkflowService.WorkflowService["Service"]["roots"];
+  readonly loadDetail?: WorkflowService.WorkflowService["Service"]["issueDetail"] | undefined;
   readonly onRead?:
     | ((
         operation: "children" | "detail",
         repository: string,
         projectId: ProjectId,
-      ) => Effect.Effect<void>)
+      ) => Effect.Effect<void, WorkflowQueryError>)
     | undefined;
   readonly validProjects?: ReadonlySet<ProjectId> | undefined;
   readonly status?:
     | WorkflowDirectorService.WorkflowDirectorService["Service"]["status"]
+    | undefined;
+  readonly reassess?:
+    | WorkflowDirectorService.WorkflowDirectorService["Service"]["reassess"]
     | undefined;
 }) {
   return WorkflowMonitor.layer.pipe(
@@ -184,13 +189,22 @@ function monitorLayer(input: {
               blockedBy: [],
             };
             if (input.onRead) yield* input.onRead("detail", repository, projectId);
-            return detail;
+            return input.loadDetail
+              ? yield* input.loadDetail({ projectId, repository, number })
+              : detail;
           }),
       }),
     ),
     Layer.provideMerge(
       Layer.mock(WorkflowDirectorService.WorkflowDirectorService)({
         status: input.status ?? (() => Effect.succeed(directorStatus([]))),
+        reassess: input.reassess ?? (() => Effect.void),
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(OrchestrationEngineService)({
+        dispatch: () => Effect.succeed({ sequence: 1 }),
+        streamDomainEvents: Stream.empty,
       }),
     ),
     Layer.provideMerge(SqlitePersistenceMemory),
@@ -1411,6 +1425,95 @@ describe("WorkflowMonitor", () => {
                 }),
               );
             },
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("records a confirmed capability invalidation when another watched path fails", () =>
+    Effect.gen(function* () {
+      let outage = false;
+      let reassessments = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+        yield* monitor.children({ projectId: projectOne, repository, parentNumber: 11 });
+        reassessments = 0;
+        outage = true;
+        const refreshed = yield* monitor.refresh({ projectId: projectOne, repository });
+        expect(refreshed.status).toBe("unavailable");
+        expect(reassessments).toBe(1);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () => Effect.succeed(roots("current")),
+            onRead: (operation) =>
+              outage && operation === "children"
+                ? Effect.fail(
+                    new WorkflowQueryError({
+                      failure: "request-failed",
+                      message: "An unrelated watched path is unavailable.",
+                    }),
+                  )
+                : Effect.void,
+            reassess: () =>
+              Effect.sync(() => {
+                reassessments += 1;
+              }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
+  it.effect("discards reassessment side effects from a superseded detail read", () =>
+    Effect.gen(function* () {
+      const oldReadStarted = yield* Deferred.make<void>();
+      const releaseOldRead = yield* Deferred.make<void>();
+      const freshReadStarted = yield* Deferred.make<void>();
+      const releaseFreshRead = yield* Deferred.make<void>();
+      let detailReads = 0;
+      let reassessments = 0;
+      const program = Effect.gen(function* () {
+        const monitor = yield* WorkflowMonitor.WorkflowMonitor;
+        yield* monitor.issueDetail({ projectId: projectOne, repository, number: 11 });
+        reassessments = 0;
+        const refresh = yield* monitor
+          .refresh({ projectId: projectOne, repository })
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(oldReadStarted);
+        yield* monitor.invalidate({ projectId: projectOne, repository });
+        yield* Deferred.succeed(releaseOldRead, undefined);
+        yield* Deferred.await(freshReadStarted);
+        expect(reassessments).toBe(0);
+        yield* Deferred.succeed(releaseFreshRead, undefined);
+        yield* Fiber.join(refresh);
+        expect(reassessments).toBe(1);
+      });
+      yield* program.pipe(
+        Effect.provide(
+          monitorLayer({
+            loadRoots: () => Effect.succeed(roots("current")),
+            onRead: (operation) =>
+              Effect.gen(function* () {
+                if (operation !== "detail") return;
+                detailReads += 1;
+                if (detailReads === 2) {
+                  yield* Deferred.succeed(oldReadStarted, undefined);
+                  yield* Deferred.await(releaseOldRead);
+                } else if (detailReads === 3) {
+                  yield* Deferred.succeed(freshReadStarted, undefined);
+                  yield* Deferred.await(releaseFreshRead);
+                }
+              }),
+            reassess: () =>
+              Effect.sync(() => {
+                reassessments += 1;
+              }),
           }),
         ),
         Effect.scoped,

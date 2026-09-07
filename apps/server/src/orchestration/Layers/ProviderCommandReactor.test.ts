@@ -20,6 +20,7 @@ import {
   EventId,
   MessageId,
   OrchestrationDispatchCommandError,
+  WorkflowDirectorError,
   ProjectId,
   ThreadId,
   TurnId,
@@ -1098,6 +1099,8 @@ describe("ProviderCommandReactor", () => {
       readDirectorRows,
       workflowStart,
       workflowDirector,
+      directorCapability,
+      directorTicket,
       dispatchWorkflow,
       workflowAssignees,
       get titleRegenerationCompletionDispatchAttempts() {
@@ -1403,11 +1406,206 @@ describe("ProviderCommandReactor", () => {
         });
         expect(harness.sendTurn).toHaveBeenCalledWith(
           expect.objectContaining({
-            input: expect.stringContaining("Before every ticket admission"),
+            input: expect.stringContaining("Before every implementation delegation"),
             modelSelection: expect.objectContaining({ model: "gpt-6-astra" }),
           }),
         );
         expect(harness.sendTurn.mock.calls.at(-1)?.[0]).not.toHaveProperty("skills");
+      }),
+  );
+
+  effectIt.effect(
+    "delivers a reassessment interrupt through the real reactor and rejects premature resume",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        NodeFS.mkdirSync("/tmp/provider-project", { recursive: true });
+        const started = yield* harness.workflowDirector.start(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            capabilityNumber: 17,
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          },
+          harness.dispatchWorkflow,
+        );
+        yield* Effect.promise(() => harness.drain());
+        const now = "2026-09-07T12:00:00.000Z";
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("unrelated-capability-create"),
+          threadId: ThreadId.make("unrelated-capability"),
+          projectId: ProjectId.make("project-1"),
+          title: "Unrelated capability",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-6-astra",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("unrelated-capability-session"),
+          threadId: ThreadId.make("unrelated-capability"),
+          session: {
+            threadId: ThreadId.make("unrelated-capability"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: TurnId.make("unrelated-turn"),
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+        yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`INSERT INTO workflow_director_admissions (
+              admission_id,director_id,batch_id,repository,ticket_id,ticket_number,
+              slot_ticket_number,purpose,ownership,claim_status,created_at,updated_at
+            ) SELECT 'admission-reassess',director_id,batch_id,repository,'ticket-100',100,
+              100,'implement','worker','confirmed',${now},${now}
+              FROM workflow_directors WHERE director_id = ${started.director.directorId}`;
+              yield* sql`INSERT INTO workflow_worker_dispatches (
+              dispatch_id,association_token,director_id,batch_id,admission_id,repository,
+              ticket_number,ownership,write_paths_json,requested_model,requested_effort,
+              requested_skill_path,provider_thread_id,status,created_at,updated_at
+            ) SELECT 'dispatch-reassess','association-reassess',director_id,batch_id,
+              'admission-reassess',repository,100,'worker','[]','gpt-5.6-sol','high',
+              '/skills/implement/SKILL.md','native-worker','associated',${now},${now}
+              FROM workflow_directors WHERE director_id = ${started.director.directorId}`;
+              yield* sql`INSERT INTO workflow_ticket_reviews (
+              review_id,association_token,director_id,batch_id,admission_id,
+              implementation_dispatch_id,repository,ticket_number,fixed_base,
+              implementation_head,scope_body,requested_model,requested_effort,
+              requested_skill_path,provider_thread_id,status,created_at,updated_at
+            ) SELECT 'review-reassess','review-association',director_id,batch_id,
+              'admission-reassess','dispatch-reassess',repository,100,'base','head','scope',
+              'gpt-6-astra','medium','/skills/code-review/SKILL.md','native-reviewer',
+              'associated',${now},${now}
+              FROM workflow_directors WHERE director_id = ${started.director.directorId}`;
+              for (const child of ["native-worker", "native-reviewer"]) {
+                yield* sql`INSERT INTO workflow_worker_observations (
+                director_id,provider_thread_id,provider_status,last_event_kind,
+                first_observed_at,updated_at
+              ) VALUES (${started.director.directorId},${child},'running','task.started',${now},${now})`;
+              }
+            }),
+          ),
+        );
+        const changedApproval = harness.directorCapability.evidence!.records.map((record) =>
+          record.kind === "approval" && record.approvalKind === "specification"
+            ? { ...record, scope: "changed" as const }
+            : record,
+        );
+        const invalidated = {
+          ...harness.directorCapability,
+          evidence: { ...harness.directorCapability.evidence!, records: changedApproval },
+        };
+        Object.assign(harness.directorCapability, invalidated);
+        yield* harness.workflowDirector.reassess(
+          { projectId: ProjectId.make("project-1"), issue: invalidated },
+          (command) =>
+            harness.engine.dispatch(command).pipe(
+              Effect.mapError(
+                (error) =>
+                  new WorkflowDirectorError({
+                    failure: "dispatch-failed",
+                    message: "Interrupt dispatch failed.",
+                    detail: String(error),
+                  }),
+              ),
+            ),
+        );
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.interruptTurn).toHaveBeenCalledWith({ threadId: started.director.threadId });
+        const reassessmentRows = yield* Effect.promise(() =>
+          harness.runEffect(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              return yield* sql<{ readonly commandId: string }>`
+              SELECT stop_command_id AS "commandId" FROM workflow_reassessments
+              WHERE director_id = ${started.director.directorId}
+            `;
+            }),
+          ),
+        );
+        expect(
+          Option.getOrNull(
+            yield* Effect.promise(() =>
+              harness.readCommandReceipt(CommandId.make(reassessmentRows[0]!.commandId)),
+            ),
+          ),
+        ).toMatchObject({ status: "accepted" });
+        const snapshot = yield* Effect.promise(() => harness.readModel());
+        expect(
+          snapshot.threads.find((thread) => thread.id === ThreadId.make("unrelated-capability"))
+            ?.session?.status,
+        ).toBe("running");
+        const held = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(held.reassessment?.subjects).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "worker", providerThreadId: "native-worker" }),
+            expect.objectContaining({ kind: "reviewer", providerThreadId: "native-reviewer" }),
+          ]),
+        );
+        const premature = yield* harness.workflowDirector
+          .resume(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+              directorId: started.director.directorId,
+              observation: held.observation,
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-6-astra",
+                options: [{ id: "reasoningEffort", value: "high" }],
+              },
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
+        expect(premature._tag).toBe("Failure");
+        const retried = yield* harness.workflowDirector.retryReassessment(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            capabilityNumber: 17,
+            directorId: started.director.directorId,
+            observation: held.observation,
+          },
+          (command) =>
+            harness.engine.dispatch(command).pipe(
+              Effect.mapError(
+                (error) =>
+                  new WorkflowDirectorError({
+                    failure: "dispatch-failed",
+                    message: "Interrupt retry failed.",
+                    detail: String(error),
+                  }),
+              ),
+            ),
+        );
+        yield* Effect.promise(() => harness.drain());
+        expect(retried.actions).toContain("stop");
+        expect(harness.interruptTurn).toHaveBeenCalledTimes(2);
       }),
   );
 

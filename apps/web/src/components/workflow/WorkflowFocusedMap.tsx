@@ -144,6 +144,9 @@ function WorkflowDetails(props: {
   const resumeDirector = useAtomCommand(workflowEnvironment.directorResume, {
     reportFailure: false,
   });
+  const retryDirectorStop = useAtomCommand(workflowEnvironment.directorReassessmentRetry, {
+    reportFailure: false,
+  });
   const [startPending, setStartPending] = useState(false);
   const [startMessage, setStartMessage] = useState<string | null>(null);
   const query = useEnvironmentQuery(
@@ -365,32 +368,37 @@ function WorkflowDetails(props: {
     }
     openLinkedThread(result.value.environmentId, result.value.threadId);
   };
-  const handleDirectorAction = async (action: "open" | "resume" | "retry") => {
+  const handleDirectorAction = async (action: "open" | "resume" | "retry" | "stop") => {
     if (!director || startPending) return;
     if (action === "open") {
       openLinkedThread(director.environmentId, director.threadId);
       return;
     }
-    if (!directorSelection.selection) return;
     if (action === "retry") {
       await handleStart();
       return;
     }
     setStartPending(true);
     setStartMessage(null);
-    const result = await resumeDirector({
-      environmentId: props.environmentId,
-      input: {
-        projectId: director.projectId,
-        repository: director.repository,
-        capabilityNumber: director.capabilityNumber,
-        directorId: director.directorId,
-        observation: director.observation,
-        modelSelection: directorSelection.selection,
-      },
-    });
+    const common = {
+      projectId: director.projectId,
+      repository: director.repository,
+      capabilityNumber: director.capabilityNumber,
+      directorId: director.directorId,
+      observation: director.observation,
+    };
+    const result =
+      action === "stop"
+        ? await retryDirectorStop({ environmentId: props.environmentId, input: common })
+        : directorSelection.selection
+          ? await resumeDirector({
+              environmentId: props.environmentId,
+              input: { ...common, modelSelection: directorSelection.selection },
+            })
+          : null;
     setStartPending(false);
     directorQuery.refresh();
+    if (!result) return;
     if (result._tag === "Failure") {
       const failure = squashAtomCommandFailure(result);
       setStartMessage(
@@ -398,7 +406,9 @@ function WorkflowDetails(props: {
       );
       return;
     }
-    openLinkedThread(result.value.environmentId, result.value.threadId);
+    if (action === "resume") {
+      openLinkedThread(result.value.environmentId, result.value.threadId);
+    }
   };
   const handleRecovery = async (action: "open" | "resume" | "start-fresh" | "takeover") => {
     const state = recoveryQuery.data;
@@ -524,6 +534,47 @@ function WorkflowDetails(props: {
             observed {director.observedProfile.model ?? "unknown"}/
             {director.observedProfile.effort ?? "unknown"} ({director.observedProfile.match})
           </p>
+          {director.reassessment ? (
+            <div className="mt-2 border-border border-t pt-2">
+              <h4 className="font-medium text-xs">Reassessment</h4>
+              <p className="mt-1 text-muted-foreground text-xs">
+                {director.reassessment.requiredAction}
+              </p>
+              <ul className="mt-1 space-y-1 text-xs">
+                {director.reassessment.triggers.map((trigger) => (
+                  <li key={`${trigger.kind}:${trigger.issueNumber}:${trigger.source}`}>
+                    <a
+                      className="inline-flex items-center gap-1 text-info hover:underline"
+                      href={trigger.source}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                    >
+                      {trigger.kind} #{trigger.issueNumber} <ExternalLink className="size-3" />
+                    </a>
+                    <p className="text-muted-foreground">{trigger.requiredAction}</p>
+                  </li>
+                ))}
+              </ul>
+              <ul className="mt-1 space-y-1 text-xs">
+                {director.reassessment.subjects.map((subject) => (
+                  <li key={subject.subjectId}>
+                    <span className="font-medium">{subject.kind}</span>{" "}
+                    <span className="break-all text-muted-foreground">
+                      {subject.providerThreadId ?? subject.subjectId} · {subject.outcome} · request{" "}
+                      {subject.requestStatus}
+                    </span>
+                    {subject.detail ? (
+                      <p className="text-muted-foreground">{subject.detail}</p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-1 text-muted-foreground text-xs">
+                Tracker {director.reassessment.trackerStatus} · stop request{" "}
+                {director.reassessment.stopRequestStatus}
+              </p>
+            </div>
+          ) : null}
           {director.workers.length > 0 ? (
             <div className="mt-2 border-border border-t pt-2">
               <h4 className="font-medium text-xs">Worker history</h4>
@@ -713,6 +764,16 @@ function WorkflowDetails(props: {
                 onClick={() => void handleDirectorAction("resume")}
               >
                 Resume
+              </Button>
+            ) : null}
+            {director.actions.includes("stop") ? (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={startPending}
+                onClick={() => void handleDirectorAction("stop")}
+              >
+                Retry stop
               </Button>
             ) : null}
             {director.actions.includes("retry") ? (

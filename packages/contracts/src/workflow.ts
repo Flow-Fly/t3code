@@ -582,6 +582,46 @@ export const WorkflowTicketResolutionStatus = Schema.Struct({
 });
 export type WorkflowTicketResolutionStatus = typeof WorkflowTicketResolutionStatus.Type;
 
+export const WorkflowInterruptionSubject = Schema.Struct({
+  subjectId: TrimmedNonEmptyString,
+  kind: Schema.Literals(["director", "worker", "reviewer", "unknown-child"]),
+  providerThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  parentProviderThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  nativeSessionId: Schema.NullOr(TrimmedNonEmptyString),
+  nativeTurnId: Schema.NullOr(TrimmedNonEmptyString),
+  interruptAttemptId: Schema.NullOr(TrimmedNonEmptyString),
+  requestStatus: Schema.Literals(["not-issued", "requested", "acknowledged", "failed", "unknown"]),
+  outcome: Schema.Literals(["stopping", "stopped", "failed", "unknown", "closed", "resumed"]),
+  detail: Schema.NullOr(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+export type WorkflowInterruptionSubject = typeof WorkflowInterruptionSubject.Type;
+
+export const WorkflowReassessmentStatus = Schema.Struct({
+  reassessmentId: TrimmedNonEmptyString,
+  triggerKind: Schema.Literals(["scope-change", "prerequisite"]),
+  triggerIssueNumber: PositiveInt,
+  triggerSource: TrimmedNonEmptyString,
+  status: Schema.Literals(["stopping", "held", "clearing", "cleared"]),
+  requiredAction: TrimmedNonEmptyString,
+  stopRequestStatus: Schema.Literals(["not-issued", "submitted", "failed", "unknown"]),
+  trackerStatus: Schema.Literals(["not-written", "pending", "uncertain", "confirmed"]),
+  trackerUrl: Schema.NullOr(TrimmedNonEmptyString),
+  triggers: Schema.Array(
+    Schema.Struct({
+      kind: Schema.Literals(["scope-change", "prerequisite"]),
+      issueNumber: PositiveInt,
+      source: TrimmedNonEmptyString,
+      requiredAction: TrimmedNonEmptyString,
+      discoveredAt: IsoDateTime,
+    }),
+  ),
+  subjects: Schema.Array(WorkflowInterruptionSubject),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type WorkflowReassessmentStatus = typeof WorkflowReassessmentStatus.Type;
+
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
   batchId: TrimmedNonEmptyString,
@@ -601,8 +641,9 @@ export const WorkflowDirectorStatus = Schema.Struct({
   workers: Schema.Array(WorkflowWorkerStatus),
   reviews: Schema.optionalKey(Schema.Array(WorkflowTicketReviewStatus)),
   resolutions: Schema.optionalKey(Schema.Array(WorkflowTicketResolutionStatus)),
+  reassessment: Schema.optionalKey(Schema.NullOr(WorkflowReassessmentStatus)),
   observation: TrimmedNonEmptyString,
-  actions: Schema.Array(Schema.Literals(["open", "resume", "retry"])),
+  actions: Schema.Array(Schema.Literals(["open", "resume", "retry", "stop"])),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   message: TrimmedNonEmptyString,
@@ -624,6 +665,16 @@ export const WorkflowDirectorResumeInput = Schema.Struct({
   modelSelection: ModelSelection,
 });
 export type WorkflowDirectorResumeInput = typeof WorkflowDirectorResumeInput.Type;
+
+export const WorkflowDirectorReassessmentRetryInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  capabilityNumber: PositiveInt,
+  directorId: TrimmedNonEmptyString,
+  observation: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorReassessmentRetryInput =
+  typeof WorkflowDirectorReassessmentRetryInput.Type;
 
 export const WorkflowDirectorAdmissionPurpose = Schema.Literals(["implement", "retry", "review"]);
 export type WorkflowDirectorAdmissionPurpose = typeof WorkflowDirectorAdmissionPurpose.Type;

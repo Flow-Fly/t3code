@@ -530,6 +530,8 @@ describe("CodexSessionRuntime collab integration", () => {
         rootThreadId: ROOT,
         holdTurnOpen: true,
         hangInterruptFor: CHILD_A,
+        failInterruptFor: CHILD_B,
+        turnIds: ["native-initial-stop-turn", "native-stop-sentinel"],
         notifications: [
           turnStartedA,
           registrationA,
@@ -561,27 +563,36 @@ describe("CodexSessionRuntime collab integration", () => {
       // Wait for both children's turnStarted signals to be processed before
       // stopping (B via the registered-child path; A only produces live-turn
       // bookkeeping, so key on B's synthetic event).
-      const childBStartedFiber = yield* runtime.events.pipe(
-        Stream.filter(
-          (event) =>
-            event.method === "collabAgent/turnStarted" &&
-            (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_B,
+      const childBStarted = yield* Deferred.make<void>();
+      const drained = yield* Deferred.make<void>();
+      const observed: ProviderEvent[] = [];
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            observed.push(event);
+            if (
+              event.method === "collabAgent/turnStarted" &&
+              (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_B
+            ) {
+              yield* Deferred.succeed(childBStarted, undefined);
+            }
+            if (event.method === "turn/started" && event.turnId === "native-stop-sentinel") {
+              yield* Deferred.succeed(drained, undefined);
+            }
+          }),
         ),
-        Stream.take(1),
-        Stream.runCollect,
         Effect.forkScoped,
       );
 
       yield* runtime.start();
       yield* runtime.sendTurn({ input: "fan out and hang" });
-      const childBStarted = yield* Fiber.join(childBStartedFiber).pipe(
-        Effect.timeoutOption("15 seconds"),
-      );
-      assert.isTrue(childBStarted._tag === "Some", "child B turnStarted never arrived");
+      yield* Deferred.await(childBStarted);
 
       // Stop everything. A's interrupt hangs forever — the bounded child
       // deadline must expire and the parent interrupt must still be sent.
       yield* runtime.interruptTurn();
+      yield* runtime.sendTurn({ input: "drain stop observations" });
+      yield* Deferred.await(drained);
 
       const parseInterruptLine = (line: string) => JSON.parse(line) as { threadId?: string };
       const interrupted = NodeFS.readFileSync(interruptsPath, "utf8")
@@ -600,6 +611,39 @@ describe("CodexSessionRuntime collab integration", () => {
         "memory consolidation must be interrupted without appearing in chat",
       );
       assert.isTrue(interruptedThreads.has(ROOT), "parent turn must be interrupted last");
+      assert.isTrue(
+        observed.some(
+          (event) =>
+            event.method === "collabAgent/interruptFailed" &&
+            (event.payload as { agentThreadId?: string; interruptRequestStatus?: string })
+              .agentThreadId === CHILD_A &&
+            (event.payload as { interruptRequestStatus?: string }).interruptRequestStatus ===
+              "unknown",
+        ),
+        "the timed out child request must remain explicitly unknown",
+      );
+      assert.isTrue(
+        observed.some(
+          (event) =>
+            event.method === "collabAgent/interruptFailed" &&
+            (event.payload as { agentThreadId?: string; interruptRequestStatus?: string })
+              .agentThreadId === CHILD_B &&
+            (event.payload as { interruptRequestStatus?: string }).interruptRequestStatus ===
+              "failed",
+        ),
+        "the rejected child request must remain explicitly failed",
+      );
+      assert.deepEqual(
+        observed
+          .filter(
+            (event) =>
+              event.method?.startsWith("collabAgent/") &&
+              (event.payload as { agentThreadId?: string }).agentThreadId === MEMORY,
+          )
+          .map((event) => event.method),
+        [],
+        "memory consolidation must stay out of user-facing worker events",
+      );
 
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

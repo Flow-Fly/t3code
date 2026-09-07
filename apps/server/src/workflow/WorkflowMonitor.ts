@@ -1,4 +1,5 @@
 import {
+  WorkflowDirectorError,
   type ProjectId,
   type WorkflowChildrenInput,
   type WorkflowChildrenResult,
@@ -27,6 +28,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as WorkflowDirectorService from "./WorkflowDirectorService.ts";
 import * as WorkflowService from "./WorkflowService.ts";
+import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 
 const REFRESH_INTERVAL = Duration.seconds(30);
 const MAX_BACKOFF = Duration.minutes(15);
@@ -34,6 +36,11 @@ const CACHE_CAPACITY = 256;
 const CACHE_REFRESH_RETENTION = Duration.minutes(1);
 
 type CachedValue = WorkflowRootsResult | WorkflowChildrenResult | WorkflowIssueDetail;
+
+type RefreshEntryResult = {
+  readonly error: WorkflowQueryError | null;
+  readonly capability: WorkflowIssueDetail | null;
+};
 
 type CacheEntry =
   | {
@@ -204,6 +211,7 @@ export class WorkflowRefreshNotifier extends Context.Reference<{
 export const make = Effect.gen(function* () {
   const workflow = yield* WorkflowService.WorkflowService;
   const directors = yield* WorkflowDirectorService.WorkflowDirectorService;
+  const orchestration = yield* OrchestrationEngine.OrchestrationEngineService;
   const sql = yield* SqlClient.SqlClient;
   const stateLock = yield* Semaphore.make(1);
   const refreshRequests = yield* Queue.unbounded<{
@@ -344,34 +352,37 @@ export const make = Effect.gen(function* () {
           const result = yield* workflow.roots(entry.input).pipe(Effect.result);
           if (result._tag === "Failure") {
             entry.error = result.failure;
-            return result.failure;
+            return { error: result.failure, capability: null } satisfies RefreshEntryResult;
           }
           entry.value = result.success;
           entry.error = null;
           entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-          return null;
+          return { error: null, capability: null } satisfies RefreshEntryResult;
         }
         case "children": {
           const result = yield* workflow.children(entry.input).pipe(Effect.result);
           if (result._tag === "Failure") {
             entry.error = result.failure;
-            return result.failure;
+            return { error: result.failure, capability: null } satisfies RefreshEntryResult;
           }
           entry.value = result.success;
           entry.error = null;
           entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-          return null;
+          return { error: null, capability: null } satisfies RefreshEntryResult;
         }
         case "detail": {
           const result = yield* workflow.issueDetail(entry.input).pipe(Effect.result);
           if (result._tag === "Failure") {
             entry.error = result.failure;
-            return result.failure;
+            return { error: result.failure, capability: null } satisfies RefreshEntryResult;
           }
           entry.value = result.success;
           entry.error = null;
           entry.lastRefreshedAtMs = yield* Clock.currentTimeMillis;
-          return null;
+          return {
+            error: null,
+            capability: result.success.kind === "capability" ? result.success : null,
+          } satisfies RefreshEntryResult;
         }
       }
     }).pipe(Effect.ensuring(finishRequest));
@@ -410,7 +421,7 @@ export const make = Effect.gen(function* () {
               (entry) => refreshEntry(entry, generation),
               { concurrency: 4 },
             );
-            const error = errors.find((candidate) => candidate !== null) ?? null;
+            const error = errors.find((candidate) => candidate.error !== null)?.error ?? null;
             const completedAt = yield* Clock.currentTimeMillis;
             if (capturedEpoch !== state.epoch) {
               state.status = "stale";
@@ -428,6 +439,31 @@ export const make = Effect.gen(function* () {
             if (requestedGeneration > generation) {
               minimumGeneration = requestedGeneration;
               return null;
+            }
+            for (const capability of errors.flatMap((candidate) =>
+              candidate.capability ? [candidate.capability] : [],
+            )) {
+              yield* directors
+                .reassess({ projectId: state.projectId, issue: capability }, (command) =>
+                  orchestration.dispatch(command).pipe(
+                    Effect.mapError(
+                      (dispatchError) =>
+                        new WorkflowDirectorError({
+                          failure: "dispatch-failed",
+                          message: "The reassessment interrupt command could not be submitted.",
+                          detail: String(dispatchError),
+                        }),
+                    ),
+                  ),
+                )
+                .pipe(
+                  Effect.catch((reassessmentError) =>
+                    Effect.logWarning("Workflow reassessment could not be recorded.", {
+                      capabilityNumber: capability.number,
+                      error: reassessmentError,
+                    }),
+                  ),
+                );
             }
             if (error !== null) {
               state.attemptedEpoch = capturedEpoch;
@@ -488,7 +524,11 @@ export const make = Effect.gen(function* () {
         t.archived_at AS "archivedAt", t.deleted_at AS "deletedAt"
       FROM workflow_directors d
       LEFT JOIN projection_threads t ON t.thread_id = d.thread_id
-      WHERE d.is_current = 1 AND d.status = 'active'
+      WHERE d.is_current = 1
+        AND (d.status = 'active' OR EXISTS (
+          SELECT 1 FROM workflow_reassessments r
+          WHERE r.director_id = d.director_id AND r.status != 'cleared'
+        ))
         AND d.initial_turn_disposition = 'accepted'
     `;
     const active = [];

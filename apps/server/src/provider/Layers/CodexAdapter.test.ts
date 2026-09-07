@@ -1191,6 +1191,86 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("keeps interrupt requests separate from matching native turn completion", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil(
+          (event) => event.type === "task.updated" && event.payload.taskId === "child-sentinel",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const childEvent = (id: string, method: string, payload: Record<string, unknown>) => ({
+        id: asEventId(id),
+        kind: "notification" as const,
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method,
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("parent-turn-1"),
+        payload: {
+          agentThreadId: "child-1",
+          agentPath: "/root/child-1",
+          nativeSessionId: "provider-parent-1",
+          nativeTurnId: "child-turn-1",
+          interruptAttemptId: "interrupt-1",
+          ...payload,
+        },
+      });
+
+      yield* runtime.emit(
+        childEvent("evt-interrupt-requested", "collabAgent/interruptRequested", {
+          interruptRequestStatus: "requested",
+        }),
+      );
+      yield* runtime.emit(
+        childEvent("evt-interrupt-ack", "collabAgent/interruptAcknowledged", {
+          interruptRequestStatus: "acknowledged",
+        }),
+      );
+      yield* runtime.emit(
+        childEvent("evt-interrupt-completed", "collabAgent/turnCompleted", {
+          interruptRequestStatus: "acknowledged",
+          turn: { id: "child-turn-1", status: "interrupted" },
+        }),
+      );
+      yield* runtime.emit({
+        ...childEvent("evt-existing-fallback", "collabAgent/turnStarted", {}),
+        payload: { agentThreadId: "child-sentinel", agentPath: "/root/sentinel" },
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.deepStrictEqual(
+        events.map((event) =>
+          event.type === "task.updated" ? event.payload.nativeInterruption : null,
+        ),
+        [
+          {
+            attemptId: "interrupt-1",
+            sessionId: "provider-parent-1",
+            turnId: "child-turn-1",
+            requestStatus: "requested",
+          },
+          {
+            attemptId: "interrupt-1",
+            sessionId: "provider-parent-1",
+            turnId: "child-turn-1",
+            requestStatus: "acknowledged",
+          },
+          {
+            attemptId: "interrupt-1",
+            sessionId: "provider-parent-1",
+            turnId: "child-turn-1",
+            requestStatus: "acknowledged",
+            completionStatus: "interrupted",
+          },
+          undefined,
+        ],
+      );
+    }),
+  );
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

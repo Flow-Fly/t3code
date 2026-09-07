@@ -2635,6 +2635,653 @@ describe("WorkflowDirectorService", () => {
       expect(forgedParent._tag).toBe("Failure");
     }).pipe(Effect.provide(test.layer));
   });
+  it.effect(
+    "holds before interruption and preserves every live reassessment subject and trigger",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const liveCapability = structuredClone(fixture.capability);
+      const githubCalls: ReadonlyArray<string>[] = [];
+      let shell: Option.Option<unknown> = Option.none();
+      const test = harness({
+        capability: liveCapability,
+        ticketDetails: fixture.ticketDetails,
+        threadShell: () => Effect.succeed(shell as never),
+        githubExecute: ({ args }) =>
+          Effect.sync(() => {
+            githubCalls.push(args);
+            return output(args[0] === "api" ? "Flow-Fly\n" : "");
+          }),
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const sql = yield* SqlClient.SqlClient;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        yield* seedDirectorProviderIdentity(sql, started.director.directorId);
+        yield* recordWorkflowWorkerObservation({
+          type: "turn.started",
+          eventId: EventId.make("director-native-running"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:00:00.000Z",
+          payload: { turnId: "orchestration-turn" },
+          raw: { payload: { threadId: "native-director", turn: { id: "native-root-turn" } } },
+        } as ProviderRuntimeEvent);
+        yield* recordWorkflowWorkerObservation({
+          type: "task.started",
+          eventId: EventId.make("child-running-before-hold"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:00:01.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("native-child"),
+            description: "worker",
+            timelineBypass: true,
+            nativeTurn: {
+              sessionId: "native-child",
+              turnId: "native-child-turn",
+              status: "running",
+            },
+          },
+        });
+
+        const changedRecords = liveCapability.evidence!.records.map((record) =>
+          record.kind === "approval" && record.approvalKind === "specification"
+            ? { ...record, scope: "changed" as const }
+            : record,
+        );
+        const blocker = {
+          ...issue(999, "Reopened prerequisite", "task", null),
+          readiness: {
+            status: "blocked" as const,
+            reasons: [
+              {
+                kind: "open-blocker" as const,
+                message: "The prerequisite reopened.",
+                source: `https://github.com/${repository}/issues/999`,
+              },
+            ],
+          },
+        };
+        const invalidated = {
+          ...liveCapability,
+          blockedBy: [blocker],
+          evidence: { ...liveCapability.evidence!, records: changedRecords },
+        };
+        Object.assign(liveCapability, invalidated);
+        const interruptCommands: OrchestrationCommand[] = [];
+        yield* service.reassess({ projectId, issue: invalidated }, (command) =>
+          Effect.gen(function* () {
+            const rows = yield* sql<{
+              readonly status: string;
+              readonly trackerBody: string | null;
+            }>`
+            SELECT d.status, r.tracker_body AS "trackerBody"
+            FROM workflow_directors d JOIN workflow_reassessments r
+              ON r.director_id = d.director_id
+            WHERE d.director_id = ${started.director.directorId}
+          `;
+            expect(rows[0]).toMatchObject({ status: "held" });
+            expect(rows[0]?.trackerBody).toContain("Outcome: scope-change");
+            interruptCommands.push(command);
+            return { sequence: 501 };
+          }),
+        );
+
+        const held = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        expect(interruptCommands).toHaveLength(1);
+        expect(held).toMatchObject({
+          status: "held",
+          reassessment: {
+            triggerKind: "scope-change",
+            stopRequestStatus: "submitted",
+            trackerStatus: "uncertain",
+            subjects: expect.arrayContaining([
+              expect.objectContaining({ kind: "director", outcome: "unknown" }),
+              expect.objectContaining({
+                kind: "unknown-child",
+                providerThreadId: "native-child",
+                outcome: "unknown",
+              }),
+            ]),
+          },
+        });
+        const triggers = yield* sql<{ readonly kind: string; readonly number: number }>`
+        SELECT trigger_kind AS kind, trigger_issue_number AS number
+        FROM workflow_reassessment_triggers
+        WHERE reassessment_id = ${held.reassessment!.reassessmentId}
+        ORDER BY trigger_kind, trigger_issue_number
+      `;
+        expect(triggers).toEqual([
+          { kind: "prerequisite", number: 999 },
+          { kind: "scope-change", number: 17 },
+        ]);
+        expect(held.reassessment?.triggers).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "prerequisite", issueNumber: 999 }),
+            expect.objectContaining({ kind: "scope-change", issueNumber: 17 }),
+          ]),
+        );
+        expect(githubCalls.some((args) => args[0] === "issue" && args[1] === "comment")).toBe(true);
+
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("native-child-interrupt-failed"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:00:01.500Z",
+          payload: {
+            taskId: RuntimeTaskId.make("native-child"),
+            timelineBypass: true,
+            nativeInterruption: {
+              attemptId: "first-stop-attempt",
+              sessionId: "native-child",
+              turnId: "native-child-turn",
+              requestStatus: "failed",
+              detail: "The provider rejected the child interrupt request.",
+            },
+          },
+        });
+        const afterRejectedChild = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(afterRejectedChild.reassessment?.subjects).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              providerThreadId: "native-child",
+              nativeTurnId: "native-child-turn",
+              requestStatus: "failed",
+              outcome: "failed",
+            }),
+          ]),
+        );
+
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("late-child-running"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:00:02.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("late-child"),
+            status: "running",
+            timelineBypass: true,
+          },
+        });
+        const withLateChild = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(withLateChild.actions).not.toContain("resume");
+        expect(withLateChild.reassessment?.subjects).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ providerThreadId: "late-child", outcome: "resumed" }),
+          ]),
+        );
+
+        const trackerRows = yield* sql<{ readonly body: string }>`
+        SELECT tracker_body AS body FROM workflow_reassessments
+        WHERE reassessment_id = ${held.reassessment!.reassessmentId}
+      `;
+        const trackerBody = trackerRows[0]!.body;
+        const scopeChangeEvidence = {
+          id: "persisted-scope-change",
+          url: `${liveCapability.url}#issuecomment-scope-change`,
+          createdAt: "2026-09-07T12:01:00.000Z",
+          kind: "reassessment" as const,
+          state: "superseded" as const,
+          sourceAccess: "verified" as const,
+          scope: "current" as const,
+          summary: "Scope changed while work was active.",
+          source: liveCapability.url,
+          outcome: "scope-change" as const,
+          evidence: `artifact: workflow-reassessment:${held.reassessment!.reassessmentId}`,
+          bodyFingerprint: workflowEvidenceBodyFingerprint(trackerBody),
+        };
+        const clearedEvidence = {
+          id: "current-cleared-reassessment",
+          url: `${liveCapability.url}#issuecomment-cleared`,
+          createdAt: "2099-09-07T12:02:00.000Z",
+          kind: "reassessment" as const,
+          state: "current" as const,
+          sourceAccess: "verified" as const,
+          scope: "current" as const,
+          summary: "Reassessment cleared after renewed approval.",
+          source: scopeChangeEvidence.url,
+          outcome: "cleared" as const,
+          evidence: `Supersedes: ${scopeChangeEvidence.url}`,
+        };
+        Object.assign(liveCapability, {
+          ...fixture.capability,
+          evidence: {
+            ...fixture.capability.evidence!,
+            records: [
+              ...fixture.capability.evidence!.records,
+              scopeChangeEvidence,
+              clearedEvidence,
+            ],
+          },
+        });
+        const commentCount = githubCalls.filter(
+          (args) => args[0] === "issue" && args[1] === "comment",
+        ).length;
+        const retried = yield* service.retryReassessment(
+          {
+            projectId,
+            repository,
+            capabilityNumber: 17,
+            directorId: started.director.directorId,
+            observation: withLateChild.observation,
+          },
+          (command) =>
+            Effect.sync(() => {
+              interruptCommands.push(command);
+              return { sequence: 502 };
+            }),
+        );
+        expect(retried.reassessment?.trackerStatus).toBe("confirmed");
+        expect(interruptCommands).toHaveLength(2);
+        expect(
+          githubCalls.filter((args) => args[0] === "issue" && args[1] === "comment"),
+        ).toHaveLength(commentCount);
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("native-child-interrupt-acknowledged"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:02:30.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("native-child"),
+            timelineBypass: true,
+            nativeInterruption: {
+              attemptId: "second-stop-attempt",
+              sessionId: "native-child",
+              turnId: "native-child-turn",
+              requestStatus: "acknowledged",
+            },
+          },
+        });
+        yield* recordWorkflowWorkerObservation({
+          type: "task.updated",
+          eventId: EventId.make("native-child-interrupted"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:02:31.000Z",
+          payload: {
+            taskId: RuntimeTaskId.make("native-child"),
+            status: "interrupted",
+            timelineBypass: true,
+            nativeTurn: {
+              sessionId: "native-child",
+              turnId: "native-child-turn",
+              status: "interrupted",
+            },
+            nativeInterruption: {
+              attemptId: "second-stop-attempt",
+              sessionId: "native-child",
+              turnId: "native-child-turn",
+              requestStatus: "acknowledged",
+              completionStatus: "interrupted",
+            },
+          },
+        });
+        const afterNativeChildStop = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(afterNativeChildStop.reassessment?.subjects).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ providerThreadId: "native-child", outcome: "stopped" }),
+          ]),
+        );
+
+        yield* recordWorkflowWorkerObservation({
+          type: "turn.completed",
+          eventId: EventId.make("director-native-ended-after-hold"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          threadId: started.director.threadId,
+          createdAt: "2026-09-07T12:03:00.000Z",
+          payload: { state: "completed" },
+          raw: { payload: { threadId: "native-director", turn: { id: "native-root-turn" } } },
+        } as ProviderRuntimeEvent);
+        yield* sql`UPDATE workflow_interruption_subjects SET outcome = 'stopped',
+        request_status = 'acknowledged', detail = 'Matching native child turns ended.'
+        WHERE reassessment_id = ${held.reassessment!.reassessmentId} AND subject_kind != 'director'`;
+        shell = Option.some({
+          id: started.director.threadId,
+          latestTurn: { turnId: "orchestration-turn", state: "completed" },
+          session: { status: "interrupted", activeTurnId: null },
+        });
+        const resumable = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        expect(resumable.actions).toContain("resume");
+        const resumed = yield* service.resume(
+          {
+            projectId,
+            repository,
+            capabilityNumber: 17,
+            directorId: started.director.directorId,
+            observation: resumable.observation,
+            modelSelection,
+          },
+          test.dispatch,
+        );
+        expect(resumed.status).toBe("active");
+        expect(resumed.reassessment).toBeNull();
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
+
+  it.effect("does not interrupt on unverified invalidation evidence", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    const liveCapability = structuredClone(fixture.capability);
+    const test = harness({ capability: liveCapability, ticketDetails: fixture.ticketDetails });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      let interrupts = 0;
+      Object.assign(liveCapability, {
+        ...fixture.capability,
+        evidence: {
+          ...fixture.capability.evidence!,
+          records: fixture.capability.evidence!.records.map((record) =>
+            record.kind === "approval" && record.approvalKind === "specification"
+              ? { ...record, scope: "changed" as const, authority: "reported" as const }
+              : record,
+          ),
+        },
+      });
+      yield* service.reassess({ projectId, issue: liveCapability }, () =>
+        Effect.sync(() => {
+          interrupts += 1;
+          return { sequence: 1 };
+        }),
+      );
+      expect(interrupts).toBe(0);
+
+      const unavailableClosedBlocker = {
+        ...issue(999, "Closed prerequisite", "task", null),
+        state: "closed" as const,
+        stateReason: "completed" as const,
+        readiness: {
+          status: "closed-unverified" as const,
+          reasons: [
+            {
+              kind: "missing-resolution" as const,
+              message: "Resolution evidence is unavailable.",
+              source: `https://github.com/${repository}/issues/999`,
+            },
+          ],
+        },
+      };
+      Object.assign(liveCapability, {
+        ...fixture.capability,
+        blockedBy: [unavailableClosedBlocker],
+      });
+      yield* service.reassess({ projectId, issue: liveCapability }, () =>
+        Effect.sync(() => {
+          interrupts += 1;
+          return { sequence: 2 };
+        }),
+      );
+      expect(interrupts).toBe(0);
+      const status = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+      expect(status.directorId).toBe(started.director.directorId);
+      expect(status.reassessment).toBeNull();
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("holds legacy admissions that have no durable scope baseline", () => {
+    const fixture = interpretedCapabilityFixture(1);
+    let claimed = false;
+    const test = harness({
+      ...fixture,
+      githubExecute: ({ args }) => {
+        if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+        if (args[0] === "issue" && args[1] === "view") {
+          return Effect.succeed(output(claimed ? "Flow-Fly\n" : ""));
+        }
+        if (args[0] === "issue" && args[1] === "edit") claimed = true;
+        return Effect.succeed(output(""));
+      },
+    });
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const sql = yield* SqlClient.SqlClient;
+      const started = yield* service.start(
+        { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+        test.dispatch,
+      );
+      const ticketNumber = fixture.ticketDetails[0]!.number;
+      yield* service.admit({
+        projectId,
+        directorId: started.director.directorId,
+        repository,
+        ticketNumber,
+        purpose: "implement",
+        ownership: "legacy baseline test",
+      });
+      yield* sql`UPDATE workflow_director_admissions SET scope_body = NULL,
+        scope_fingerprint = NULL WHERE director_id = ${started.director.directorId}`;
+
+      const admission = yield* service
+        .admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber,
+          purpose: "retry",
+          ownership: "legacy baseline test",
+        })
+        .pipe(Effect.result);
+      const preparation = yield* service
+        .prepareWorker(environmentId, started.director.threadId, instanceId, {
+          ticketNumber,
+          ownership: "legacy baseline test",
+          writePaths: ["apps/server/src/workflow"],
+        })
+        .pipe(Effect.result);
+      expect(admission).toMatchObject({
+        _tag: "Failure",
+        failure: { failure: "not-ready", message: expect.stringContaining("legacy admission") },
+      });
+      expect(preparation).toMatchObject({
+        _tag: "Failure",
+        failure: { failure: "not-ready", message: expect.stringContaining("legacy admission") },
+      });
+      yield* sql`UPDATE workflow_director_admissions SET scope_body = ${fixture.ticketDetails[0]!.body},
+        scope_fingerprint = ${workflowEvidenceBodyFingerprint(fixture.ticketDetails[0]!.body)},
+        current_scope_body = NULL, current_scope_fingerprint = NULL
+        WHERE director_id = ${started.director.directorId}`;
+      yield* sql`UPDATE workflow_directors SET specification_fingerprint = NULL
+        WHERE director_id = ${started.director.directorId}`;
+      const legacyDirector = yield* service
+        .admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber,
+          purpose: "retry",
+          ownership: "legacy baseline test",
+        })
+        .pipe(Effect.result);
+      expect(legacyDirector).toMatchObject({
+        _tag: "Failure",
+        failure: { failure: "not-ready", message: expect.stringContaining("legacy director") },
+      });
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect(
+    "requires reassessment for changed admitted scope and refreshes authority on resume",
+    () => {
+      const fixture = interpretedCapabilityFixture(1);
+      const liveCapability = structuredClone(fixture.capability);
+      const liveTicket = structuredClone(fixture.ticketDetails[0]!);
+      let shell: Option.Option<unknown> = Option.none();
+      let claimed = false;
+      const test = harness({
+        capability: liveCapability,
+        ticketDetails: [liveTicket],
+        threadShell: () => Effect.succeed(shell as never),
+        githubExecute: ({ args }) => {
+          if (args[0] === "api") return Effect.succeed(output("Flow-Fly\n"));
+          if (args[0] === "issue" && args[1] === "view") {
+            return Effect.succeed(output(claimed ? "Flow-Fly\n" : ""));
+          }
+          if (args[0] === "issue" && args[1] === "edit") claimed = true;
+          return Effect.succeed(output(""));
+        },
+      });
+      return Effect.gen(function* () {
+        const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+        const sql = yield* SqlClient.SqlClient;
+        const started = yield* service.start(
+          { projectId, repository, rootNumber: 10, capabilityNumber: 17, modelSelection },
+          test.dispatch,
+        );
+        yield* service.admit({
+          projectId,
+          directorId: started.director.directorId,
+          repository,
+          ticketNumber: liveTicket.number,
+          purpose: "implement",
+          ownership: "changed ticket scope",
+        });
+        Object.assign(liveTicket, {
+          ...liveTicket,
+          body: `${liveTicket.body}\n\nRenewed approved delivery detail.`,
+          evidence: {
+            ...liveTicket.evidence!,
+            records: liveTicket.evidence!.records.map((record) =>
+              record.kind === "approval"
+                ? { ...record, scope: "current" as const, authority: "verified" as const }
+                : record,
+            ),
+          },
+        });
+
+        const bypass = yield* service
+          .admit({
+            projectId,
+            directorId: started.director.directorId,
+            repository,
+            ticketNumber: liveTicket.number,
+            purpose: "retry",
+            ownership: "changed ticket scope",
+          })
+          .pipe(Effect.result);
+        expect(bypass).toMatchObject({
+          _tag: "Failure",
+          failure: { failure: "not-ready", message: expect.stringContaining("scope changed") },
+        });
+
+        let interruptCount = 0;
+        yield* service.reassess({ projectId, issue: liveCapability }, () =>
+          Effect.sync(() => {
+            interruptCount += 1;
+            return { sequence: 800 };
+          }),
+        );
+        const held = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        expect(held.reassessment?.triggers).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "scope-change", issueNumber: liveTicket.number }),
+          ]),
+        );
+        const trackerRows = yield* sql<{ readonly body: string }>`
+        SELECT tracker_body AS body FROM workflow_reassessments
+        WHERE reassessment_id = ${held.reassessment!.reassessmentId}
+      `;
+        const scopeSource = held.reassessment!.triggers.find(
+          (trigger) => trigger.issueNumber === liveTicket.number,
+        )!.source;
+        const scopeRecordUrl = `${liveCapability.url}#issuecomment-ticket-scope-change`;
+        Object.assign(liveCapability, {
+          ...liveCapability,
+          evidence: {
+            ...liveCapability.evidence!,
+            records: [
+              ...liveCapability.evidence!.records,
+              {
+                id: "ticket-scope-change",
+                url: scopeRecordUrl,
+                createdAt: "2026-09-07T13:00:00.000Z",
+                kind: "reassessment" as const,
+                state: "superseded" as const,
+                sourceAccess: "verified" as const,
+                scope: "current" as const,
+                summary: "Ticket scope changed.",
+                source: scopeSource,
+                outcome: "scope-change" as const,
+                evidence: `artifact: workflow-reassessment:${held.reassessment!.reassessmentId}`,
+                bodyFingerprint: workflowEvidenceBodyFingerprint(trackerRows[0]!.body),
+              },
+              {
+                id: "ticket-scope-cleared",
+                url: `${liveCapability.url}#issuecomment-ticket-scope-cleared`,
+                createdAt: "2099-09-07T13:01:00.000Z",
+                kind: "reassessment" as const,
+                state: "current" as const,
+                sourceAccess: "verified" as const,
+                scope: "current" as const,
+                summary: "Ticket scope was reapproved.",
+                source: scopeRecordUrl,
+                outcome: "cleared" as const,
+                evidence: `Supersedes: ${scopeRecordUrl}`,
+              },
+            ],
+          },
+        });
+        yield* sql`UPDATE workflow_interruption_subjects SET outcome = 'stopped',
+        request_status = 'acknowledged' WHERE reassessment_id = ${held.reassessment!.reassessmentId}`;
+        shell = Option.some({
+          id: started.director.threadId,
+          latestTurn: { turnId: "ended-before-resume", state: "completed" },
+          session: { status: "idle", activeTurnId: null },
+        });
+        const resumable = yield* service.status({ projectId, repository, capabilityNumber: 17 });
+        const resumed = yield* service.resume(
+          {
+            projectId,
+            repository,
+            capabilityNumber: 17,
+            directorId: started.director.directorId,
+            observation: resumable.observation,
+            modelSelection,
+          },
+          test.dispatch,
+        );
+        expect(resumed.reassessment).toBeNull();
+
+        yield* service.reassess({ projectId, issue: liveCapability }, () =>
+          Effect.sync(() => {
+            interruptCount += 1;
+            return { sequence: 801 };
+          }),
+        );
+        expect(interruptCount).toBe(1);
+        expect(
+          (yield* service.status({ projectId, repository, capabilityNumber: 17 })).reassessment,
+        ).toBeNull();
+      }).pipe(Effect.provide(test.layer));
+    },
+  );
 });
 
 describe("workflowTicketResolutionBody", () => {
@@ -2818,10 +3465,13 @@ function seedReportedReview(
       yield* sql`
         INSERT INTO workflow_director_admissions (
           admission_id, director_id, batch_id, repository, ticket_id, ticket_number, slot_ticket_number,
-          purpose, ownership, claim_login, claim_status, created_at, updated_at
+          purpose, ownership, claim_login, claim_status, scope_body, scope_fingerprint,
+          current_scope_body, current_scope_fingerprint, created_at, updated_at
         ) VALUES (
           ${admissionId}, ${input.directorId}, ${input.batchId}, ${repository}, ${`ticket-${input.suffix}`}, ${input.ticketNumber},
           ${input.ticketNumber}, 'implement', ${`ticket-${input.suffix}`}, 'Flow-Fly', 'confirmed',
+          ${input.scopeBody}, ${workflowEvidenceBodyFingerprint(input.scopeBody)},
+          ${input.scopeBody}, ${workflowEvidenceBodyFingerprint(input.scopeBody)},
           '2026-09-07T09:00:00.000Z', '2026-09-07T09:00:00.000Z'
         )
       `;

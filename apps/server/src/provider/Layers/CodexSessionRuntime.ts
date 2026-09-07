@@ -25,6 +25,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -1175,6 +1176,23 @@ export const makeCodexSessionRuntime = (
     const collabChildMetadataRef = yield* Ref.make(new Map<string, CollabChildMetadataState>());
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
+    const memoryConsolidationThreadIdsRef = yield* Ref.make(new Set<string>());
+    const collabChildInterruptsRef = yield* Ref.make(
+      new Map<
+        string,
+        {
+          readonly attemptId: string;
+          readonly sessionId: string;
+          readonly turnId: string;
+          readonly requestStatus:
+            | "not-issued"
+            | "requested"
+            | "acknowledged"
+            | "failed"
+            | "unknown";
+        }
+      >(),
+    );
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
 
@@ -1613,7 +1631,16 @@ export const makeCodexSessionRuntime = (
               threadId: options.threadId,
               ...(child.spawnTurnId ? { turnId: child.spawnTurnId } : {}),
               method: "collabAgent/turnStarted",
-              payload: childIdentity,
+              payload: {
+                ...childIdentity,
+                ...(childTurnId
+                  ? {
+                      nativeSessionId: child.agentThreadId,
+                      nativeTurnId: childTurnId,
+                      nativeTurnStatus: "running",
+                    }
+                  : {}),
+              },
             });
             return true;
           }
@@ -1623,6 +1650,15 @@ export const makeCodexSessionRuntime = (
               next.delete(child.agentThreadId);
               return next;
             });
+            const completedTurnId =
+              typeof (notification.params as { turn?: { id?: unknown } }).turn?.id === "string"
+                ? (notification.params as { turn: { id: string } }).turn.id
+                : undefined;
+            const interruption = (yield* Ref.get(collabChildInterruptsRef)).get(
+              child.agentThreadId,
+            );
+            const matchingInterruption =
+              interruption && completedTurnId === interruption.turnId ? interruption : undefined;
             yield* emitEvent({
               kind: "notification",
               threadId: options.threadId,
@@ -1631,6 +1667,26 @@ export const makeCodexSessionRuntime = (
               payload: {
                 ...childIdentity,
                 turn: notification.params.turn,
+                ...(completedTurnId
+                  ? {
+                      nativeSessionId: child.agentThreadId,
+                      nativeTurnId: completedTurnId,
+                      nativeTurnStatus:
+                        notification.params.turn.status === "interrupted"
+                          ? "interrupted"
+                          : notification.params.turn.status === "failed"
+                            ? "failed"
+                            : "completed",
+                    }
+                  : {}),
+                ...(matchingInterruption
+                  ? {
+                      interruptAttemptId: matchingInterruption.attemptId,
+                      nativeSessionId: matchingInterruption.sessionId,
+                      nativeTurnId: matchingInterruption.turnId,
+                      interruptRequestStatus: matchingInterruption.requestStatus,
+                    }
+                  : {}),
               },
             });
             return true;
@@ -1732,6 +1788,13 @@ export const makeCodexSessionRuntime = (
       Effect.gen(function* () {
         const isMemoryConsolidationNotification =
           suppressMemoryConsolidationNotification(notification);
+        if (notification.method === "thread/started" && isMemoryConsolidationNotification) {
+          yield* Ref.update(memoryConsolidationThreadIdsRef, (current) => {
+            const next = new Set(current);
+            next.add(notification.params.thread.id);
+            return next;
+          });
+        }
 
         const payload = notification.params;
         const route = readRouteFields(notification);
@@ -2374,15 +2437,96 @@ export const makeCodexSessionRuntime = (
           // (review finding). Per-child and overall deadlines guarantee the
           // parent interrupt below always runs.
           const liveChildTurns = yield* Ref.get(collabChildLiveTurnsRef);
+          const memoryConsolidationThreadIds = yield* Ref.get(memoryConsolidationThreadIdsRef);
+          const interruptAttemptId = yield* randomUUIDv4("provider-event");
+          const liveChildren = Array.from(liveChildTurns.entries());
           yield* Effect.forEach(
-            Array.from(liveChildTurns.entries()),
+            liveChildren,
             ([childThreadId, childTurnId]) =>
-              client
-                .request("turn/interrupt", {
-                  threadId: childThreadId,
-                  turnId: childTurnId,
-                })
-                .pipe(Effect.timeoutOption("3 seconds"), Effect.ignore),
+              Effect.gen(function* () {
+                yield* Ref.update(collabChildInterruptsRef, (current) => {
+                  const next = new Map(current);
+                  next.set(childThreadId, {
+                    attemptId: interruptAttemptId,
+                    sessionId: childThreadId,
+                    turnId: childTurnId,
+                    requestStatus: "not-issued",
+                  });
+                  return next;
+                });
+                if (!memoryConsolidationThreadIds.has(childThreadId))
+                  yield* emitEvent({
+                    kind: "notification",
+                    threadId: options.threadId,
+                    method: "collabAgent/interruptRequested",
+                    payload: {
+                      agentThreadId: childThreadId,
+                      interruptAttemptId,
+                      nativeSessionId: childThreadId,
+                      nativeTurnId: childTurnId,
+                      interruptRequestStatus: "not-issued",
+                    },
+                  });
+              }),
+            { discard: true },
+          );
+          yield* Effect.forEach(
+            liveChildren,
+            ([childThreadId, childTurnId]) =>
+              Effect.gen(function* () {
+                const updateStatus = (
+                  requestStatus: "requested" | "acknowledged" | "failed" | "unknown",
+                  detail?: string,
+                ) =>
+                  Effect.gen(function* () {
+                    yield* Ref.update(collabChildInterruptsRef, (current) => {
+                      const next = new Map(current);
+                      next.set(childThreadId, {
+                        attemptId: interruptAttemptId,
+                        sessionId: childThreadId,
+                        turnId: childTurnId,
+                        requestStatus,
+                      });
+                      return next;
+                    });
+                    if (!memoryConsolidationThreadIds.has(childThreadId))
+                      yield* emitEvent({
+                        kind: "notification",
+                        threadId: options.threadId,
+                        method:
+                          requestStatus === "acknowledged"
+                            ? "collabAgent/interruptAcknowledged"
+                            : requestStatus === "failed" || requestStatus === "unknown"
+                              ? "collabAgent/interruptFailed"
+                              : "collabAgent/interruptRequested",
+                        payload: {
+                          agentThreadId: childThreadId,
+                          interruptAttemptId,
+                          nativeSessionId: childThreadId,
+                          nativeTurnId: childTurnId,
+                          interruptRequestStatus: requestStatus,
+                          ...(detail ? { interruptDetail: detail } : {}),
+                        },
+                      });
+                  });
+                yield* updateStatus("requested");
+                const result = yield* client
+                  .request("turn/interrupt", {
+                    threadId: childThreadId,
+                    turnId: childTurnId,
+                  })
+                  .pipe(Effect.timeoutOption("3 seconds"), Effect.result);
+                if (result._tag === "Failure") {
+                  yield* updateStatus(
+                    "failed",
+                    "The provider rejected the child interrupt request.",
+                  );
+                } else if (Option.isNone(result.success)) {
+                  yield* updateStatus("unknown", "The child interrupt request timed out.");
+                } else {
+                  yield* updateStatus("acknowledged");
+                }
+              }),
             { concurrency: 8, discard: true },
           ).pipe(Effect.timeoutOption("10 seconds"), Effect.ignore);
           const effectiveTurnId = turnId ?? session.activeTurnId;
