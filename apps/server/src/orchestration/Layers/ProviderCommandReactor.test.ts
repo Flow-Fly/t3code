@@ -44,6 +44,7 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -967,6 +968,7 @@ describe("ProviderCommandReactor", () => {
         Effect.provide(NodeServices.layer),
       ),
     );
+    let failNextDirectorGitStatus = false;
     const directorWorkflow = WorkflowService.WorkflowService.of({
       issueDetail: ({
         number,
@@ -1068,18 +1070,23 @@ describe("ProviderCommandReactor", () => {
                       ? ""
                       : `fork\tgit@github.com:${workflowRepository}.git (fetch)\n`,
                 stderr: "",
-                code: 0,
+                code: ChildProcessSpawner.ExitCode(0),
                 timedOut: false,
                 stdoutTruncated: false,
                 stderrTruncated: false,
                 stdoutInvalidUtf8: false,
                 stderrInvalidUtf8: false,
-              } as never).pipe(
+              } satisfies ProcessRunner.ProcessRunOutput).pipe(
                 Effect.tap(() => {
                   if (args[0] !== "status" || !beforeNextDirectorGitStatus) return Effect.void;
                   const beforeGitStatus = beforeNextDirectorGitStatus;
                   beforeNextDirectorGitStatus = undefined;
                   return beforeGitStatus();
+                }),
+                Effect.map((result) => {
+                  if (args[0] !== "status" || !failNextDirectorGitStatus) return result;
+                  failNextDirectorGitStatus = false;
+                  return { ...result, stdout: " M receipt-race.txt\n" };
                 }),
               ),
           }),
@@ -1305,9 +1312,13 @@ describe("ProviderCommandReactor", () => {
       beforeNextDirectorGitStatus: (effect: () => Effect.Effect<void>) => {
         beforeNextDirectorGitStatus = effect;
       },
+      failNextDirectorGitStatus: () => {
+        failNextDirectorGitStatus = true;
+      },
       workflowMonitor,
       makeWorkflowMonitor,
       directorCapability,
+      refreshDirectorCapability,
       directorTicket,
       directorTickets,
       directorImplementationHead,
@@ -1637,10 +1648,16 @@ describe("ProviderCommandReactor", () => {
         const ownerPreflightEntered = yield* Deferred.make<void>();
         const releaseOwnerPreflight = yield* Deferred.make<void>();
         let blockNextDirectorIssueDetail = false;
+        let beforeNextDirectorIssueDetail: (() => Effect.Effect<void>) | undefined;
         const harness = yield* Effect.promise(() =>
           createHarness({
             directorTicketCount: 11,
             beforeDirectorIssueDetail: () => {
+              if (beforeNextDirectorIssueDetail) {
+                const effect = beforeNextDirectorIssueDetail;
+                beforeNextDirectorIssueDetail = undefined;
+                return effect();
+              }
               if (!blockNextDirectorIssueDetail) return Effect.void;
               blockNextDirectorIssueDetail = false;
               return Deferred.succeed(ownerPreflightEntered, undefined).pipe(
@@ -1919,6 +1936,7 @@ describe("ProviderCommandReactor", () => {
         expect(harness.sendTurn).toHaveBeenCalledTimes(1);
         for (const index of harness.directorTickets.keys()) harness.readyDirectorTicket(index);
 
+        let rejectedCommand: Parameters<typeof harness.dispatchWorkflow>[0] | undefined;
         const unknownBeforeDispatch = yield* harness.workflowDirector
           .rotateReady(
             {
@@ -1926,12 +1944,14 @@ describe("ProviderCommandReactor", () => {
               repository: "Flow-Fly/t3code",
               capabilityNumber: 17,
             },
-            () =>
-              Effect.fail(
+            (command) => {
+              rejectedCommand = command;
+              return Effect.fail(
                 new OrchestrationDispatchCommandError({
                   message: "Simulated failure with no definitive engine receipt.",
                 }),
-              ),
+              );
+            },
           )
           .pipe(Effect.result);
         expect(unknownBeforeDispatch._tag).toBe("Failure");
@@ -1995,25 +2015,48 @@ describe("ProviderCommandReactor", () => {
             }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
           ),
         );
-        yield* harness.engine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make("rotation-conflicting-thread-create"),
-          threadId: ThreadId.make(rejectionIdentity[0]!.successorThreadId),
-          projectId: ProjectId.make("project-1"),
-          title: "Conflicting successor thread",
-          modelSelection: {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: "gpt-6-astra",
-          },
-          runtimeMode: "approval-required",
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          branch: null,
-          worktreePath: null,
-          createdAt: "2026-09-07T13:00:01.700Z",
-        });
+        let rejectedDuringFinalGit = false;
+        harness.beforeNextDirectorGitStatus(() =>
+          Effect.gen(function* () {
+            rejectedDuringFinalGit = true;
+            yield* harness.engine
+              .dispatch({
+                type: "thread.create",
+                commandId: CommandId.make("rotation-conflicting-thread-create"),
+                threadId: ThreadId.make(rejectionIdentity[0]!.successorThreadId),
+                projectId: ProjectId.make("project-1"),
+                title: "Conflicting successor thread",
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "gpt-6-astra",
+                },
+                runtimeMode: "approval-required",
+                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                branch: null,
+                worktreePath: null,
+                createdAt: "2026-09-07T13:00:01.700Z",
+              })
+              .pipe(Effect.orDie);
+            const rejectedDispatch = yield* harness
+              .dispatchWorkflow(rejectedCommand!)
+              .pipe(Effect.result);
+            expect(rejectedDispatch._tag).toBe("Failure");
+            harness.failNextDirectorGitStatus();
+          }),
+        );
+        const rejectedPreflight = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
+          )
+          .pipe(Effect.result);
         yield* Effect.promise(() => harness.drain());
-        yield* Effect.promise(() => harness.makeWorkflowMonitor());
-        yield* Effect.promise(() => harness.drain());
+        expect(rejectedDuringFinalGit).toBe(true);
+        expect(rejectedPreflight._tag).toBe("Failure");
         const rejectedCreate = yield* harness.workflowDirector.status({
           projectId: ProjectId.make("project-1"),
           repository: "Flow-Fly/t3code",
@@ -2036,6 +2079,7 @@ describe("ProviderCommandReactor", () => {
         );
         expect(Option.isNone(turnReceipt)).toBe(true);
         expect(Option.getOrNull(createReceipt)).toMatchObject({ status: "rejected" });
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
         expect(
           yield* harness.workflowDirector.prepareHandoff(
             EnvironmentId.make("workflow-environment"),
@@ -2133,21 +2177,35 @@ describe("ProviderCommandReactor", () => {
           successorDirectorId: null,
         });
 
-        const crashedAfterReceipt = yield* harness.workflowDirector
+        let acceptedCommand: Parameters<typeof harness.dispatchWorkflow>[0] | undefined;
+        const pendingAccepted = yield* harness.workflowDirector
           .rotateReady(
             {
               projectId: ProjectId.make("project-1"),
               repository: "Flow-Fly/t3code",
               capabilityNumber: 17,
             },
-            (command) =>
-              harness.dispatchWorkflow(command).pipe(
-                Effect.flatMap(() =>
-                  Effect.promise(() =>
-                    harness.runEffect(
-                      Effect.gen(function* () {
-                        const sql = yield* SqlClient.SqlClient;
-                        yield* sql`INSERT INTO workflow_reassessments (
+            (command) => {
+              acceptedCommand = command;
+              return Effect.fail(
+                new OrchestrationDispatchCommandError({
+                  message: "Simulated unknown transport outcome before engine acceptance.",
+                }),
+              );
+            },
+          )
+          .pipe(Effect.result);
+        expect(pendingAccepted._tag).toBe("Failure");
+        let acceptedDuringCapabilityPreflight = false;
+        beforeNextDirectorIssueDetail = () =>
+          Effect.gen(function* () {
+            acceptedDuringCapabilityPreflight = true;
+            yield* harness.dispatchWorkflow(acceptedCommand!).pipe(Effect.orDie);
+            yield* Effect.promise(() =>
+              harness.runEffect(
+                Effect.gen(function* () {
+                  const sql = yield* SqlClient.SqlClient;
+                  yield* sql`INSERT INTO workflow_reassessments (
                           reassessment_id, director_id, trigger_kind, trigger_issue_number,
                           trigger_source, status, required_action, stop_request_status,
                           tracker_status, created_at, updated_at
@@ -2157,31 +2215,41 @@ describe("ProviderCommandReactor", () => {
                           'held', 'Preserve this hold while reconciling the accepted receipt.',
                           'not-issued', 'confirmed', '2026-09-07T13:00:03.500Z',
                           '2026-09-07T13:00:03.500Z'
-                        FROM workflow_directors WHERE thread_id = ${command.threadId}`;
-                        yield* sql`UPDATE workflow_directors SET status = 'held',
-                          detail = 'Durable reassessment hold.' WHERE thread_id = ${command.threadId}`;
-                      }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
-                    ),
-                  ),
-                ),
-                Effect.flatMap(() =>
-                  Effect.fail(
-                    new OrchestrationDispatchCommandError({
-                      message: "Simulated crash after the engine accepted the successor turn.",
-                    }),
-                  ),
-                ),
+                        FROM workflow_directors WHERE thread_id = ${acceptedCommand!.threadId}`;
+                  yield* sql`UPDATE workflow_directors SET status = 'held',
+                          detail = 'Durable reassessment hold.'
+                          WHERE thread_id = ${acceptedCommand!.threadId}`;
+                }).pipe(Effect.provideService(SqlClient.SqlClient, harness.sqlClient)),
               ),
+            );
+            harness.refreshDirectorCapability("closed");
+          });
+        const acceptedAfterFailedPreflight = yield* harness.workflowDirector
+          .rotateReady(
+            {
+              projectId: ProjectId.make("project-1"),
+              repository: "Flow-Fly/t3code",
+              capabilityNumber: 17,
+            },
+            harness.dispatchWorkflow,
           )
           .pipe(Effect.result);
-        expect(crashedAfterReceipt._tag).toBe("Failure");
+        expect(acceptedDuringCapabilityPreflight).toBe(true);
+        expect(acceptedAfterFailedPreflight._tag).toBe("Success");
+        harness.refreshDirectorCapability("open");
         yield* Effect.promise(() => harness.drain());
+        const lateAcceptedReceipt = yield* Effect.promise(() =>
+          harness.readCommandReceipt(acceptedCommand!.commandId),
+        );
+        expect(Option.getOrNull(lateAcceptedReceipt)?.status).toBe("accepted");
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
         const acceptedDuringReassessment = yield* harness.workflowDirector.status({
           projectId: ProjectId.make("project-1"),
           repository: "Flow-Fly/t3code",
           capabilityNumber: 17,
         });
         expect(acceptedDuringReassessment).toMatchObject({
+          threadId: acceptedCommand!.threadId,
           status: "held",
           reassessment: { reassessmentId: "rotation-accepted-receipt-reassessment" },
           handoff: { handoffId: prepared.handoffId, status: "submitted" },
@@ -2819,24 +2887,26 @@ describe("ProviderCommandReactor", () => {
         harness.beforeNextDirectorGitStatus(() =>
           Effect.gen(function* () {
             projectedSourceDuringFinalGit = true;
-            yield* harness.engine.dispatch({
-              type: "thread.turn.start",
-              commandId: CommandId.make("rotation-source-projected-during-final-git"),
-              threadId: rotated.threadId,
-              message: {
-                messageId: MessageId.make("rotation-source-projected-message"),
-                role: "user",
-                text: "New source work during succession preflight",
-                attachments: [],
-              },
-              modelSelection: {
-                instanceId: ProviderInstanceId.make("codex"),
-                model: "gpt-6-astra",
-              },
-              runtimeMode: "approval-required",
-              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-              createdAt: "2026-09-07T13:01:03.300Z",
-            });
+            yield* harness.engine
+              .dispatch({
+                type: "thread.turn.start",
+                commandId: CommandId.make("rotation-source-projected-during-final-git"),
+                threadId: rotated.threadId,
+                message: {
+                  messageId: MessageId.make("rotation-source-projected-message"),
+                  role: "user",
+                  text: "New source work during succession preflight",
+                  attachments: [],
+                },
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "gpt-6-astra",
+                },
+                runtimeMode: "approval-required",
+                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                createdAt: "2026-09-07T13:01:03.300Z",
+              })
+              .pipe(Effect.orDie);
           }),
         );
         yield* Effect.promise(() => harness.makeWorkflowMonitor());
