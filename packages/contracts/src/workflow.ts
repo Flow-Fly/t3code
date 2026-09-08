@@ -284,7 +284,7 @@ export type WorkflowSearchResult = typeof WorkflowSearchResult.Type;
 export const WorkflowLocateInput = Schema.Struct({
   projectId: ProjectId,
   repository: WorkflowRepositoryNameWithOwner,
-  id: TrimmedNonEmptyString,
+  id: Schema.optional(TrimmedNonEmptyString),
   number: PositiveInt,
 });
 export type WorkflowLocateInput = typeof WorkflowLocateInput.Type;
@@ -435,6 +435,50 @@ export const WorkflowDirectorStatusInput = Schema.Struct({
   ticketNumber: Schema.optional(PositiveInt),
 });
 export type WorkflowDirectorStatusInput = typeof WorkflowDirectorStatusInput.Type;
+
+export const WorkflowActiveWorkCursor = Schema.Struct({
+  directorCreatedAt: IsoDateTime,
+  directorId: TrimmedNonEmptyString,
+  entryOrder: Schema.Number,
+  entryCreatedAt: IsoDateTime,
+  entryId: TrimmedNonEmptyString,
+});
+export type WorkflowActiveWorkCursor = typeof WorkflowActiveWorkCursor.Type;
+
+export const WorkflowActiveWorkInput = Schema.Struct({
+  cursor: Schema.optional(WorkflowActiveWorkCursor),
+});
+export type WorkflowActiveWorkInput = typeof WorkflowActiveWorkInput.Type;
+
+export const WorkflowActiveWorkEntry = Schema.Struct({
+  entryId: TrimmedNonEmptyString,
+  kind: Schema.Literals(["director", "worker", "reviewer", "unassociated"]),
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  projectTitle: TrimmedNonEmptyString,
+  repository: WorkflowRepositoryNameWithOwner,
+  rootNumber: PositiveInt,
+  capabilityNumber: PositiveInt,
+  issueNumber: PositiveInt,
+  directorId: TrimmedNonEmptyString,
+  ownerThreadId: ThreadId,
+  navigationThreadId: Schema.NullOr(ThreadId),
+  title: Schema.NullOr(TrimmedNonEmptyString),
+  providerThreadId: Schema.NullOr(TrimmedNonEmptyString),
+  activity: Schema.Literals(["running", "waiting", "attention", "unknown", "settled"]),
+  unresolved: Schema.Boolean,
+  updatedAt: IsoDateTime,
+  cursor: WorkflowActiveWorkCursor,
+});
+export type WorkflowActiveWorkEntry = typeof WorkflowActiveWorkEntry.Type;
+
+export const WorkflowActiveWorkResult = Schema.Struct({
+  environmentId: EnvironmentId,
+  entries: Schema.Array(WorkflowActiveWorkEntry),
+  nextCursor: Schema.NullOr(WorkflowActiveWorkCursor),
+  refreshedAt: IsoDateTime,
+});
+export type WorkflowActiveWorkResult = typeof WorkflowActiveWorkResult.Type;
 
 export const WorkflowWorkerRequestedProfile = Schema.Struct({
   model: TrimmedNonEmptyString,

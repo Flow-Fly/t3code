@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import type { ScopedThreadRef } from "@t3tools/contracts";
+import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 
 import { resolveStorage } from "./lib/storage";
 import type { WorkflowPoint, WorkflowViewport } from "./components/workflow/WorkflowMap.logic";
@@ -11,6 +13,18 @@ export interface WorkflowMapView {
   openFolds: string[];
   positions: Record<string, WorkflowPoint>;
   viewport: WorkflowViewport;
+}
+
+export interface WorkflowThreadLocation {
+  projectId: string;
+  repository: string;
+  rootNumber: number;
+}
+
+export interface WorkflowNavigationTarget extends WorkflowThreadLocation {
+  requestId: string;
+  issueNumber: number;
+  providerThreadId: string | null;
 }
 
 const EMPTY_VIEW: WorkflowMapView = {
@@ -25,9 +39,15 @@ const EMPTY_VIEW: WorkflowMapView = {
 interface WorkflowMapStoreState {
   repositoryByProject: Record<string, string>;
   focusedRootByContext: Record<string, string>;
+  locationByThread: Record<string, WorkflowThreadLocation>;
+  navigationTargetByThread: Record<string, WorkflowNavigationTarget>;
   views: Record<string, WorkflowMapView>;
   selectRepository: (projectScope: string, repository: string | null) => void;
   focusRoot: (context: string, rootId: string) => void;
+  setThreadLocation: (ref: ScopedThreadRef, location: WorkflowThreadLocation) => void;
+  clearThreadLocation: (ref: ScopedThreadRef) => void;
+  setNavigationTarget: (ref: ScopedThreadRef, target: WorkflowNavigationTarget) => void;
+  clearNavigationTarget: (ref: ScopedThreadRef, requestId: string) => void;
   patchView: (scope: string, patch: Partial<WorkflowMapView>) => void;
   toggleExpanded: (scope: string, id: string) => void;
   toggleFold: (scope: string, id: string) => void;
@@ -49,6 +69,8 @@ export const useWorkflowMapStore = create<WorkflowMapStoreState>()(
     (set) => ({
       repositoryByProject: {},
       focusedRootByContext: {},
+      locationByThread: {},
+      navigationTargetByThread: {},
       views: {},
       selectRepository: (projectScope, repository) =>
         set((state) => {
@@ -67,6 +89,31 @@ export const useWorkflowMapStore = create<WorkflowMapStoreState>()(
         set((state) => ({
           focusedRootByContext: { ...state.focusedRootByContext, [context]: rootId },
         })),
+      setThreadLocation: (ref, location) =>
+        set((state) => ({
+          locationByThread: { ...state.locationByThread, [scopedThreadKey(ref)]: location },
+        })),
+      clearThreadLocation: (ref) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          const { [key]: _removed, ...locationByThread } = state.locationByThread;
+          return { locationByThread };
+        }),
+      setNavigationTarget: (ref, target) =>
+        set((state) => ({
+          locationByThread: { ...state.locationByThread, [scopedThreadKey(ref)]: target },
+          navigationTargetByThread: {
+            ...state.navigationTargetByThread,
+            [scopedThreadKey(ref)]: target,
+          },
+        })),
+      clearNavigationTarget: (ref, requestId) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          if (state.navigationTargetByThread[key]?.requestId !== requestId) return state;
+          const { [key]: _removed, ...navigationTargetByThread } = state.navigationTargetByThread;
+          return { navigationTargetByThread };
+        }),
       patchView: (scope, patch) =>
         set((state) => ({
           views: {
@@ -94,9 +141,10 @@ export const useWorkflowMapStore = create<WorkflowMapStoreState>()(
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
-      partialize: ({ repositoryByProject, focusedRootByContext, views }) => ({
+      partialize: ({ repositoryByProject, focusedRootByContext, locationByThread, views }) => ({
         repositoryByProject,
         focusedRootByContext,
+        locationByThread,
         views,
       }),
     },

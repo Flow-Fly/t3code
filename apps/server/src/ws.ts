@@ -2210,6 +2210,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.workflowDirectorStatus, workflowDirector.status(input), {
             "rpc.aggregate": "workflow",
           }),
+        [WS_METHODS.workflowActiveWork]: (input) =>
+          observeRpcEffect(WS_METHODS.workflowActiveWork, workflowDirector.activeWork(input), {
+            "rpc.aggregate": "workflow",
+          }),
         [WS_METHODS.workflowDirectorHandoffReconcile]: (input) =>
           observeRpcEffect(
             WS_METHODS.workflowDirectorHandoffReconcile,

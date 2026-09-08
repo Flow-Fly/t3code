@@ -40,6 +40,7 @@ import {
   ThreadId,
   TurnId,
   type WorkflowDirectorStatus,
+  type WorkflowActiveWorkResult,
   WS_METHODS,
   WsRpcGroup,
   EditorId,
@@ -4160,6 +4161,74 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       if (rpcError._tag === "EnvironmentAuthorizationError") {
         assert.equal(rpcError.requiredScope, "orchestration:read");
       }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("serves active work through the read-authorized environment websocket", () =>
+    Effect.gen(function* () {
+      const timestamp = "2026-09-09T00:00:00.000Z";
+      const cursor = {
+        directorCreatedAt: timestamp,
+        directorId: "rpc-director",
+        entryOrder: 0,
+        entryCreatedAt: timestamp,
+        entryId: "director:rpc-director",
+      };
+      const result = {
+        environmentId: testEnvironmentDescriptor.environmentId,
+        entries: [
+          {
+            entryId: cursor.entryId,
+            kind: "director",
+            environmentId: testEnvironmentDescriptor.environmentId,
+            projectId: defaultProjectId,
+            projectTitle: "RPC project",
+            repository: "Flow-Fly/t3code",
+            rootNumber: 10,
+            capabilityNumber: 25,
+            issueNumber: 25,
+            directorId: cursor.directorId,
+            ownerThreadId: ThreadId.make("rpc-owner"),
+            navigationThreadId: ThreadId.make("rpc-owner"),
+            title: null,
+            providerThreadId: null,
+            activity: "waiting",
+            unresolved: true,
+            updatedAt: timestamp,
+            cursor,
+          },
+        ],
+        nextCursor: null,
+        refreshedAt: timestamp,
+      } satisfies WorkflowActiveWorkResult;
+      const inputs: unknown[] = [];
+      yield* buildAppUnderTest({
+        layers: {
+          workflowDirector: {
+            activeWork: (input) =>
+              Effect.sync(() => {
+                inputs.push(input);
+                return result;
+              }),
+          },
+        },
+      });
+      const reader = yield* exchangeAccessToken(defaultDesktopBootstrapToken, {
+        scope: "orchestration:read",
+      });
+      const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+        headers: { authorization: `Bearer ${reader.body.access_token ?? ""}` },
+      });
+      const { ticket } = yield* responseJsonEffect<{ readonly ticket: string }>(ticketResponse);
+      const readerUrl = `${yield* getWsServerUrl("/ws", {
+        authenticated: false,
+      })}?wsTicket=${encodeURIComponent(ticket)}`;
+      const observed = yield* Effect.scoped(
+        withWsRpcClient(readerUrl, (client) => client[WS_METHODS.workflowActiveWork]({})),
+      );
+
+      assert.equal(observed.entries[0]?.entryId, "director:rpc-director");
+      assert.deepEqual(inputs, [{}]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -120,6 +120,7 @@ function WorkflowDetails(props: {
   capabilityNumber?: number;
   issue: WorkflowIssueSummary;
   refreshRequest: number;
+  focusedProviderThreadId?: string | null;
 }) {
   const navigate = useNavigate();
   const project = useProject(scopeProjectRef(props.environmentId, props.projectId));
@@ -745,9 +746,19 @@ function WorkflowDetails(props: {
               <ul className="mt-1 space-y-2">
                 {director.workers.map((worker) => (
                   <li
-                    className="rounded-sm bg-muted/50 p-1.5 text-xs"
+                    className={cn(
+                      "rounded-sm bg-muted/50 p-1.5 text-xs",
+                      worker.providerThreadId === props.focusedProviderThreadId &&
+                        "ring-2 ring-ring",
+                    )}
                     key={worker.dispatchId ?? `unassociated:${worker.providerThreadId}`}
+                    aria-current={
+                      worker.providerThreadId === props.focusedProviderThreadId ? "true" : undefined
+                    }
                   >
+                    {worker.providerThreadId === props.focusedProviderThreadId ? (
+                      <p className="mb-1 font-medium text-info">Selected from Active work</p>
+                    ) : null}
                     <p>
                       {worker.ticketNumber
                         ? `Ticket #${worker.ticketNumber}`
@@ -821,7 +832,31 @@ function WorkflowDetails(props: {
               <h4 className="font-medium text-xs">Review history</h4>
               <ul className="mt-1 space-y-2">
                 {director.reviews?.map((review) => (
-                  <li className="rounded-sm bg-muted/50 p-1.5 text-xs" key={review.reviewId}>
+                  <li
+                    className={cn(
+                      "rounded-sm bg-muted/50 p-1.5 text-xs",
+                      (review.providerThreadId === props.focusedProviderThreadId ||
+                        review.axes.some(
+                          (axis) => axis.providerThreadId === props.focusedProviderThreadId,
+                        )) &&
+                        "ring-2 ring-ring",
+                    )}
+                    key={review.reviewId}
+                    aria-current={
+                      review.providerThreadId === props.focusedProviderThreadId ||
+                      review.axes.some(
+                        (axis) => axis.providerThreadId === props.focusedProviderThreadId,
+                      )
+                        ? "true"
+                        : undefined
+                    }
+                  >
+                    {review.providerThreadId === props.focusedProviderThreadId ||
+                    review.axes.some(
+                      (axis) => axis.providerThreadId === props.focusedProviderThreadId,
+                    ) ? (
+                      <p className="mb-1 font-medium text-info">Selected from Active work</p>
+                    ) : null}
                     <p>
                       Ticket #{review.ticketNumber} · review {review.status}
                     </p>
@@ -1242,6 +1277,8 @@ export function WorkflowFocusedMap(props: {
   root: WorkflowIssueSummary;
   onRefreshRoot: () => void;
   onNavigateMatch: (match: WorkflowSearchMatch) => void;
+  onManualNavigation: () => void;
+  focusedProviderThreadId?: string | null;
 }) {
   const context = workflowMapContextKey({
     environmentId: props.environmentId,
@@ -1406,6 +1443,7 @@ export function WorkflowFocusedMap(props: {
     ) ?? [];
 
   const revealMatch = (match: WorkflowSearchMatch) => {
+    props.onManualNavigation();
     const merged = mergeWorkflowSearchMatch({ nodes: currentNodes, childrenByParent }, match);
     const expanded = [...new Set([...view.expanded, ...merged.expanded])];
     const openFolds = [
@@ -1464,11 +1502,13 @@ export function WorkflowFocusedMap(props: {
     });
   };
 
-  const selectIssue = (issue: WorkflowIssueSummary) =>
+  const selectIssue = (issue: WorkflowIssueSummary) => {
+    props.onManualNavigation();
     store.patchView(scope, {
       selectedId: issueIdentity(issue),
       selectedIssue: { id: issue.id, repository: issue.repository, number: issue.number },
     });
+  };
 
   const zoomBy = (factor: number) =>
     store.patchView(scope, {
@@ -1839,7 +1879,10 @@ export function WorkflowFocusedMap(props: {
                 className="mt-1"
                 size="xs"
                 variant="outline"
-                onClick={() => props.onNavigateMatch(locateQuery.data!)}
+                onClick={() => {
+                  props.onManualNavigation();
+                  props.onNavigateMatch(locateQuery.data!);
+                }}
               >
                 Open current root #{(locateQuery.data.ancestry[0] ?? locateQuery.data.issue).number}
               </Button>
@@ -1923,6 +1966,9 @@ export function WorkflowFocusedMap(props: {
             {...(selectedCapabilityNumber ? { capabilityNumber: selectedCapabilityNumber } : {})}
             issue={selected}
             refreshRequest={refreshRequest}
+            {...(props.focusedProviderThreadId !== undefined
+              ? { focusedProviderThreadId: props.focusedProviderThreadId }
+              : {})}
           />
         ) : (
           <p className="border-t border-border p-3 text-muted-foreground text-xs">

@@ -1,4 +1,11 @@
-import { EnvironmentId, ProjectId, WS_METHODS, type WorkflowSyncState } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  WS_METHODS,
+  type WorkflowActiveWorkResult,
+  type WorkflowSyncState,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -26,6 +33,43 @@ import { createWorkflowEnvironmentAtoms } from "./workflow.ts";
 
 const LOCAL_ID = EnvironmentId.make("local-environment");
 const REMOTE_ID = EnvironmentId.make("remote-environment");
+const activeWorkPage = (environmentId: EnvironmentId): WorkflowActiveWorkResult => {
+  const timestamp = "2026-09-09T00:00:00.000Z";
+  const cursor = {
+    directorCreatedAt: timestamp,
+    directorId: "overlapping-director",
+    entryOrder: 0,
+    entryCreatedAt: timestamp,
+    entryId: "director:overlapping-director",
+  };
+  return {
+    environmentId,
+    entries: [
+      {
+        entryId: cursor.entryId,
+        kind: "director",
+        environmentId,
+        projectId: ProjectId.make("overlapping-project"),
+        projectTitle: "Overlapping project",
+        repository: "Flow-Fly/t3code",
+        rootNumber: 10,
+        capabilityNumber: 10,
+        issueNumber: 10,
+        directorId: cursor.directorId,
+        ownerThreadId: ThreadId.make("overlapping-thread"),
+        navigationThreadId: ThreadId.make("overlapping-thread"),
+        title: null,
+        providerThreadId: null,
+        activity: "waiting",
+        unresolved: true,
+        updatedAt: timestamp,
+        cursor,
+      },
+    ],
+    nextCursor: null,
+    refreshedAt: timestamp,
+  };
+};
 
 function session(client: WsRpcProtocolClient): RpcSession {
   return {
@@ -73,7 +117,13 @@ const supervisor = Effect.fn("WorkflowEnvironmentTest.supervisor")(function* (
 it.effect("runs Workflow queries on the selected remote environment", () =>
   Effect.scoped(
     Effect.gen(function* () {
+      const localActiveCalls = new Array<unknown>();
       const localClient = {
+        [WS_METHODS.workflowActiveWork]: (input: unknown) =>
+          Effect.sync(() => {
+            localActiveCalls.push(input);
+            return activeWorkPage(LOCAL_ID);
+          }),
         [WS_METHODS.workflowRoots]: () => Effect.die("local environment must not be queried"),
         [WS_METHODS.workflowWatch]: () => Stream.die("local environment must not be watched"),
       } as unknown as WsRpcProtocolClient;
@@ -82,6 +132,11 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
       const syncEvents = yield* PubSub.unbounded<WorkflowSyncState>();
       let rootTitle = "Initial capability";
       const remoteClient = {
+        [WS_METHODS.workflowActiveWork]: (input: unknown) =>
+          Effect.sync(() => {
+            remoteCalls.push({ activeWork: input });
+            return activeWorkPage(REMOTE_ID);
+          }),
         [WS_METHODS.workflowRoots]: (input: unknown) =>
           Effect.sync(() => {
             remoteCalls.push(input);
@@ -190,6 +245,14 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
       const unmount = registry.mount(roots);
 
       const result = yield* Effect.promise(() => executeAtomQuery(registry, roots));
+      const activeWork = atoms.activeWork({ environmentId: REMOTE_ID, input: {} });
+      const unmountActiveWork = registry.mount(activeWork);
+      const activeWorkResult = yield* Effect.promise(() => executeAtomQuery(registry, activeWork));
+      const localActiveWork = atoms.activeWork({ environmentId: LOCAL_ID, input: {} });
+      const unmountLocalActiveWork = registry.mount(localActiveWork);
+      const localActiveWorkResult = yield* Effect.promise(() =>
+        executeAtomQuery(registry, localActiveWork),
+      );
       const children = atoms.children({
         environmentId: REMOTE_ID,
         input: { ...input, parentNumber: 10 },
@@ -201,14 +264,28 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
       );
 
       expect(AsyncResult.isSuccess(result)).toBe(true);
+      expect(AsyncResult.isSuccess(activeWorkResult)).toBe(true);
+      expect(AsyncResult.isSuccess(localActiveWorkResult)).toBe(true);
+      if (AsyncResult.isSuccess(activeWorkResult) && AsyncResult.isSuccess(localActiveWorkResult)) {
+        expect(activeWorkResult.value.entries[0]?.entryId).toBe(
+          localActiveWorkResult.value.entries[0]?.entryId,
+        );
+        expect(activeWorkResult.value.entries[0]?.environmentId).toBe(REMOTE_ID);
+        expect(localActiveWorkResult.value.entries[0]?.environmentId).toBe(LOCAL_ID);
+      }
       expect(AsyncResult.isSuccess(childResult)).toBe(true);
       expect(refreshResult._tag).toBe("Success");
       if (AsyncResult.isSuccess(childResult)) {
         expect(childResult.value.frontier?.status).toBe("empty-claimed");
       }
       expect(routedEnvironments.length).toBeGreaterThanOrEqual(3);
-      expect(routedEnvironments.every((environmentId) => environmentId === REMOTE_ID)).toBe(true);
+      expect(routedEnvironments).toContain(LOCAL_ID);
+      expect(
+        routedEnvironments.filter((environmentId) => environmentId === REMOTE_ID).length,
+      ).toBeGreaterThanOrEqual(3);
       expect(remoteCalls).toContainEqual(input);
+      expect(remoteCalls).toContainEqual({ activeWork: {} });
+      expect(localActiveCalls).toEqual([{}]);
       expect(remoteCalls).toContainEqual({ ...input, parentNumber: 10 });
       expect(remoteCalls).toContainEqual({ watch: input });
       expect(remoteCalls).toContainEqual({ refresh: input });
@@ -239,6 +316,8 @@ it.effect("runs Workflow queries on the selected remote environment", () =>
           ?.title,
       ).toBe("Updated capability");
       unmount();
+      unmountActiveWork();
+      unmountLocalActiveWork();
       unmountChildren();
       yield* Deferred.await(watchFinalized);
     }),

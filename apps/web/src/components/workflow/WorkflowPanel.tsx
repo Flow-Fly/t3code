@@ -2,10 +2,12 @@ import type {
   EnvironmentId,
   ProjectId,
   ThreadId,
+  WorkflowIssueSummary,
   WorkflowRepository,
   WorkflowSearchMatch,
   WorkflowSyncState,
 } from "@t3tools/contracts";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -21,6 +23,7 @@ import {
 } from "~/workflowMapStore";
 
 import { WorkflowFocusedMap } from "./WorkflowFocusedMap";
+import { WorkflowActiveWork } from "./WorkflowActiveWork";
 import { WorkflowAdoptionPanel } from "./WorkflowAdoptionPanel";
 import { foldIdentity, issueIdentity } from "./WorkflowMap.logic";
 import {
@@ -143,7 +146,16 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
   );
   const mapStore = useWorkflowMapStore();
   const projectScope = `${props.environmentId}:${props.projectId}`;
-  const repositoryChoice = mapStore.repositoryByProject[projectScope] ?? null;
+  const threadRef = props.planningThreadId
+    ? scopeThreadRef(props.environmentId, props.planningThreadId)
+    : null;
+  const threadKey = threadRef ? scopedThreadKey(threadRef) : null;
+  const threadLocation = threadKey ? mapStore.locationByThread[threadKey] : undefined;
+  const navigationTarget = threadKey ? mapStore.navigationTargetByThread[threadKey] : undefined;
+  const repositoryChoice =
+    threadLocation?.projectId === props.projectId
+      ? threadLocation.repository
+      : (mapStore.repositoryByProject[projectScope] ?? null);
   const repositories = repositoriesQuery.data?.repositories ?? [];
   const repository = resolveWorkflowRepository(repositoryChoice, repositories);
   const rootsQuery = useEnvironmentQuery(
@@ -194,37 +206,109 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
       })
     : null;
   const focusedId = context ? mapStore.focusedRootByContext[context] : null;
-  const focusedRoot = roots.find((root) => issueIdentity(root) === focusedId) ?? null;
-  const navigateToMatch = (match: WorkflowSearchMatch) => {
-    const root = match.ancestry[0] ?? match.issue;
-    const destinationContext = workflowMapContextKey({
-      environmentId: props.environmentId,
-      projectId: props.projectId,
-      repository: root.repository,
-    });
-    const destinationRootId = issueIdentity(root);
-    const destinationScope = workflowMapScopeKey(destinationContext, destinationRootId);
-    const destinationView = selectWorkflowMapView(mapStore.views, destinationScope);
-    mapStore.selectRepository(projectScope, root.repository);
-    mapStore.focusRoot(destinationContext, destinationRootId);
-    mapStore.patchView(destinationScope, {
-      selectedId: issueIdentity(match.issue),
-      selectedIssue: {
-        id: match.issue.id,
-        repository: match.issue.repository,
-        number: match.issue.number,
-      },
-      expanded: [...new Set([...destinationView.expanded, ...match.ancestry.map(issueIdentity)])],
-      openFolds: [
-        ...new Set([
-          ...destinationView.openFolds,
-          ...match.ancestry.flatMap((parent) => [
-            foldIdentity(issueIdentity(parent), "completed"),
-            foldIdentity(issueIdentity(parent), "cancelled"),
+  const hasThreadLocation =
+    threadLocation?.projectId === props.projectId &&
+    threadLocation.repository.toLowerCase() === repository?.toLowerCase();
+  const rootFromThread = hasThreadLocation
+    ? roots.find((root) => root.number === threadLocation.rootNumber)
+    : undefined;
+  const locateNumber =
+    navigationTarget?.projectId === props.projectId &&
+    navigationTarget.repository.toLowerCase() === repository?.toLowerCase()
+      ? navigationTarget.issueNumber
+      : hasThreadLocation && !rootFromThread
+        ? threadLocation.rootNumber
+        : null;
+  const locationQuery = useEnvironmentQuery(
+    repository && locateNumber !== null
+      ? workflowEnvironment.locate({
+          environmentId: props.environmentId,
+          input: { projectId: props.projectId, repository, number: locateNumber },
+        })
+      : null,
+  );
+  const locatedRoot = locationQuery.data
+    ? (locationQuery.data.ancestry[0] ?? locationQuery.data.issue)
+    : null;
+  const focusedRoot = hasThreadLocation
+    ? (rootFromThread ?? (locatedRoot?.number === threadLocation.rootNumber ? locatedRoot : null))
+    : (roots.find((root) => issueIdentity(root) === focusedId) ?? null);
+  const navigateToMatch = useCallback(
+    (match: WorkflowSearchMatch) => {
+      const root = match.ancestry[0] ?? match.issue;
+      const destinationContext = workflowMapContextKey({
+        environmentId: props.environmentId,
+        projectId: props.projectId,
+        repository: root.repository,
+      });
+      const destinationRootId = issueIdentity(root);
+      const destinationScope = workflowMapScopeKey(destinationContext, destinationRootId);
+      const destinationView = selectWorkflowMapView(mapStore.views, destinationScope);
+      mapStore.selectRepository(projectScope, root.repository);
+      mapStore.focusRoot(destinationContext, destinationRootId);
+      if (threadRef) {
+        mapStore.setThreadLocation(threadRef, {
+          projectId: props.projectId,
+          repository: root.repository,
+          rootNumber: root.number,
+        });
+      }
+      mapStore.patchView(destinationScope, {
+        selectedId: issueIdentity(match.issue),
+        selectedIssue: {
+          id: match.issue.id,
+          repository: match.issue.repository,
+          number: match.issue.number,
+        },
+        expanded: [...new Set([...destinationView.expanded, ...match.ancestry.map(issueIdentity)])],
+        openFolds: [
+          ...new Set([
+            ...destinationView.openFolds,
+            ...match.ancestry.flatMap((parent) => [
+              foldIdentity(issueIdentity(parent), "completed"),
+              foldIdentity(issueIdentity(parent), "cancelled"),
+            ]),
           ]),
-        ]),
-      ],
-    });
+        ],
+      });
+    },
+    [mapStore, projectScope, props.environmentId, props.projectId, threadRef],
+  );
+  const handledNavigationRequest = useRef<string | null>(null);
+  useEffect(() => {
+    if (!threadRef || !navigationTarget || !locationQuery.data) return;
+    if (handledNavigationRequest.current === navigationTarget.requestId) return;
+    const current =
+      useWorkflowMapStore.getState().navigationTargetByThread[scopedThreadKey(threadRef)];
+    if (
+      current?.requestId !== navigationTarget.requestId ||
+      current.projectId !== props.projectId ||
+      current.repository.toLowerCase() !== locationQuery.data.issue.repository.toLowerCase() ||
+      current.issueNumber !== locationQuery.data.issue.number
+    )
+      return;
+    handledNavigationRequest.current = navigationTarget.requestId;
+    navigateToMatch(locationQuery.data);
+  }, [locationQuery.data, navigateToMatch, navigationTarget, props.projectId, threadRef]);
+
+  const chooseRepository = (value: string | null) => {
+    mapStore.selectRepository(projectScope, value);
+    if (!threadRef) return;
+    mapStore.clearThreadLocation(threadRef);
+    if (navigationTarget) mapStore.clearNavigationTarget(threadRef, navigationTarget.requestId);
+  };
+
+  const focusRoot = (root: WorkflowIssueSummary) => {
+    if (!context) return;
+    mapStore.focusRoot(context, issueIdentity(root));
+    if (threadRef) {
+      mapStore.setThreadLocation(threadRef, {
+        projectId: props.projectId,
+        repository: root.repository,
+        rootNumber: root.number,
+      });
+      if (navigationTarget) mapStore.clearNavigationTarget(threadRef, navigationTarget.requestId);
+    }
   };
 
   const header = (
@@ -239,13 +323,19 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           <span className="block truncate font-medium">{props.projectTitle}</span>
         </div>
       </div>
-      {repositoriesQuery.data && repositories.length > 0 ? (
-        <RepositoryPicker
-          repositories={repositories}
-          value={repository}
-          onChange={(value) => mapStore.selectRepository(projectScope, value)}
+      <div className="flex items-end justify-end gap-2">
+        <WorkflowActiveWork
+          environmentId={props.environmentId}
+          environmentLabel={props.environmentLabel}
         />
-      ) : null}
+        {repositoriesQuery.data && repositories.length > 0 ? (
+          <RepositoryPicker
+            repositories={repositories}
+            value={repository}
+            onChange={chooseRepository}
+          />
+        ) : null}
+      </div>
     </header>
   );
 
@@ -303,7 +393,19 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
         retry={rootsQuery.refresh}
       />
     );
-  else if (roots.length === 0)
+  else if (locateNumber !== null && locationQuery.isPending && !locationQuery.data && !focusedRoot)
+    content = (
+      <QueryMessage title="Locating active work…" description={`Finding #${locateNumber}.`} />
+    );
+  else if (locateNumber !== null && locationQuery.error && !focusedRoot)
+    content = (
+      <QueryMessage
+        title="Could not locate active work"
+        description={`${locationQuery.error} The environment may need an updated T3 Code server.`}
+        retry={locationQuery.refresh}
+      />
+    );
+  else if (roots.length === 0 && !focusedRoot)
     content = (
       <QueryMessage
         title="No workflow roots"
@@ -336,7 +438,7 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
               <button
                 type="button"
                 className="w-full rounded-md border border-border p-3 text-left hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={() => context && mapStore.focusRoot(context, issueIdentity(root))}
+                onClick={() => focusRoot(root)}
               >
                 <span className="block text-[10px] text-muted-foreground">
                   {root.repository} · {root.kind}
@@ -371,7 +473,14 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           <button
             type="button"
             className="truncate rounded font-medium focus-visible:ring-2 focus-visible:ring-ring"
-            onClick={() => context && mapStore.focusRoot(context, "")}
+            onClick={() => {
+              if (context) mapStore.focusRoot(context, "");
+              if (threadRef) {
+                mapStore.clearThreadLocation(threadRef);
+                if (navigationTarget)
+                  mapStore.clearNavigationTarget(threadRef, navigationTarget.requestId);
+              }
+            }}
             aria-label="Choose another workflow root"
           >
             #{focusedRoot.number} {focusedRoot.title}
@@ -395,6 +504,13 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           root={focusedRoot}
           onRefreshRoot={retryWorkflow}
           onNavigateMatch={navigateToMatch}
+          {...(navigationTarget
+            ? { focusedProviderThreadId: navigationTarget.providerThreadId }
+            : {})}
+          onManualNavigation={() => {
+            if (threadRef && navigationTarget)
+              mapStore.clearNavigationTarget(threadRef, navigationTarget.requestId);
+          }}
         />
       </>
     );
@@ -405,6 +521,25 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
       aria-label="Workflow"
     >
       {header}
+      {navigationTarget && locationQuery.isPending && !locationQuery.data ? (
+        <div className="border-b border-border bg-muted/40 px-3 py-2 text-xs" role="status">
+          Locating active work #{navigationTarget.issueNumber}…
+        </div>
+      ) : null}
+      {navigationTarget && locationQuery.error ? (
+        <div
+          className="flex items-center gap-2 border-b border-destructive/40 px-3 py-2 text-xs"
+          role="alert"
+        >
+          <span className="min-w-0 flex-1">
+            Could not locate active work. {locationQuery.error} The environment may need an updated
+            T3 Code server.
+          </span>
+          <Button size="xs" variant="outline" onClick={locationQuery.refresh}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
       {repository ? (
         <WorkflowSyncNotice
           state={syncQuery.data ?? null}

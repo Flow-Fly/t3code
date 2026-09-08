@@ -48,6 +48,12 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("allows active work to be read without orchestration operate access", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.workflowActiveWork)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
   it("requires write access to import agent session history", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsScan)).toBe(
       AuthOrchestrationReadScope,

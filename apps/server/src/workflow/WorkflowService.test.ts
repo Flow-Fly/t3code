@@ -640,6 +640,51 @@ describe("WorkflowService", () => {
     }).pipe(Effect.provide(layer(execute)));
   });
 
+  it.effect("keeps stale identity rejection while allowing locate by number", () => {
+    const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
+    execute
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({ data: { repository: { issue: issue(12, 20) } } }),
+          ) as never,
+        ),
+      )
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            JSON.stringify({ data: { repository: { issue: issue(12, 20) } } }),
+          ) as never,
+        ),
+      )
+      .mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(JSON.stringify({ data: { repository: { issue: issue(20) } } })) as never,
+        ),
+      );
+
+    return Effect.gen(function* () {
+      const service = yield* WorkflowService.WorkflowService;
+      const stale = yield* Effect.flip(
+        service.locate({
+          projectId: "project-1" as never,
+          repository: "Flow-Fly/t3code",
+          id: "stale-issue-id",
+          number: 12,
+        }),
+      );
+      expect(stale).toMatchObject({ failure: "issue-not-found" });
+
+      const current = yield* service.locate({
+        projectId: "project-1" as never,
+        repository: "Flow-Fly/t3code",
+        number: 12,
+      });
+      expect(current.issue.id).toBe("issue-12");
+      expect(current.ancestry.map((ancestor) => ancestor.number)).toEqual([20]);
+    }).pipe(Effect.provide(layer(execute)));
+  });
+
   it.effect("derives the frontier from canonical approval and current blocker evidence", () => {
     const execute = vi.fn<GitHubCli.GitHubCli["Service"]["execute"]>();
     const ticketBody = [

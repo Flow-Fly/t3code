@@ -30,6 +30,8 @@ import {
   type WorkflowDirectorStartResult,
   type WorkflowDirectorStatus,
   type WorkflowDirectorStatusInput,
+  type WorkflowActiveWorkInput,
+  type WorkflowActiveWorkResult,
   type WorkflowWorkerAssociateInput,
   type WorkflowWorkerHandoffInput,
   type WorkflowWorkerPrepareInput,
@@ -153,6 +155,31 @@ const DirectorRow = Schema.Struct({
 });
 type DirectorRow = typeof DirectorRow.Type;
 const decodeDirectorRow = Schema.decodeUnknownEffect(DirectorRow);
+
+const ActiveWorkRow = Schema.Struct({
+  entryId: Schema.String,
+  kind: Schema.String,
+  environmentId: Schema.String,
+  projectId: Schema.String,
+  projectTitle: Schema.String,
+  repository: Schema.String,
+  rootNumber: Schema.Number,
+  capabilityNumber: Schema.Number,
+  issueNumber: Schema.Number,
+  directorId: Schema.String,
+  ownerThreadId: Schema.String,
+  navigationThreadId: Schema.NullOr(Schema.String),
+  title: Schema.NullOr(Schema.String),
+  providerThreadId: Schema.NullOr(Schema.String),
+  activity: Schema.String,
+  unresolved: Schema.Number,
+  updatedAt: Schema.String,
+  directorCreatedAt: Schema.String,
+  entryOrder: Schema.Number,
+  entryCreatedAt: Schema.String,
+});
+type ActiveWorkRow = typeof ActiveWorkRow.Type;
+const decodeActiveWorkRow = Schema.decodeUnknownEffect(ActiveWorkRow);
 
 const AdmissionRow = Schema.Struct({
   admissionId: Schema.String,
@@ -865,6 +892,9 @@ export class WorkflowDirectorService extends Context.Service<
     readonly status: (
       input: WorkflowDirectorStatusInput,
     ) => Effect.Effect<WorkflowDirectorStatus, WorkflowQueryError | WorkflowDirectorError>;
+    readonly activeWork: (
+      input: WorkflowActiveWorkInput,
+    ) => Effect.Effect<WorkflowActiveWorkResult, WorkflowDirectorError>;
     readonly reassess: (
       input: ReassessmentInput,
       dispatch: InterruptDispatch,
@@ -3151,6 +3181,362 @@ export const make = Effect.gen(function* () {
     }
     yield* reconcileAcceptedResume(row.directorId);
     return yield* statusFromRow(yield* loadDirectorById(row.directorId));
+  });
+
+  const activeWork = Effect.fn("WorkflowDirectorService.activeWork")(function* (
+    input: WorkflowActiveWorkInput,
+  ) {
+    const environmentId = yield* environment.getEnvironmentId.pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "workspace-unavailable",
+          "The environment identity could not be read.",
+          String(error),
+        ),
+      ),
+    );
+    const cursor = input.cursor;
+    const rows = yield* persistence(
+      sql<Record<string, unknown>>`
+        WITH current_directors AS (
+          SELECT d.*,
+            substr(COALESCE(NULLIF(p.title, ''), d.project_id), 1, 160) AS project_title,
+            COALESCE(
+              (SELECT t.thread_id FROM projection_threads t
+                WHERE t.thread_id = d.thread_id AND t.archived_at IS NULL AND t.deleted_at IS NULL
+                LIMIT 1),
+              (SELECT source.thread_id
+                FROM workflow_director_handoffs handoff
+                JOIN workflow_directors source ON source.director_id = handoff.source_director_id
+                JOIN projection_threads source_thread ON source_thread.thread_id = source.thread_id
+                WHERE handoff.successor_director_id = d.director_id
+                  AND source_thread.archived_at IS NULL AND source_thread.deleted_at IS NULL
+                ORDER BY handoff.created_at DESC LIMIT 1),
+              (SELECT history.thread_id
+                FROM workflow_directors history
+                JOIN projection_threads history_thread ON history_thread.thread_id = history.thread_id
+                WHERE history.environment_id = d.environment_id
+                  AND history.repository COLLATE NOCASE = d.repository
+                  AND history.capability_number = d.capability_number
+                  AND history.director_id != d.director_id
+                  AND history_thread.archived_at IS NULL AND history_thread.deleted_at IS NULL
+                ORDER BY history.created_at DESC LIMIT 1)
+            ) AS navigation_thread_id
+          FROM workflow_directors d
+          LEFT JOIN projection_projects p ON p.project_id = d.project_id AND p.deleted_at IS NULL
+          WHERE d.environment_id = ${environmentId} AND d.is_current = 1
+            AND (
+              NOT EXISTS (
+                SELECT 1 FROM workflow_capability_completions completion
+                JOIN workflow_directors completed_director
+                  ON completed_director.director_id = completion.director_id
+                WHERE completed_director.environment_id = d.environment_id
+                  AND completed_director.repository COLLATE NOCASE = d.repository
+                  AND completed_director.capability_number = d.capability_number
+                  AND completion.status = 'completed'
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_director_native_turns native_turn
+                JOIN workflow_directors native_director
+                  ON native_director.director_id = native_turn.director_id
+                WHERE native_director.environment_id = d.environment_id
+                  AND native_director.repository COLLATE NOCASE = d.repository
+                  AND native_director.capability_number = d.capability_number
+                  AND native_turn.status = 'running'
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_director_handoffs handoff
+                JOIN workflow_directors source ON source.director_id = handoff.source_director_id
+                WHERE source.environment_id = d.environment_id
+                  AND source.repository COLLATE NOCASE = d.repository
+                  AND source.capability_number = d.capability_number
+                  AND handoff.status IN ('waiting-settlement', 'submitting', 'held')
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_reassessments reassessment
+                JOIN workflow_directors reassessed ON reassessed.director_id = reassessment.director_id
+                WHERE reassessed.environment_id = d.environment_id
+                  AND reassessed.repository COLLATE NOCASE = d.repository
+                  AND reassessed.capability_number = d.capability_number
+                  AND reassessment.status != 'cleared'
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_worker_observations observation
+                JOIN workflow_directors observed ON observed.director_id = observation.director_id
+                WHERE observed.environment_id = d.environment_id
+                  AND observed.repository COLLATE NOCASE = d.repository
+                  AND observed.capability_number = d.capability_number
+                  AND observation.native_lifecycle IS NULL
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_worker_dispatches dispatch
+                JOIN workflow_directors dispatched ON dispatched.director_id = dispatch.director_id
+                WHERE dispatched.environment_id = d.environment_id
+                  AND dispatched.repository COLLATE NOCASE = d.repository
+                  AND dispatched.capability_number = d.capability_number
+                  AND dispatch.status IN ('prepared', 'unconfirmed')
+              )
+              OR EXISTS (
+                SELECT 1 FROM workflow_ticket_reviews review
+                JOIN workflow_directors reviewed ON reviewed.director_id = review.director_id
+                WHERE reviewed.environment_id = d.environment_id
+                  AND reviewed.repository COLLATE NOCASE = d.repository
+                  AND reviewed.capability_number = d.capability_number
+                  AND review.status IN ('checks-pending', 'checks-failed', 'prepared', 'spawn-issued', 'associated')
+              )
+            )
+        ), capability_history AS (
+          SELECT current.director_id AS current_director_id, history.*,
+            substr(COALESCE(NULLIF(history_project.title, ''), history.project_id), 1, 160)
+              AS history_project_title
+          FROM current_directors current
+          JOIN workflow_directors history
+            ON history.environment_id = current.environment_id
+            AND history.repository COLLATE NOCASE = current.repository
+            AND history.capability_number = current.capability_number
+          LEFT JOIN projection_projects history_project
+            ON history_project.project_id = history.project_id AND history_project.deleted_at IS NULL
+        ), entries AS (
+          SELECT 'director:' || current.director_id AS entry_id, 'director' AS kind,
+            current.environment_id, current.project_id, current.project_title, current.repository,
+            current.root_number, current.capability_number,
+            current.capability_number AS issue_number, current.director_id,
+            current.thread_id AS owner_thread_id,
+            current.navigation_thread_id,
+            NULL AS title, NULL AS provider_thread_id,
+            CASE
+              WHEN native_turn.status = 'running' THEN 'running'
+              WHEN current.status IN ('held', 'preparing-worktree') THEN 'attention'
+              WHEN current.status = 'submitting' THEN 'unknown'
+              ELSE 'waiting'
+            END AS activity,
+            1 AS unresolved, current.updated_at,
+            current.created_at AS director_created_at, 0 AS entry_order,
+            current.created_at AS entry_created_at
+          FROM current_directors current
+          LEFT JOIN workflow_director_native_turns native_turn
+            ON native_turn.director_id = current.director_id
+
+          UNION ALL
+
+          SELECT 'director:' || history.director_id, 'director',
+            current.environment_id, history.project_id,
+            history.history_project_title,
+            history.repository, history.root_number, history.capability_number,
+            history.capability_number, history.director_id, history.thread_id,
+            CASE WHEN owner_thread.thread_id IS NULL THEN NULL ELSE history.thread_id END,
+            substr('Earlier director for capability #' || history.capability_number, 1, 160),
+            NULL, 'running', 1, native_turn.updated_at, current.created_at, 1, history.created_at
+          FROM current_directors current
+          JOIN capability_history history ON history.current_director_id = current.director_id
+          JOIN workflow_director_native_turns native_turn
+            ON native_turn.director_id = history.director_id AND native_turn.status = 'running'
+          LEFT JOIN projection_threads owner_thread
+            ON owner_thread.thread_id = history.thread_id
+            AND owner_thread.archived_at IS NULL AND owner_thread.deleted_at IS NULL
+          WHERE history.director_id != current.director_id
+
+          UNION ALL
+
+          SELECT 'child:' || history.director_id || ':' || observation.provider_thread_id,
+            CASE
+              WHEN EXISTS (SELECT 1 FROM workflow_worker_dispatches dispatch
+                WHERE dispatch.director_id = history.director_id
+                  AND dispatch.provider_thread_id = observation.provider_thread_id) THEN 'worker'
+              WHEN EXISTS (SELECT 1 FROM workflow_ticket_reviews review
+                WHERE review.director_id = history.director_id
+                  AND review.provider_thread_id = observation.provider_thread_id)
+                OR EXISTS (SELECT 1 FROM workflow_review_axes axis
+                  JOIN workflow_ticket_reviews review ON review.review_id = axis.review_id
+                  WHERE review.director_id = history.director_id
+                    AND axis.provider_thread_id = observation.provider_thread_id) THEN 'reviewer'
+              ELSE 'unassociated'
+            END,
+            current.environment_id, history.project_id, history.history_project_title,
+            history.repository, history.root_number, history.capability_number,
+            COALESCE(
+              (SELECT dispatch.ticket_number FROM workflow_worker_dispatches dispatch
+                WHERE dispatch.director_id = history.director_id
+                  AND dispatch.provider_thread_id = observation.provider_thread_id LIMIT 1),
+              (SELECT review.ticket_number FROM workflow_ticket_reviews review
+                WHERE review.director_id = history.director_id
+                  AND review.provider_thread_id = observation.provider_thread_id LIMIT 1),
+              (SELECT review.ticket_number FROM workflow_review_axes axis
+                JOIN workflow_ticket_reviews review ON review.review_id = axis.review_id
+                WHERE review.director_id = history.director_id
+                  AND axis.provider_thread_id = observation.provider_thread_id LIMIT 1),
+              current.capability_number
+            ),
+            history.director_id, history.thread_id,
+            CASE WHEN owner_thread.thread_id IS NULL THEN NULL ELSE history.thread_id END,
+            NULLIF(substr(COALESCE(observation.title, observation.role, ''), 1, 160), ''),
+            observation.provider_thread_id,
+            CASE
+              WHEN observation.native_lifecycle = 'closed' THEN 'settled'
+              WHEN observation.native_turn_status = 'running' OR observation.provider_status = 'running'
+                THEN 'running'
+              WHEN observation.provider_status IN ('failed', 'interrupted') THEN 'attention'
+              ELSE 'unknown'
+            END,
+            CASE WHEN observation.native_lifecycle = 'closed' THEN 0 ELSE 1 END,
+            observation.updated_at, current.created_at,
+            CASE WHEN observation.native_lifecycle = 'closed' THEN 4 ELSE 1 END,
+            observation.first_observed_at
+          FROM current_directors current
+          JOIN capability_history history ON history.current_director_id = current.director_id
+          JOIN workflow_worker_observations observation
+            ON observation.director_id = history.director_id
+          LEFT JOIN projection_threads owner_thread
+            ON owner_thread.thread_id = history.thread_id
+            AND owner_thread.archived_at IS NULL AND owner_thread.deleted_at IS NULL
+          WHERE observation.native_lifecycle IS NULL OR observation.native_lifecycle != 'closed'
+
+          UNION ALL
+
+          SELECT 'dispatch:' || dispatch.dispatch_id, 'worker',
+            current.environment_id, history.project_id, history.history_project_title,
+            history.repository, history.root_number, history.capability_number,
+            dispatch.ticket_number, history.director_id, history.thread_id,
+            CASE WHEN owner_thread.thread_id IS NULL THEN NULL ELSE history.thread_id END,
+            NULL, dispatch.provider_thread_id,
+            CASE WHEN dispatch.status IN ('reported-failed', 'unconfirmed') THEN 'attention' ELSE 'waiting' END,
+            1, dispatch.updated_at, current.created_at, 2, dispatch.created_at
+          FROM current_directors current
+          JOIN capability_history history ON history.current_director_id = current.director_id
+          JOIN workflow_worker_dispatches dispatch ON dispatch.director_id = history.director_id
+          LEFT JOIN projection_threads owner_thread
+            ON owner_thread.thread_id = history.thread_id
+            AND owner_thread.archived_at IS NULL AND owner_thread.deleted_at IS NULL
+          WHERE dispatch.status IN ('prepared', 'associated', 'reported-failed', 'unconfirmed')
+            AND (dispatch.provider_thread_id IS NULL OR NOT EXISTS (
+              SELECT 1 FROM workflow_worker_observations observation
+              WHERE observation.director_id = history.director_id
+                AND observation.provider_thread_id = dispatch.provider_thread_id
+            ))
+
+          UNION ALL
+
+          SELECT 'review:' || review.review_id, 'reviewer',
+            current.environment_id, history.project_id, history.history_project_title,
+            history.repository, history.root_number, history.capability_number,
+            review.ticket_number, history.director_id, history.thread_id,
+            CASE WHEN owner_thread.thread_id IS NULL THEN NULL ELSE history.thread_id END,
+            'Review for #' || review.ticket_number, review.provider_thread_id,
+            CASE WHEN review.status = 'checks-failed' THEN 'attention' ELSE 'waiting' END,
+            1, review.updated_at, current.created_at, 2, review.created_at
+          FROM current_directors current
+          JOIN capability_history history ON history.current_director_id = current.director_id
+          JOIN workflow_ticket_reviews review ON review.director_id = history.director_id
+          LEFT JOIN projection_threads owner_thread
+            ON owner_thread.thread_id = history.thread_id
+            AND owner_thread.archived_at IS NULL AND owner_thread.deleted_at IS NULL
+          WHERE review.status != 'reported'
+            AND (review.provider_thread_id IS NULL OR NOT EXISTS (
+              SELECT 1 FROM workflow_worker_observations observation
+              WHERE observation.director_id = history.director_id
+                AND observation.provider_thread_id = review.provider_thread_id
+            ))
+
+          UNION ALL
+
+          SELECT 'review-axis:' || review.review_id || ':' || axis.axis, 'reviewer',
+            current.environment_id, history.project_id, history.history_project_title,
+            history.repository, history.root_number, history.capability_number,
+            review.ticket_number, history.director_id, history.thread_id,
+            CASE WHEN owner_thread.thread_id IS NULL THEN NULL ELSE history.thread_id END,
+            substr(axis.axis || ' review for #' || review.ticket_number, 1, 160),
+            axis.provider_thread_id, 'unknown', 1,
+            review.updated_at, current.created_at, 2, review.created_at
+          FROM current_directors current
+          JOIN capability_history history ON history.current_director_id = current.director_id
+          JOIN workflow_ticket_reviews review ON review.director_id = history.director_id
+          JOIN workflow_review_axes axis ON axis.review_id = review.review_id
+          LEFT JOIN projection_threads owner_thread
+            ON owner_thread.thread_id = history.thread_id
+            AND owner_thread.archived_at IS NULL AND owner_thread.deleted_at IS NULL
+          WHERE review.status != 'reported' AND NOT EXISTS (
+            SELECT 1 FROM workflow_worker_observations observation
+            WHERE observation.director_id = history.director_id
+              AND observation.provider_thread_id = axis.provider_thread_id
+          )
+        )
+        SELECT entry_id AS "entryId", kind, environment_id AS "environmentId",
+          project_id AS "projectId", project_title AS "projectTitle", repository,
+          root_number AS "rootNumber", capability_number AS "capabilityNumber",
+          issue_number AS "issueNumber", director_id AS "directorId",
+          owner_thread_id AS "ownerThreadId", navigation_thread_id AS "navigationThreadId",
+          title, provider_thread_id AS "providerThreadId", activity, unresolved,
+          updated_at AS "updatedAt", director_created_at AS "directorCreatedAt",
+          entry_order AS "entryOrder", entry_created_at AS "entryCreatedAt"
+        FROM entries
+        WHERE ${cursor ? 1 : 0} = 0
+          OR director_created_at < ${cursor?.directorCreatedAt ?? ""}
+          OR (director_created_at = ${cursor?.directorCreatedAt ?? ""}
+            AND director_id > ${cursor?.directorId ?? ""})
+          OR (director_created_at = ${cursor?.directorCreatedAt ?? ""}
+            AND director_id = ${cursor?.directorId ?? ""}
+            AND entry_order > ${cursor?.entryOrder ?? 0})
+          OR (director_created_at = ${cursor?.directorCreatedAt ?? ""}
+            AND director_id = ${cursor?.directorId ?? ""}
+            AND entry_order = ${cursor?.entryOrder ?? 0}
+            AND entry_created_at < ${cursor?.entryCreatedAt ?? ""})
+          OR (director_created_at = ${cursor?.directorCreatedAt ?? ""}
+            AND director_id = ${cursor?.directorId ?? ""}
+            AND entry_order = ${cursor?.entryOrder ?? 0}
+            AND entry_created_at = ${cursor?.entryCreatedAt ?? ""}
+            AND entry_id > ${cursor?.entryId ?? ""})
+        ORDER BY director_created_at DESC, director_id,
+          entry_order, entry_created_at DESC, entry_id
+        LIMIT 51
+      `,
+      "Active Workflow entries could not be read.",
+    );
+    const decoded = yield* Effect.forEach(rows, (row) => decodeActiveWorkRow(row)).pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "persistence-failed",
+          "Saved Active work entries are invalid.",
+          String(error),
+        ),
+      ),
+    );
+    const page = decoded.slice(0, 50);
+    const entries = page.map((row) => {
+      const entryCursor = {
+        directorCreatedAt: row.directorCreatedAt,
+        directorId: row.directorId,
+        entryOrder: row.entryOrder,
+        entryCreatedAt: row.entryCreatedAt,
+        entryId: row.entryId,
+      };
+      return {
+        entryId: row.entryId,
+        kind: row.kind as WorkflowActiveWorkResult["entries"][number]["kind"],
+        environmentId: EnvironmentId.make(row.environmentId),
+        projectId: ProjectId.make(row.projectId),
+        projectTitle: row.projectTitle,
+        repository: row.repository as WorkflowActiveWorkResult["entries"][number]["repository"],
+        rootNumber: row.rootNumber,
+        capabilityNumber: row.capabilityNumber,
+        issueNumber: row.issueNumber,
+        directorId: row.directorId,
+        ownerThreadId: ThreadId.make(row.ownerThreadId),
+        navigationThreadId:
+          row.navigationThreadId === null ? null : ThreadId.make(row.navigationThreadId),
+        title: row.title,
+        providerThreadId: row.providerThreadId,
+        activity: row.activity as WorkflowActiveWorkResult["entries"][number]["activity"],
+        unresolved: row.unresolved === 1,
+        updatedAt: row.updatedAt,
+        cursor: entryCursor,
+      } satisfies WorkflowActiveWorkResult["entries"][number];
+    });
+    return {
+      environmentId,
+      entries,
+      nextCursor: decoded.length > 50 ? (entries.at(-1)?.cursor ?? null) : null,
+      refreshedAt: DateTime.formatIso(yield* DateTime.now),
+    } satisfies WorkflowActiveWorkResult;
   });
 
   const reassessmentTriggers = Effect.fn("WorkflowDirectorService.reassessmentTriggers")(function* (
@@ -8922,6 +9308,7 @@ export const make = Effect.gen(function* () {
   return WorkflowDirectorService.of({
     start: (input, dispatch) => lock.withPermits(1)(startUnlocked(input, dispatch)),
     status: (input) => lock.withPermits(1)(statusUnlocked(input)),
+    activeWork,
     reassess: (input, dispatch) => lock.withPermits(1)(reassessUnlocked(input, dispatch)),
     retryReassessment: (input, dispatch) =>
       lock.withPermits(1)(retryReassessmentUnlocked(input, dispatch)),

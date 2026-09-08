@@ -156,6 +156,8 @@ import {
   WorkflowDirectorStartResult,
   WorkflowDirectorStatus,
   WorkflowDirectorStatusInput,
+  WorkflowActiveWorkInput,
+  WorkflowActiveWorkResult,
   WorkflowRecoveryInput,
   WorkflowRecoveryResult,
   WorkflowRecoverInput,
@@ -418,6 +420,7 @@ export const WS_METHODS = {
   workflowRecover: "workflow.recover",
   workflowDirectorStart: "workflow.director.start",
   workflowDirectorStatus: "workflow.director.status",
+  workflowActiveWork: "workflow.activeWork",
   workflowDirectorHandoffReconcile: "workflow.director.handoff.reconcile",
   workflowDirectorReassessmentRetry: "workflow.director.reassessment.retry",
   workflowDirectorResume: "workflow.director.resume",
@@ -921,6 +924,12 @@ export const WsWorkflowDirectorStartRpc = Rpc.make(WS_METHODS.workflowDirectorSt
 export const WsWorkflowDirectorStatusRpc = Rpc.make(WS_METHODS.workflowDirectorStatus, {
   payload: WorkflowDirectorStatusInput,
   success: WorkflowDirectorStatus,
+  error: WorkflowDirectorRpcError,
+});
+
+export const WsWorkflowActiveWorkRpc = Rpc.make(WS_METHODS.workflowActiveWork, {
+  payload: WorkflowActiveWorkInput,
+  success: WorkflowActiveWorkResult,
   error: WorkflowDirectorRpcError,
 });
 
@@ -1493,6 +1502,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkflowRecoverRpc,
   WsWorkflowDirectorStartRpc,
   WsWorkflowDirectorStatusRpc,
+  WsWorkflowActiveWorkRpc,
   WsWorkflowDirectorHandoffReconcileRpc,
   WsWorkflowDirectorReassessmentRetryRpc,
   WsWorkflowDirectorResumeRpc,

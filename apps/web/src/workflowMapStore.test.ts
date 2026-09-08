@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 
 import {
   selectWorkflowMapView,
@@ -8,7 +10,13 @@ import {
 } from "./workflowMapStore";
 
 beforeEach(() =>
-  useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} }),
+  useWorkflowMapStore.setState({
+    repositoryByProject: {},
+    focusedRootByContext: {},
+    locationByThread: {},
+    navigationTargetByThread: {},
+    views: {},
+  }),
 );
 
 describe("Workflow map view persistence", () => {
@@ -61,5 +69,36 @@ describe("Workflow map view persistence", () => {
     });
 
     expect(canonical).toBe(lower);
+  });
+
+  it("keeps roots and pending destinations scoped to canonical environment threads", () => {
+    const local = scopeThreadRef(EnvironmentId.make("local"), ThreadId.make("thread-1"));
+    const remote = scopeThreadRef(EnvironmentId.make("remote"), ThreadId.make("thread-1"));
+    const store = useWorkflowMapStore.getState();
+
+    store.setThreadLocation(local, {
+      projectId: "project",
+      repository: "one/repo",
+      rootNumber: 10,
+    });
+    store.setNavigationTarget(remote, {
+      requestId: "new-request",
+      projectId: "other-project",
+      repository: "two/repo",
+      rootNumber: 20,
+      issueNumber: 21,
+      providerThreadId: "native-child",
+    });
+    store.clearNavigationTarget(remote, "old-request");
+
+    expect(useWorkflowMapStore.getState()).toMatchObject({
+      locationByThread: {
+        "local:thread-1": { rootNumber: 10 },
+        "remote:thread-1": { rootNumber: 20 },
+      },
+      navigationTargetByThread: {
+        "remote:thread-1": { requestId: "new-request", issueNumber: 21 },
+      },
+    });
   });
 });

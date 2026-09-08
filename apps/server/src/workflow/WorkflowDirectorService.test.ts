@@ -897,6 +897,182 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe("WorkflowDirectorService", () => {
+  it.effect("pages active work across projects without leaking another environment", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const sql = yield* SqlClient.SqlClient;
+      const timestamp = "2026-09-09T00:00:00.000Z";
+      for (const id of ["project-1", "project-2"]) {
+        yield* sql`
+          INSERT INTO projection_projects
+            (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+          VALUES (${id}, ${id}, ${`/tmp/${id}`}, '[]', ${timestamp}, ${timestamp})
+        `;
+      }
+      for (let index = 0; index < 51; index++) {
+        const directorId = `active-${String(index).padStart(2, "0")}`;
+        const ownerThreadId = `thread-${directorId}`;
+        const ownerProjectId = index % 2 === 0 ? "project-1" : "project-2";
+        yield* sql`
+          INSERT INTO projection_threads
+            (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
+          VALUES (${ownerThreadId}, ${ownerProjectId}, ${ownerThreadId}, ${timestamp}, ${timestamp}, NULL, NULL)
+        `;
+        yield* sql`
+          INSERT INTO workflow_directors (
+            director_id, batch_id, environment_id, project_id, repository, root_number,
+            capability_number, thread_id, command_id, message_id, worktree_path,
+            worktree_branch, status, requested_model, requested_instance_id,
+            requested_effort, observed_match, initial_turn_disposition, is_current,
+            created_at, updated_at
+          ) VALUES (
+            ${directorId}, ${`batch-${directorId}`}, ${environmentId}, ${ownerProjectId},
+            ${repository}, ${index + 1}, ${index + 1}, ${ownerThreadId}, ${`command-${directorId}`},
+            ${`message-${directorId}`}, ${`/tmp/${directorId}`}, ${`capability/${directorId}`},
+            'active', 'gpt-6-astra', ${instanceId}, 'high', 'unknown', 'accepted', 1,
+            ${timestamp}, ${timestamp}
+          )
+        `;
+      }
+      yield* sql`
+        INSERT INTO workflow_directors (
+          director_id, batch_id, environment_id, project_id, repository, root_number,
+          capability_number, thread_id, command_id, message_id, worktree_path,
+          worktree_branch, status, requested_model, requested_instance_id,
+          requested_effort, observed_match, initial_turn_disposition, is_current,
+          created_at, updated_at
+        ) VALUES (
+          'other-environment', 'other-batch', 'environment-2', 'project-1', ${repository},
+          100, 100, 'other-thread', 'other-command', 'other-message', '/tmp/other',
+          'capability/other', 'active', 'gpt-6-astra', ${instanceId}, 'high', 'unknown',
+          'accepted', 1, ${timestamp}, ${timestamp}
+        )
+      `;
+
+      const first = yield* service.activeWork({});
+      expect(first.entries).toHaveLength(50);
+      expect(first.nextCursor).not.toBeNull();
+      const second = yield* service.activeWork({ cursor: first.nextCursor! });
+      expect(second.entries).toHaveLength(1);
+      expect(second.nextCursor).toBeNull();
+      expect(
+        [...first.entries, ...second.entries].every(
+          (entry) => entry.environmentId === environmentId,
+        ),
+      ).toBe(true);
+      expect(
+        new Set([...first.entries, ...second.entries].map((entry) => entry.projectId)),
+      ).toEqual(new Set([ProjectId.make("project-1"), ProjectId.make("project-2")]));
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("keeps a completed capability visible when its root starts another native turn", () => {
+    const test = harness();
+    return Effect.gen(function* () {
+      const service = yield* WorkflowDirectorService.WorkflowDirectorService;
+      const sql = yield* SqlClient.SqlClient;
+      const timestamp = "2026-09-09T00:00:00.000Z";
+      yield* sql`
+        INSERT INTO projection_projects
+          (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+        VALUES (${projectId}, 'T3 Code', '/tmp/project-1', '[]', ${timestamp}, ${timestamp})
+      `;
+      yield* sql`
+        INSERT INTO projection_threads
+          (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
+        VALUES ('resumed-root', ${projectId}, 'Resumed root', ${timestamp}, ${timestamp}, NULL, NULL)
+      `;
+      yield* sql`
+        INSERT INTO workflow_directors (
+          director_id, batch_id, environment_id, project_id, repository, root_number,
+          capability_number, thread_id, command_id, message_id, worktree_path,
+          worktree_branch, status, requested_model, requested_instance_id,
+          requested_effort, observed_match, initial_turn_disposition, is_current,
+          created_at, updated_at
+        ) VALUES (
+          'completed-root', 'completed-batch', ${environmentId}, ${projectId}, ${repository},
+          80, 80, 'resumed-root', 'completed-command', 'completed-message', '/tmp/completed',
+          'capability/completed', 'active', 'gpt-6-astra', ${instanceId}, 'high', 'unknown',
+          'accepted', 1, ${timestamp}, ${timestamp}
+        )
+      `;
+      yield* sql`
+        INSERT INTO workflow_capability_completions (
+          completion_id, director_id, repository, capability_number, resulting_head,
+          specification_fingerprint, breakdown_fingerprint, comment_body, status,
+          close_confirmed, required_action, close_owned, created_at, updated_at
+        ) VALUES (
+          'completion-80', 'completed-root', ${repository}, 80, ${"a".repeat(40)},
+          'spec', 'breakdown', 'Complete', 'completed', 1, 'none', 1, ${timestamp}, ${timestamp}
+        )
+      `;
+      expect((yield* service.activeWork({})).entries).toEqual([]);
+
+      yield* sql`
+        INSERT INTO workflow_director_native_turns
+          (director_id, native_session_id, native_turn_id, status, updated_at)
+        VALUES ('completed-root', 'native-session', 'native-turn', 'running', ${timestamp})
+      `;
+      expect((yield* service.activeWork({})).entries).toContainEqual(
+        expect.objectContaining({
+          entryId: "director:completed-root",
+          navigationThreadId: "resumed-root",
+          activity: "running",
+        }),
+      );
+
+      yield* sql`
+        INSERT INTO projection_threads
+          (thread_id, project_id, title, created_at, updated_at, archived_at, deleted_at)
+        VALUES
+          ('retired-root', ${projectId}, 'Retired root', ${timestamp}, ${timestamp}, NULL, NULL),
+          ('successor-root', ${projectId}, 'Successor root', ${timestamp}, ${timestamp}, NULL, NULL)
+      `;
+      yield* sql`
+        INSERT INTO workflow_directors (
+          director_id, batch_id, environment_id, project_id, repository, root_number,
+          capability_number, thread_id, command_id, message_id, worktree_path,
+          worktree_branch, status, requested_model, requested_instance_id,
+          requested_effort, observed_match, initial_turn_disposition, is_current,
+          created_at, updated_at
+        ) VALUES
+          ('retired-director', 'retired-batch', ${environmentId}, ${projectId}, ${repository},
+            90, 90, 'retired-root', 'retired-command', 'retired-message', '/tmp/retired',
+            'capability/retired', 'active', 'gpt-6-astra', ${instanceId}, 'high', 'unknown',
+            'accepted', 0, ${timestamp}, ${timestamp}),
+          ('successor-director', 'successor-batch', ${environmentId}, ${projectId}, ${repository},
+            90, 90, 'successor-root', 'successor-command', 'successor-message', '/tmp/successor',
+            'capability/successor', 'waiting', 'gpt-6-astra', ${instanceId}, 'high', 'unknown',
+            'accepted', 1, ${timestamp}, ${timestamp})
+      `;
+      yield* sql`
+        INSERT INTO workflow_capability_completions (
+          completion_id, director_id, repository, capability_number, resulting_head,
+          specification_fingerprint, breakdown_fingerprint, comment_body, status,
+          close_confirmed, required_action, close_owned, created_at, updated_at
+        ) VALUES (
+          'completion-90', 'successor-director', ${repository}, 90, ${"b".repeat(40)},
+          'spec-90', 'breakdown-90', 'Complete', 'completed', 1, 'none', 1,
+          ${timestamp}, ${timestamp}
+        )
+      `;
+      yield* sql`
+        INSERT INTO workflow_director_native_turns
+          (director_id, native_session_id, native_turn_id, status, updated_at)
+        VALUES ('retired-director', 'retired-session', 'retired-turn', 'running', ${timestamp})
+      `;
+      expect((yield* service.activeWork({})).entries).toContainEqual(
+        expect.objectContaining({
+          entryId: "director:retired-director",
+          title: "Earlier director for capability #90",
+          navigationThreadId: "retired-root",
+          activity: "running",
+        }),
+      );
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect(
     "admits before controlled collaboration dispatch and associates the ingested child",
     () => {

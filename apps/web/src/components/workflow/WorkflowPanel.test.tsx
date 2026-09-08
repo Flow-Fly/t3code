@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { useWorkflowMapStore } from "~/workflowMapStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 
+vi.mock("./WorkflowActiveWork", () => ({ WorkflowActiveWork: () => null }));
+
 const query = vi.hoisted(() => {
   const calls = new Array<{ kind: string; request: unknown }>();
   const descriptor = (kind: string, request: unknown) => {
@@ -733,7 +735,13 @@ import { WorkflowPanel } from "./WorkflowPanel";
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.spyOn(console, "error").mockImplementation(() => undefined);
-  useWorkflowMapStore.setState({ repositoryByProject: {}, focusedRootByContext: {}, views: {} });
+  useWorkflowMapStore.setState({
+    repositoryByProject: {},
+    focusedRootByContext: {},
+    locationByThread: {},
+    navigationTargetByThread: {},
+    views: {},
+  });
   useRightPanelStore.setState({ byThreadKey: {} });
   query.moved = false;
   query.evidence = false;
@@ -761,6 +769,49 @@ afterEach(() => {
 });
 
 describe("WorkflowPanel browsing", () => {
+  it("restores an unloaded per-thread root before the shared project root", async () => {
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const threadId = ThreadId.make("return-thread");
+    const store = useWorkflowMapStore.getState();
+    const sharedContext = "remote-environment:project-draft:flow-fly/t3code";
+    const unloadedScope = `${sharedContext}:issue-20`;
+    store.focusRoot(sharedContext, "issue-10");
+    store.setThreadLocation(
+      { environmentId, threadId },
+      { projectId, repository: "Flow-Fly/t3code", rootNumber: 20 },
+    );
+    store.patchView(unloadedScope, {
+      positions: { "issue-12": { x: 90, y: 45 } },
+      viewport: { x: 12, y: 24, zoom: 0.7 },
+    });
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(() => {
+      renderer = create(
+        <WorkflowPanel
+          environmentId={environmentId}
+          environmentLabel="Remote environment"
+          projectId={projectId}
+          projectTitle="Draft project"
+          planningThreadId={threadId}
+          supported
+        />,
+      );
+    });
+
+    expect(
+      renderer!.root
+        .findByProps({ "aria-label": "Choose another workflow root" })
+        .children.join(""),
+    ).toContain("#20 New capability");
+    expect(useWorkflowMapStore.getState().views[unloadedScope]).toMatchObject({
+      positions: { "issue-12": { x: 90, y: 45 } },
+      viewport: { x: 12, y: 24, zoom: 0.7 },
+    });
+    await act(() => renderer?.unmount());
+  });
+
   it("shows a planning failure and restores the capability action", async () => {
     query.planningKind = "map";
     query.startFailure = true;

@@ -1161,7 +1161,7 @@ export const make = Effect.gen(function* () {
           ),
       });
       const issue = decoded.data.repository?.issue;
-      if (!issue || issue.id !== input.id) {
+      if (!issue || (input.id !== undefined && issue.id !== input.id)) {
         return yield* queryError(
           "issue-not-found",
           "The selected workflow issue is no longer available at this location.",

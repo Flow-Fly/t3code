@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   WorkflowChildrenResult,
+  WorkflowActiveWorkResult,
   WorkflowIssueDetail,
   WorkflowIssueSummary,
   WorkflowDirectorAdmissionInput,
@@ -10,6 +11,7 @@ import {
   WorkflowDirectorStatus,
   WorkflowRepositoriesResult,
   WorkflowRootsInput,
+  WorkflowLocateInput,
   WorkflowStartInput,
   WorkflowStartResult,
 } from "./workflow.ts";
@@ -19,8 +21,57 @@ const decodeWorkflowStartResult = Schema.decodeUnknownSync(WorkflowStartResult);
 const decodeDirectorStart = Schema.decodeUnknownSync(WorkflowDirectorStartInput);
 const decodeDirectorStatus = Schema.decodeUnknownSync(WorkflowDirectorStatus);
 const decodeAdmission = Schema.decodeUnknownSync(WorkflowDirectorAdmissionInput);
+const decodeActiveWork = Schema.decodeUnknownSync(WorkflowActiveWorkResult);
+const decodeLocate = Schema.decodeUnknownSync(WorkflowLocateInput);
 
 describe("workflow contracts", () => {
+  it("decodes bounded active-work pages and locate-by-number requests", () => {
+    const timestamp = "2026-09-09T00:00:00.000Z";
+    const cursor = {
+      directorCreatedAt: timestamp,
+      directorId: "director-1",
+      entryOrder: 1,
+      entryCreatedAt: timestamp,
+      entryId: "child:director-1:native-child",
+    };
+    const page = decodeActiveWork({
+      environmentId: "environment-1",
+      entries: [
+        {
+          entryId: cursor.entryId,
+          kind: "unassociated",
+          environmentId: "environment-1",
+          projectId: "project-1",
+          projectTitle: "Project",
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          capabilityNumber: 17,
+          issueNumber: 17,
+          directorId: "director-1",
+          ownerThreadId: "thread-1",
+          navigationThreadId: null,
+          title: "Unassociated worker",
+          providerThreadId: "native-child",
+          activity: "unknown",
+          unresolved: true,
+          updatedAt: timestamp,
+          cursor,
+        },
+      ],
+      nextCursor: cursor,
+      refreshedAt: timestamp,
+    });
+
+    expect(page.entries[0]).toMatchObject({
+      kind: "unassociated",
+      navigationThreadId: null,
+      unresolved: true,
+    });
+    expect(
+      decodeLocate({ projectId: "project-1", repository: "Flow-Fly/t3code", number: 10 }),
+    ).toEqual({ projectId: "project-1", repository: "Flow-Fly/t3code", number: 10 });
+  });
+
   it("keeps director profile observations and admission identity explicit", () => {
     const input = decodeDirectorStart({
       projectId: "project-1",

@@ -110,6 +110,11 @@ export function createWorkflowEnvironmentAtoms<R, E>(
       tag: WS_METHODS.workflowDirectorStatus,
       staleTimeMs: 0,
     }),
+    activeWork: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:workflow:active-work",
+      tag: WS_METHODS.workflowActiveWork,
+      staleTimeMs: 0,
+    }),
     directorHandoffReconcile: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:workflow:director-handoff-reconcile",
       tag: WS_METHODS.workflowDirectorHandoffReconcile,
