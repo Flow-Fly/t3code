@@ -1005,6 +1005,7 @@ describe("ProviderCommandReactor", () => {
       validateProject: () => Effect.void,
       roots: () => Effect.succeed({ repository: workflowRepository, roots: [directorCapability] }),
     } as unknown as WorkflowService.WorkflowService["Service"]);
+    let beforeNextDirectorGitStatus: (() => Effect.Effect<void>) | undefined;
     const workflowDirector = await runtime.runPromise(
       WorkflowDirectorService.make.pipe(
         Effect.provideService(WorkflowService.WorkflowService, directorWorkflow),
@@ -1073,7 +1074,14 @@ describe("ProviderCommandReactor", () => {
                 stderrTruncated: false,
                 stdoutInvalidUtf8: false,
                 stderrInvalidUtf8: false,
-              } as never),
+              } as never).pipe(
+                Effect.tap(() => {
+                  if (args[0] !== "status" || !beforeNextDirectorGitStatus) return Effect.void;
+                  const beforeGitStatus = beforeNextDirectorGitStatus;
+                  beforeNextDirectorGitStatus = undefined;
+                  return beforeGitStatus();
+                }),
+              ),
           }),
         ),
         Effect.provideService(
@@ -1294,6 +1302,9 @@ describe("ProviderCommandReactor", () => {
       readDirectorRows,
       workflowStart,
       workflowDirector,
+      beforeNextDirectorGitStatus: (effect: () => Effect.Effect<void>) => {
+        beforeNextDirectorGitStatus = effect;
+      },
       workflowMonitor,
       makeWorkflowMonitor,
       directorCapability,
@@ -2603,30 +2614,37 @@ describe("ProviderCommandReactor", () => {
           .pipe(Effect.result);
         expect(pendingSecond._tag).toBe("Failure");
         expect(harness.sendTurn).toHaveBeenCalledTimes(2);
-        yield* Effect.promise(() =>
-          harness.emitProviderEvents([
-            {
-              type: "turn.started",
-              eventId: EventId.make("rotation-oldest-before-pending-dispatch"),
-              provider: ProviderDriverKind.make("codex"),
-              providerInstanceId: ProviderInstanceId.make("codex"),
-              threadId: started.director.threadId,
-              turnId: TurnId.make("rotation-oldest-renewed"),
-              createdAt: "2026-09-07T13:01:02.000Z",
-              payload: {},
-              raw: {
-                source: "codex.app-server.notification",
-                payload: {
-                  threadId: "rotation-source-session",
-                  turn: { id: "rotation-oldest-renewed" },
+        let injectedDuringFinalGit = false;
+        harness.beforeNextDirectorGitStatus(() =>
+          Effect.gen(function* () {
+            injectedDuringFinalGit = true;
+            yield* Effect.promise(() =>
+              harness.emitProviderEvents([
+                {
+                  type: "task.updated",
+                  eventId: EventId.make("rotation-source-worker-restarted-during-final-git"),
+                  provider: ProviderDriverKind.make("codex"),
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                  threadId: started.director.threadId,
+                  createdAt: "2026-09-07T13:01:02.100Z",
+                  payload: {
+                    taskId: RuntimeTaskId.make("rotation-source-worker"),
+                    status: "running",
+                    timelineBypass: true,
+                    nativeTurn: {
+                      sessionId: "rotation-source-worker-restarted-session",
+                      turnId: "rotation-source-worker-restarted-turn",
+                      status: "running",
+                    },
+                  },
                 },
-              },
-            },
-          ]),
+              ]),
+            );
+          }),
         );
-        yield* Effect.promise(() => harness.drain());
         yield* Effect.promise(() => harness.makeWorkflowMonitor());
         yield* Effect.promise(() => harness.drain());
+        expect(injectedDuringFinalGit).toBe(true);
         expect(harness.sendTurn).toHaveBeenCalledTimes(2);
         const heldPending = yield* harness.workflowDirector.status({
           projectId: ProjectId.make("project-1"),
@@ -2638,8 +2656,8 @@ describe("ProviderCommandReactor", () => {
         expect(heldPending.handoffRecoveryTargets?.[0]).toMatchObject({
           handoffId: prepared.handoffId,
           sourceBatchNumber: expect.any(Number),
-          rootSettlement: { status: "running" },
-          childSettlements: { observedCount: 1, settledCount: 1 },
+          rootSettlement: { status: "interrupted" },
+          childSettlements: { observedCount: 1, settledCount: 0 },
         });
         const pendingShell = yield* harness.snapshotQuery.getThreadShellById(heldPending.threadId);
         expect(Option.isNone(pendingShell)).toBe(true);
@@ -2651,19 +2669,20 @@ describe("ProviderCommandReactor", () => {
         yield* Effect.promise(() =>
           harness.emitProviderEvents([
             {
-              type: "turn.aborted",
-              eventId: EventId.make("rotation-oldest-before-pending-settled"),
+              type: "task.updated",
+              eventId: EventId.make("rotation-source-worker-restarted-settled"),
               provider: ProviderDriverKind.make("codex"),
               providerInstanceId: ProviderInstanceId.make("codex"),
               threadId: started.director.threadId,
-              turnId: TurnId.make("rotation-oldest-renewed"),
-              createdAt: "2026-09-07T13:01:03.000Z",
-              payload: { reason: "The oldest predecessor settled before owner recovery." },
-              raw: {
-                source: "codex.app-server.notification",
-                payload: {
-                  threadId: "rotation-source-session",
-                  turn: { id: "rotation-oldest-renewed" },
+              createdAt: "2026-09-07T13:01:03.100Z",
+              payload: {
+                taskId: RuntimeTaskId.make("rotation-source-worker"),
+                status: "interrupted",
+                timelineBypass: true,
+                nativeTurn: {
+                  sessionId: "rotation-source-worker-restarted-session",
+                  turnId: "rotation-source-worker-restarted-turn",
+                  status: "interrupted",
                 },
               },
             },
@@ -2694,8 +2713,12 @@ describe("ProviderCommandReactor", () => {
           repository: "Flow-Fly/t3code",
           capabilityNumber: 17,
         });
-        const terminalTarget = terminalPending.handoffRecoveryTargets![0]!;
+        expect(terminalPending.handoffRecoveryTargets).toHaveLength(1);
+        const terminalTarget = terminalPending.handoffRecoveryTargets!.find(
+          (target) => target.handoffId === prepared.handoffId,
+        )!;
         expect(terminalTarget.rootSettlement?.status).toBe("interrupted");
+        expect(terminalTarget.childSettlements).toEqual({ observedCount: 1, settledCount: 1 });
         const wrongProjectRecovery = yield* harness.workflowDirector
           .reconcileHandoffAsOwner(
             {
@@ -2775,7 +2798,9 @@ describe("ProviderCommandReactor", () => {
           repository: "Flow-Fly/t3code",
           capabilityNumber: 17,
         });
-        const refreshedTarget = refreshedPending.handoffRecoveryTargets![0]!;
+        const refreshedTarget = refreshedPending.handoffRecoveryTargets!.find(
+          (target) => target.handoffId === prepared.handoffId,
+        )!;
         const recoveredPending = yield* harness.workflowDirector.reconcileHandoffAsOwner(
           {
             projectId: ProjectId.make("project-1"),
@@ -2790,6 +2815,104 @@ describe("ProviderCommandReactor", () => {
           "owner-session-subject",
         );
         expect(recoveredPending.handoffRecoveryTargets).toEqual([]);
+        let projectedSourceDuringFinalGit = false;
+        harness.beforeNextDirectorGitStatus(() =>
+          Effect.gen(function* () {
+            projectedSourceDuringFinalGit = true;
+            yield* harness.engine.dispatch({
+              type: "thread.turn.start",
+              commandId: CommandId.make("rotation-source-projected-during-final-git"),
+              threadId: rotated.threadId,
+              message: {
+                messageId: MessageId.make("rotation-source-projected-message"),
+                role: "user",
+                text: "New source work during succession preflight",
+                attachments: [],
+              },
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "gpt-6-astra",
+              },
+              runtimeMode: "approval-required",
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              createdAt: "2026-09-07T13:01:03.300Z",
+            });
+          }),
+        );
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+        expect(projectedSourceDuringFinalGit).toBe(true);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(3);
+        const projectedSourcePending = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(projectedSourcePending.directorId).toBe(heldPending.directorId);
+        expect(projectedSourcePending.handoffRecoveryTargets).toEqual([]);
+        yield* Effect.promise(() =>
+          harness.emitProviderEvents([
+            {
+              type: "turn.started",
+              eventId: EventId.make("rotation-projected-source-native-started"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: rotated.threadId,
+              turnId: TurnId.make("turn-3"),
+              createdAt: "2026-09-07T13:01:03.400Z",
+              payload: {},
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-successor-session",
+                  turn: { id: "turn-3" },
+                },
+              },
+            },
+            {
+              type: "turn.aborted",
+              eventId: EventId.make("rotation-projected-source-native-settled"),
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: rotated.threadId,
+              turnId: TurnId.make("turn-3"),
+              createdAt: "2026-09-07T13:01:03.500Z",
+              payload: { reason: "The projected source turn settled before owner recovery." },
+              raw: {
+                source: "codex.app-server.notification",
+                payload: {
+                  threadId: "rotation-successor-session",
+                  turn: { id: "turn-3" },
+                },
+              },
+            },
+          ]),
+        );
+        yield* Effect.promise(() => harness.makeWorkflowMonitor());
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(3);
+        const terminalSourcePending = yield* harness.workflowDirector.status({
+          projectId: ProjectId.make("project-1"),
+          repository: "Flow-Fly/t3code",
+          capabilityNumber: 17,
+        });
+        expect(terminalSourcePending.handoffRecoveryTargets).toHaveLength(1);
+        const immediateSourceTarget = terminalSourcePending.handoffRecoveryTargets![0]!;
+        expect(immediateSourceTarget.handoffId).not.toBe(prepared.handoffId);
+        const fullyRecoveredPending = yield* harness.workflowDirector.reconcileHandoffAsOwner(
+          {
+            projectId: ProjectId.make("project-1"),
+            repository: "Flow-Fly/t3code",
+            capabilityNumber: 17,
+            expectedDirectorId: terminalSourcePending.directorId,
+            expectedObservation: terminalSourcePending.observation,
+            handoffId: immediateSourceTarget.handoffId,
+            expectedTargetObservation: immediateSourceTarget.targetObservation,
+            summary: "The owner acknowledged the immediate source's terminal evidence.",
+          },
+          "owner-session-subject",
+        );
+        expect(fullyRecoveredPending.handoffRecoveryTargets).toEqual([]);
         const ownerReconciliations = yield* Effect.promise(() =>
           harness.runEffect(
             Effect.gen(function* () {
@@ -2820,7 +2943,7 @@ describe("ProviderCommandReactor", () => {
           harness.readDirectorRows(third.directorId),
         );
         expect(submittedDirectorRows[0]?.commandId).toBe(pendingCommandId);
-        expect(harness.sendTurn).toHaveBeenCalledTimes(3);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(4);
         const repeatedRows = yield* Effect.promise(() =>
           harness.runEffect(
             Effect.gen(function* () {

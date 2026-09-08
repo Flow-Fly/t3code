@@ -5725,6 +5725,69 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const successorDispatchDecision = Effect.fn("WorkflowDirectorService.successorDispatchDecision")(
+    function* (
+      current: DirectorRow,
+      source: DirectorRow,
+      handoff: HandoffRow,
+      attemptedAt: string,
+    ) {
+      return yield* persistence(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            // Native ingestion and projection writes do not share the director semaphore. Take the
+            // SQLite writer lock before the last local evidence read and the persisted attempt.
+            yield* sql`UPDATE workflow_directors SET director_id = director_id
+            WHERE director_id = ${current.directorId}`;
+            const receiptRows = yield* sql<{
+              readonly commandId: string;
+              readonly resultSequence: number;
+              readonly status: string;
+            }>`SELECT command_id AS "commandId", result_sequence AS "resultSequence", status
+            FROM orchestration_command_receipts
+            WHERE command_id IN (
+              ${handoff.successorCommandId},
+              ${workflowSuccessorCreateCommandId(CommandId.make(handoff.successorCommandId!))}
+            )`;
+            const turnReceipt = receiptRows.find(
+              (receipt) => receipt.commandId === handoff.successorCommandId,
+            );
+            const createReceipt = receiptRows.find(
+              (receipt) => receipt.commandId !== handoff.successorCommandId,
+            );
+            if (turnReceipt?.status === "accepted") {
+              return {
+                disposition: "accepted" as const,
+                sequence: turnReceipt.resultSequence,
+              };
+            }
+            if (
+              turnReceipt?.status === "rejected" ||
+              (!turnReceipt && createReceipt?.status === "rejected")
+            ) {
+              return { disposition: "rejected" as const };
+            }
+            const predecessorDecision = yield* ensurePredecessorExecutionSettled(
+              current,
+              source.directorId,
+            ).pipe(Effect.result);
+            if (predecessorDecision._tag === "Failure") {
+              return {
+                disposition: "blocked" as const,
+                error: predecessorDecision.failure,
+              };
+            }
+            yield* sql`UPDATE workflow_directors SET initial_turn_disposition = 'unknown',
+            updated_at = ${attemptedAt} WHERE director_id = ${current.directorId}
+              AND initial_turn_disposition = 'not-attempted'`;
+            return { disposition: "dispatch" as const };
+          }),
+        ),
+        "The successor dispatch decision could not be persisted.",
+      );
+    },
+  );
+
   const rotateReadyUnlocked = Effect.fn("WorkflowDirectorService.rotateReady")(function* (
     input: WorkflowDirectorStatusInput,
     dispatch: Dispatch,
@@ -6026,12 +6089,25 @@ export const make = Effect.gen(function* () {
       );
     }
     const submittedAt = DateTime.formatIso(yield* DateTime.now);
-    yield* persistence(
-      sql`UPDATE workflow_directors SET initial_turn_disposition = 'unknown',
-        updated_at = ${submittedAt} WHERE director_id = ${current.directorId}
-          AND initial_turn_disposition = 'not-attempted'`,
-      "The successor dispatch attempt could not be marked before submission.",
+    const dispatchDecision = yield* successorDispatchDecision(
+      current,
+      source,
+      handoff,
+      submittedAt,
     );
+    if (dispatchDecision.disposition === "accepted") {
+      return yield* finalizeAcceptedSuccessor(current, handoff, dispatchDecision.sequence);
+    }
+    if (dispatchDecision.disposition === "rejected") {
+      yield* restoreRejectedSuccessor(current, handoff);
+      return yield* directorError(
+        "dispatch-failed",
+        "The successor was definitively rejected. The source director was restored for explicit handoff retry.",
+      );
+    }
+    if (dispatchDecision.disposition === "blocked") {
+      return yield* dispatchDecision.error;
+    }
     current = { ...current, initialTurnDisposition: "unknown", updatedAt: submittedAt };
     const dispatched = yield* dispatch({
       type: "thread.turn.start",
@@ -6454,7 +6530,7 @@ export const make = Effect.gen(function* () {
 
   const ensurePredecessorExecutionSettled = Effect.fn(
     "WorkflowDirectorService.ensurePredecessorExecutionSettled",
-  )(function* (row: DirectorRow) {
+  )(function* (row: DirectorRow, requiredProjectedSourceDirectorId?: string) {
     const predecessors = yield* persistence(
       sql<{
         readonly directorId: string;
@@ -6473,18 +6549,16 @@ export const make = Effect.gen(function* () {
     );
     for (const predecessor of predecessors) {
       const handoff = yield* outgoingHandoff(predecessor.directorId);
-      if (!handoff || handoff.status !== "submitted") {
-        const receipt = yield* receipts
-          .getByCommandId({ commandId: CommandId.make(predecessor.commandId) })
-          .pipe(
-            Effect.mapError((error) =>
-              directorError(
-                "persistence-failed",
-                "Abandoned predecessor receipt evidence could not be read.",
-                String(error),
-              ),
-            ),
-          );
+      const isPendingImmediateSource =
+        predecessor.directorId === requiredProjectedSourceDirectorId &&
+        handoff?.successorDirectorId === row.directorId &&
+        handoff.status === "submitting";
+      if (!handoff || (handoff.status !== "submitted" && !isPendingImmediateSource)) {
+        const receipt = yield* persistence(
+          sql<{ readonly status: string }>`SELECT status FROM orchestration_command_receipts
+            WHERE command_id = ${predecessor.commandId} LIMIT 1`,
+          "Abandoned predecessor receipt evidence could not be read.",
+        );
         const nativeActivity = yield* persistence(
           sql<{ readonly count: number }>`SELECT
             (SELECT count(*) FROM workflow_director_native_turns WHERE director_id = ${predecessor.directorId}) +
@@ -6493,12 +6567,53 @@ export const make = Effect.gen(function* () {
         );
         const safelyAbandoned =
           ["not-attempted", "not-accepted"].includes(predecessor.initialTurnDisposition) &&
-          (Option.isNone(receipt) || receipt.value.status === "rejected") &&
+          (!receipt[0] || receipt[0].status === "rejected") &&
           nativeActivity[0]?.count === 0;
         if (safelyAbandoned) continue;
         return yield* directorError(
           "not-ready",
           "A predecessor batch has no accepted durable settlement handoff.",
+          predecessor.directorId,
+        );
+      }
+      const projectedRoots = yield* persistence(
+        sql<{
+          readonly latestTurnState: string | null;
+          readonly sessionStatus: string | null;
+          readonly activeTurnId: string | null;
+          readonly unsettledTurnCount: number;
+        }>`
+          SELECT turn.state AS "latestTurnState", session.status AS "sessionStatus",
+            session.active_turn_id AS "activeTurnId",
+            (SELECT count(*) FROM projection_turns unsettled
+              WHERE unsettled.thread_id = thread.thread_id
+                AND (unsettled.turn_id IS NULL OR unsettled.state = 'running'))
+              AS "unsettledTurnCount"
+          FROM projection_threads thread
+          LEFT JOIN projection_turns turn
+            ON turn.thread_id = thread.thread_id AND turn.turn_id = thread.latest_turn_id
+          LEFT JOIN projection_thread_sessions session ON session.thread_id = thread.thread_id
+          WHERE thread.thread_id = (
+            SELECT thread_id FROM workflow_directors WHERE director_id = ${predecessor.directorId}
+          ) AND thread.deleted_at IS NULL AND thread.archived_at IS NULL
+          LIMIT 1
+        `,
+        "Predecessor projected director state could not be read.",
+      );
+      const projectedRoot = projectedRoots[0];
+      if (
+        (!projectedRoot && predecessor.directorId === requiredProjectedSourceDirectorId) ||
+        (projectedRoot &&
+          (projectedRoot.latestTurnState === null ||
+            projectedRoot.latestTurnState === "running" ||
+            projectedRoot.unsettledTurnCount > 0 ||
+            projectedRoot.activeTurnId !== null ||
+            projectedRoot.sessionStatus === "running" ||
+            projectedRoot.sessionStatus === "starting"))
+      ) {
+        return yield* directorError(
+          "not-ready",
+          "New predecessor director activity requires explicit handoff reconciliation.",
           predecessor.directorId,
         );
       }
