@@ -39,6 +39,8 @@ const query = vi.hoisted(() => {
     }>(),
     directorRefresh: vi.fn(),
     workerHistory: false,
+    nullChildIds: false,
+    multiplePreparedHistory: false,
     destinationRepository: "Flow-Fly/t3code",
   };
 });
@@ -504,7 +506,7 @@ vi.mock("~/state/query", () => ({
                   dispatchId: "dispatch-1",
                   admissionId: "admission-1",
                   ticketNumber: 11,
-                  providerThreadId: "provider-worker-1",
+                  providerThreadId: query.nullChildIds ? null : "provider-worker-1",
                   parentProviderThreadId: "provider-director",
                   ownership: "workflow panel",
                   writePaths: ["apps/web/src/components/workflow"],
@@ -527,6 +529,33 @@ vi.mock("~/state/query", () => ({
                   role: "worker",
                   updatedAt: "2026-09-06T11:00:00.000Z",
                 },
+                ...(query.multiplePreparedHistory
+                  ? [
+                      {
+                        dispatchId: "dispatch-2",
+                        admissionId: "admission-2",
+                        ticketNumber: 12,
+                        providerThreadId: null,
+                        parentProviderThreadId: "provider-director",
+                        ownership: "unrelated workflow work",
+                        writePaths: ["apps/web/src/components/workflow"],
+                        writeReservation: "held",
+                        settlementEvidence: null,
+                        association: "unconfirmed",
+                        providerStatus: "unknown",
+                        requestedProfile: {
+                          model: "gpt-5.6-sol",
+                          effort: "high",
+                          skillPath: "/skills/implement/SKILL.md",
+                        },
+                        observedProfile: { model: null, effort: null, match: "unknown" },
+                        handoff: null,
+                        title: "Unrelated prepared worker",
+                        role: "worker",
+                        updatedAt: "2026-09-06T11:00:01.000Z",
+                      },
+                    ]
+                  : []),
               ],
               reviews: [
                 {
@@ -538,7 +567,7 @@ vi.mock("~/state/query", () => ({
                   implementationHead: "final-head",
                   status: "reported",
                   association: "associated",
-                  providerThreadId: "review-coordinator-1",
+                  providerThreadId: query.nullChildIds ? null : "review-coordinator-1",
                   parentProviderThreadId: "director-thread",
                   providerStatus: "interrupted",
                   settlementEvidence: "native-closed",
@@ -608,6 +637,35 @@ vi.mock("~/state/query", () => ({
                   summary: "Both axes completed.",
                   updatedAt: "2026-09-06T11:00:00.000Z",
                 },
+                ...(query.multiplePreparedHistory
+                  ? [
+                      {
+                        reviewId: "review-2",
+                        admissionId: "admission-2",
+                        ticketNumber: 12,
+                        implementationProviderThreadId: "provider-worker-1",
+                        fixedBase: "base-head",
+                        implementationHead: "final-head",
+                        status: "prepared",
+                        association: "unconfirmed",
+                        providerThreadId: null,
+                        parentProviderThreadId: "director-thread",
+                        providerStatus: "unknown",
+                        settlementEvidence: null,
+                        requestedProfile: {
+                          model: "gpt-6-astra",
+                          effort: "medium",
+                          skillPath: "/skills/code-review/SKILL.md",
+                        },
+                        observedProfile: { model: null, effort: null, match: "unknown" },
+                        checks: [],
+                        axes: [],
+                        findings: [],
+                        summary: null,
+                        updatedAt: "2026-09-06T11:00:01.000Z",
+                      },
+                    ]
+                  : []),
               ],
               resolutions: [
                 {
@@ -688,6 +746,47 @@ vi.mock("~/state/query", () => ({
         },
       };
     }
+    if (
+      descriptor.kind === "locate" &&
+      (descriptor.request as { input?: { number?: number } }).input?.number === 11
+    ) {
+      return {
+        ...idle,
+        data: {
+          ancestryComplete: true,
+          ancestry: [
+            {
+              id: "issue-10",
+              repository: "Flow-Fly/t3code",
+              number: 10,
+              title: "Capability",
+              url: "https://github.com/Flow-Fly/t3code/issues/10",
+              kind: "capability",
+              state: "open",
+              stateReason: null,
+              updatedAt: "2026-09-05T00:00:00Z",
+              childCount: 1,
+              parentNumber: null,
+              labels: ["workflow:capability"],
+            },
+          ],
+          issue: {
+            id: "issue-11",
+            repository: "Flow-Fly/t3code",
+            number: 11,
+            title: "Browse work",
+            url: "https://github.com/Flow-Fly/t3code/issues/11",
+            kind: "ticket",
+            state: "open",
+            stateReason: null,
+            updatedAt: "2026-09-05T00:00:00Z",
+            childCount: 1,
+            parentNumber: 10,
+            labels: ["workflow:ticket"],
+          },
+        },
+      };
+    }
     if (descriptor.kind === "locate") {
       return {
         ...idle,
@@ -759,6 +858,8 @@ beforeEach(() => {
   query.directorActivities.length = 0;
   query.directorRefresh.mockClear();
   query.workerHistory = false;
+  query.nullChildIds = false;
+  query.multiplePreparedHistory = false;
   query.destinationRepository = "Flow-Fly/t3code";
 });
 
@@ -811,6 +912,201 @@ describe("WorkflowPanel browsing", () => {
     });
     await act(() => renderer?.unmount());
   });
+
+  it("opens a linked director in its capability root without replacing the saved destination view", async () => {
+    query.workerHistory = true;
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const sourceThread = ThreadId.make("source-thread");
+    const destinationThread = ThreadId.make("director-thread");
+    const destinationRef = { environmentId, threadId: destinationThread };
+    const savedScope = "remote-environment:project-draft:flow-fly/t3code:issue-20";
+    const store = useWorkflowMapStore.getState();
+    store.setThreadLocation(
+      { environmentId, threadId: sourceThread },
+      { projectId, repository: "Flow-Fly/t3code", rootNumber: 10 },
+    );
+    store.setThreadLocation(destinationRef, {
+      projectId,
+      repository: "Flow-Fly/t3code",
+      rootNumber: 20,
+    });
+    store.patchView(savedScope, { viewport: { x: 12, y: 24, zoom: 0.7 } });
+    const props = {
+      environmentId,
+      environmentLabel: "Remote environment",
+      projectId,
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<WorkflowPanel {...props} planningThreadId={sourceThread} />);
+      });
+      const rootButton = renderer!.root
+        .findByProps({ "aria-label": "Synchronized workflow outline" })
+        .findAllByType("button")
+        .find((button) => button.children.join("").includes("#10 Capability"));
+      await act(() => rootButton!.props.onClick());
+      const director = renderer!.root.findByProps({ "aria-label": "Capability director" });
+      const open = director
+        .findAllByType("button")
+        .find((button) => button.children.includes("Open director"));
+      await act(() => open!.props.onClick());
+
+      expect(query.navigateCalls.at(-1)).toMatchObject({
+        params: { environmentId, threadId: destinationThread },
+      });
+      await act(() => {
+        renderer!.update(<WorkflowPanel {...props} planningThreadId={destinationThread} />);
+      });
+      expect(
+        renderer!.root
+          .findByProps({ "aria-label": "Choose another workflow root" })
+          .children.join(""),
+      ).toContain("#10 Capability");
+      expect(useWorkflowMapStore.getState().views[savedScope]?.viewport).toEqual({
+        x: 12,
+        y: 24,
+        zoom: 0.7,
+      });
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  for (const scenario of [
+    { entryId: "director:director-1", providerThreadId: null, selectedText: null },
+    {
+      entryId: "dispatch:dispatch-1",
+      providerThreadId: null,
+      selectedText: "Implement workflow panel",
+    },
+    { entryId: "review:review-1", providerThreadId: null, selectedText: "review reported" },
+    {
+      entryId: "review-axis:review-1:standards",
+      providerThreadId: "axis-not-observed",
+      selectedText: "review reported",
+    },
+  ]) {
+    it(`selects only the exact prepared work for ${scenario.entryId}`, async () => {
+      query.workerHistory = true;
+      query.nullChildIds = true;
+      query.multiplePreparedHistory = true;
+      const environmentId = EnvironmentId.make("remote-environment");
+      const projectId = ProjectId.make("project-draft");
+      const threadId = ThreadId.make("director-thread");
+      useWorkflowMapStore.getState().setNavigationTarget(
+        { environmentId, threadId },
+        {
+          requestId: `open-${scenario.entryId}`,
+          projectId,
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          issueNumber: 11,
+          providerThreadId: scenario.providerThreadId,
+          activeWorkEntryId: scenario.entryId,
+        },
+      );
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <WorkflowPanel
+              environmentId={environmentId}
+              environmentLabel="Remote environment"
+              projectId={projectId}
+              projectTitle="Draft project"
+              planningThreadId={threadId}
+              supported
+            />,
+          );
+        });
+        const director = renderer!.root.findByProps({ "aria-label": "Capability director" });
+        const selected = director
+          .findAllByType("li")
+          .filter((row) => row.props["aria-current"] === "true");
+        expect(selected).toHaveLength(scenario.selectedText === null ? 0 : 1);
+        if (scenario.selectedText) {
+          expect(
+            selected[0]!
+              .findAllByType("p")
+              .map((paragraph) => paragraph.children.join(""))
+              .join(" "),
+          ).toContain(scenario.selectedText);
+        }
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    });
+  }
+
+  for (const scenario of [
+    {
+      entryId: "child:director-1:provider-worker-1",
+      providerThreadId: "provider-worker-1",
+      selectedText: "Implement workflow panel",
+    },
+    {
+      entryId: "child:director-1:review-coordinator-1",
+      providerThreadId: "review-coordinator-1",
+      selectedText: "Coordinator review-coordinator-1",
+    },
+    {
+      entryId: "child:director-1:standards-1",
+      providerThreadId: "standards-1",
+      selectedText: "standards standards-1",
+    },
+  ]) {
+    it(`selects the exact native work for ${scenario.providerThreadId}`, async () => {
+      query.workerHistory = true;
+      query.multiplePreparedHistory = true;
+      const environmentId = EnvironmentId.make("remote-environment");
+      const projectId = ProjectId.make("project-draft");
+      const threadId = ThreadId.make("director-thread");
+      useWorkflowMapStore.getState().setNavigationTarget(
+        { environmentId, threadId },
+        {
+          requestId: `open-${scenario.entryId}`,
+          projectId,
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          issueNumber: 11,
+          providerThreadId: scenario.providerThreadId,
+          activeWorkEntryId: scenario.entryId,
+        },
+      );
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <WorkflowPanel
+              environmentId={environmentId}
+              environmentLabel="Remote environment"
+              projectId={projectId}
+              projectTitle="Draft project"
+              planningThreadId={threadId}
+              supported
+            />,
+          );
+        });
+        const director = renderer!.root.findByProps({ "aria-label": "Capability director" });
+        const selected = director
+          .findAllByType("li")
+          .filter((row) => row.props["aria-current"] === "true");
+        expect(selected).toHaveLength(1);
+        expect(
+          selected[0]!
+            .findAllByType("p")
+            .map((paragraph) => paragraph.children.join(""))
+            .join(" "),
+        ).toContain(scenario.selectedText);
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    });
+  }
 
   it("shows a planning failure and restores the capability action", async () => {
     query.planningKind = "map";
@@ -912,6 +1208,16 @@ describe("WorkflowPanel browsing", () => {
           params: { environmentId, threadId: "workflow-thread-15" },
         },
       ]);
+      expect(
+        useWorkflowMapStore.getState().navigationTargetByThread[
+          `${environmentId}:workflow-thread-15`
+        ],
+      ).toMatchObject({
+        projectId,
+        repository: "Flow-Fly/t3code",
+        rootNumber: 10,
+        issueNumber: 11,
+      });
       expect(Object.values(useRightPanelStore.getState().byThreadKey)[0]).toMatchObject({
         isOpen: true,
         activeSurfaceId: "workflow",
@@ -977,6 +1283,16 @@ describe("WorkflowPanel browsing", () => {
       expect(query.navigateCalls.at(-1)).toEqual({
         to: "/$environmentId/$threadId",
         params: { environmentId, threadId: "workflow-thread-15" },
+      });
+      expect(
+        useWorkflowMapStore.getState().navigationTargetByThread[
+          `${environmentId}:workflow-thread-15`
+        ],
+      ).toMatchObject({
+        projectId,
+        repository: "Flow-Fly/t3code",
+        rootNumber: 10,
+        issueNumber: 11,
       });
     } finally {
       await act(() => renderer?.unmount());

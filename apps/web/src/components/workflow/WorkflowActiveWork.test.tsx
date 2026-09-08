@@ -253,6 +253,7 @@ it("routes a native child through its owning T3 thread and saves its Workflow co
     useWorkflowMapStore.getState().navigationTargetByThread[`${environmentId}:owning-t3-thread`],
   ).toMatchObject({
     issueNumber: 11,
+    activeWorkEntryId: "director:director-1",
     providerThreadId: "provider-child-not-a-t3-thread",
   });
 });

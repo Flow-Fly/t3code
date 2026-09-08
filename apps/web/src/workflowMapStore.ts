@@ -25,6 +25,7 @@ export interface WorkflowNavigationTarget extends WorkflowThreadLocation {
   requestId: string;
   issueNumber: number;
   providerThreadId: string | null;
+  activeWorkEntryId?: string;
 }
 
 const EMPTY_VIEW: WorkflowMapView = {
@@ -100,13 +101,18 @@ export const useWorkflowMapStore = create<WorkflowMapStoreState>()(
           return { locationByThread };
         }),
       setNavigationTarget: (ref, target) =>
-        set((state) => ({
-          locationByThread: { ...state.locationByThread, [scopedThreadKey(ref)]: target },
-          navigationTargetByThread: {
-            ...state.navigationTargetByThread,
-            [scopedThreadKey(ref)]: target,
-          },
-        })),
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          const location = {
+            projectId: target.projectId,
+            repository: target.repository,
+            rootNumber: target.rootNumber,
+          };
+          return {
+            locationByThread: { ...state.locationByThread, [key]: location },
+            navigationTargetByThread: { ...state.navigationTargetByThread, [key]: target },
+          };
+        }),
       clearNavigationTarget: (ref, requestId) =>
         set((state) => {
           const key = scopedThreadKey(ref);

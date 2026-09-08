@@ -209,6 +209,7 @@ export function WorkflowActiveWork(props: {
       repository: entry.repository,
       rootNumber: entry.rootNumber,
       issueNumber: entry.issueNumber,
+      activeWorkEntryId: entry.entryId,
       providerThreadId: entry.providerThreadId,
     });
     useRightPanelStore.getState().open(threadRef, "workflow");

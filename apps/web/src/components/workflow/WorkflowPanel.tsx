@@ -505,7 +505,10 @@ export function WorkflowPanel(props: WorkflowPanelProps) {
           onRefreshRoot={retryWorkflow}
           onNavigateMatch={navigateToMatch}
           {...(navigationTarget
-            ? { focusedProviderThreadId: navigationTarget.providerThreadId }
+            ? {
+                focusedActiveWorkEntryId: navigationTarget.activeWorkEntryId,
+                focusedProviderThreadId: navigationTarget.providerThreadId,
+              }
             : {})}
           onManualNavigation={() => {
             if (threadRef && navigationTarget)

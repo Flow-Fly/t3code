@@ -91,11 +91,11 @@ describe("Workflow map view persistence", () => {
     });
     store.clearNavigationTarget(remote, "old-request");
 
+    expect(useWorkflowMapStore.getState().locationByThread).toEqual({
+      "local:thread-1": { projectId: "project", repository: "one/repo", rootNumber: 10 },
+      "remote:thread-1": { projectId: "other-project", repository: "two/repo", rootNumber: 20 },
+    });
     expect(useWorkflowMapStore.getState()).toMatchObject({
-      locationByThread: {
-        "local:thread-1": { rootNumber: 10 },
-        "remote:thread-1": { rootNumber: 20 },
-      },
       navigationTargetByThread: {
         "remote:thread-1": { requestId: "new-request", issueNumber: 21 },
       },

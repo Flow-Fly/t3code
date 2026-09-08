@@ -35,7 +35,7 @@ import { useProject, useServerConfigs, useThreadDetail } from "~/state/entities"
 import { workflowEnvironment } from "~/state/workflow";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
-import { cn } from "~/lib/utils";
+import { cn, randomUUID } from "~/lib/utils";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { buildThreadRouteParams } from "~/threadRoutes";
 import {
@@ -120,6 +120,7 @@ function WorkflowDetails(props: {
   capabilityNumber?: number;
   issue: WorkflowIssueSummary;
   refreshRequest: number;
+  focusedActiveWorkEntryId?: string;
   focusedProviderThreadId?: string | null;
 }) {
   const navigate = useNavigate();
@@ -300,8 +301,23 @@ function WorkflowDetails(props: {
       recovery.assignees.length > 0 ||
       recovery.actions.length > 0);
   const director = directorQuery.data;
-  const openLinkedThread = (environmentId: EnvironmentId, threadId: ThreadId) => {
-    const threadRef = scopeThreadRef(environmentId, threadId);
+  const openLinkedThread = (target: {
+    environmentId: EnvironmentId;
+    projectId: ProjectId;
+    repository: WorkflowIssueSummary["repository"];
+    rootNumber: number;
+    issueNumber: number;
+    threadId: ThreadId;
+  }) => {
+    const threadRef = scopeThreadRef(target.environmentId, target.threadId);
+    useWorkflowMapStore.getState().setNavigationTarget(threadRef, {
+      requestId: randomUUID(),
+      projectId: target.projectId,
+      repository: target.repository,
+      rootNumber: target.rootNumber,
+      issueNumber: target.issueNumber,
+      providerThreadId: null,
+    });
     useRightPanelStore.getState().open(threadRef, "workflow");
     void navigate({
       to: "/$environmentId/$threadId",
@@ -336,7 +352,15 @@ function WorkflowDetails(props: {
         return;
       }
       if (result.value.director.status === "active") {
-        openLinkedThread(result.value.director.environmentId, result.value.director.threadId);
+        const started = result.value.director;
+        openLinkedThread({
+          environmentId: started.environmentId,
+          projectId: started.projectId,
+          repository: started.repository,
+          rootNumber: started.rootNumber,
+          issueNumber: started.capabilityNumber,
+          threadId: started.threadId,
+        });
       } else {
         setStartMessage(result.value.director.message);
       }
@@ -371,12 +395,19 @@ function WorkflowDetails(props: {
       setStartMessage(result.value.message);
       return;
     }
-    openLinkedThread(result.value.environmentId, result.value.threadId);
+    openLinkedThread(result.value);
   };
   const handleDirectorAction = async (action: "open" | "resume" | "retry" | "stop") => {
     if (!director || startPending) return;
     if (action === "open") {
-      openLinkedThread(director.environmentId, director.threadId);
+      openLinkedThread({
+        environmentId: director.environmentId,
+        projectId: director.projectId,
+        repository: director.repository,
+        rootNumber: director.rootNumber,
+        issueNumber: director.capabilityNumber,
+        threadId: director.threadId,
+      });
       return;
     }
     if (action === "retry") {
@@ -412,7 +443,14 @@ function WorkflowDetails(props: {
       return;
     }
     if (action === "resume") {
-      openLinkedThread(result.value.environmentId, result.value.threadId);
+      openLinkedThread({
+        environmentId: result.value.environmentId,
+        projectId: result.value.projectId,
+        repository: result.value.repository,
+        rootNumber: result.value.rootNumber,
+        issueNumber: result.value.capabilityNumber,
+        threadId: result.value.threadId,
+      });
     }
   };
   const handleHandoffReconciliation = async (handoffId: string) => {
@@ -488,7 +526,7 @@ function WorkflowDetails(props: {
       );
       return;
     }
-    openLinkedThread(result.value.environmentId, result.value.threadId);
+    openLinkedThread(result.value);
   };
   return (
     <article
@@ -674,7 +712,14 @@ function WorkflowDetails(props: {
                         size="xs"
                         variant="outline"
                         onClick={() =>
-                          openLinkedThread(director.environmentId, target.sourceThreadId)
+                          openLinkedThread({
+                            environmentId: director.environmentId,
+                            projectId: director.projectId,
+                            repository: director.repository,
+                            rootNumber: director.rootNumber,
+                            issueNumber: director.capabilityNumber,
+                            threadId: target.sourceThreadId,
+                          })
                         }
                       >
                         Open source thread
@@ -744,86 +789,91 @@ function WorkflowDetails(props: {
                 close. Idle, turn completion, handoff, and unknown child outcomes keep it held.
               </p>
               <ul className="mt-1 space-y-2">
-                {director.workers.map((worker) => (
-                  <li
-                    className={cn(
-                      "rounded-sm bg-muted/50 p-1.5 text-xs",
-                      worker.providerThreadId === props.focusedProviderThreadId &&
-                        "ring-2 ring-ring",
-                    )}
-                    key={worker.dispatchId ?? `unassociated:${worker.providerThreadId}`}
-                    aria-current={
-                      worker.providerThreadId === props.focusedProviderThreadId ? "true" : undefined
-                    }
-                  >
-                    {worker.providerThreadId === props.focusedProviderThreadId ? (
-                      <p className="mb-1 font-medium text-info">Selected from Active work</p>
-                    ) : null}
-                    <p>
-                      {worker.ticketNumber
-                        ? `Ticket #${worker.ticketNumber}`
-                        : "Unassociated child"}
-                      {worker.title ? ` · ${worker.title}` : ""} · {worker.association}
-                    </p>
-                    {worker.providerThreadId ? (
-                      <p className="mt-0.5 break-all text-muted-foreground">
-                        Provider child {worker.providerThreadId}
+                {director.workers.map((worker) => {
+                  const isSelected =
+                    (worker.dispatchId !== null &&
+                      props.focusedActiveWorkEntryId === `dispatch:${worker.dispatchId}`) ||
+                    (props.focusedProviderThreadId != null &&
+                      worker.providerThreadId === props.focusedProviderThreadId);
+                  return (
+                    <li
+                      className={cn(
+                        "rounded-sm bg-muted/50 p-1.5 text-xs",
+                        isSelected && "ring-2 ring-ring",
+                      )}
+                      key={worker.dispatchId ?? `unassociated:${worker.providerThreadId}`}
+                      aria-current={isSelected ? "true" : undefined}
+                    >
+                      {isSelected ? (
+                        <p className="mb-1 font-medium text-info">Selected from Active work</p>
+                      ) : null}
+                      <p>
+                        {worker.ticketNumber
+                          ? `Ticket #${worker.ticketNumber}`
+                          : "Unassociated child"}
+                        {worker.title ? ` · ${worker.title}` : ""} · {worker.association}
                       </p>
-                    ) : null}
-                    <p className="mt-0.5 text-muted-foreground">
-                      Provider {worker.providerStatus}
-                      {worker.writeReservation
-                        ? ` · write reservation ${worker.writeReservation}`
-                        : ""}
-                      {worker.settlementEvidence === "native-closed"
-                        ? " · native close observed"
-                        : ""}{" "}
-                      · requested {worker.requestedProfile?.model ?? "unknown"}/
-                      {worker.requestedProfile?.effort ?? "unknown"} · observed{" "}
-                      {worker.observedProfile.model ?? "unknown"}/
-                      {worker.observedProfile.effort ?? "unknown"} ({worker.observedProfile.match})
-                    </p>
-                    {worker.ownership ? (
-                      <p className="mt-0.5 text-muted-foreground">
-                        Owns {worker.ownership}
-                        {worker.writePaths.length > 0 ? `: ${worker.writePaths.join(", ")}` : ""}
-                      </p>
-                    ) : null}
-                    {worker.handoff ? (
-                      <div className="mt-0.5 text-muted-foreground">
-                        <p>
-                          Handoff {worker.handoff.outcome}: {worker.handoff.summary}
+                      {worker.providerThreadId ? (
+                        <p className="mt-0.5 break-all text-muted-foreground">
+                          Provider child {worker.providerThreadId}
                         </p>
-                        {worker.handoff.commits.length > 0 ? (
-                          <p>
-                            Commits{" "}
-                            {worker.handoff.commits.map((commit, index) => (
-                              <span key={commit}>
-                                {index > 0 ? ", " : null}
-                                <a
-                                  className="text-info hover:underline"
-                                  href={`https://github.com/${director.repository}/commit/${encodeURIComponent(commit)}`}
-                                  target="_blank"
-                                  rel="noreferrer noopener"
-                                >
-                                  {commit}
-                                </a>
-                              </span>
-                            ))}
-                          </p>
-                        ) : null}
-                        {worker.handoff.checks.length > 0 ? (
-                          <p>Checks {worker.handoff.checks.join(", ")}</p>
-                        ) : null}
-                      </div>
-                    ) : (
+                      ) : null}
                       <p className="mt-0.5 text-muted-foreground">
-                        No implementation handoff reported. Idle activity does not settle this
-                        worker.
+                        Provider {worker.providerStatus}
+                        {worker.writeReservation
+                          ? ` · write reservation ${worker.writeReservation}`
+                          : ""}
+                        {worker.settlementEvidence === "native-closed"
+                          ? " · native close observed"
+                          : ""}{" "}
+                        · requested {worker.requestedProfile?.model ?? "unknown"}/
+                        {worker.requestedProfile?.effort ?? "unknown"} · observed{" "}
+                        {worker.observedProfile.model ?? "unknown"}/
+                        {worker.observedProfile.effort ?? "unknown"} ({worker.observedProfile.match}
+                        )
                       </p>
-                    )}
-                  </li>
-                ))}
+                      {worker.ownership ? (
+                        <p className="mt-0.5 text-muted-foreground">
+                          Owns {worker.ownership}
+                          {worker.writePaths.length > 0 ? `: ${worker.writePaths.join(", ")}` : ""}
+                        </p>
+                      ) : null}
+                      {worker.handoff ? (
+                        <div className="mt-0.5 text-muted-foreground">
+                          <p>
+                            Handoff {worker.handoff.outcome}: {worker.handoff.summary}
+                          </p>
+                          {worker.handoff.commits.length > 0 ? (
+                            <p>
+                              Commits{" "}
+                              {worker.handoff.commits.map((commit, index) => (
+                                <span key={commit}>
+                                  {index > 0 ? ", " : null}
+                                  <a
+                                    className="text-info hover:underline"
+                                    href={`https://github.com/${director.repository}/commit/${encodeURIComponent(commit)}`}
+                                    target="_blank"
+                                    rel="noreferrer noopener"
+                                  >
+                                    {commit}
+                                  </a>
+                                </span>
+                              ))}
+                            </p>
+                          ) : null}
+                          {worker.handoff.checks.length > 0 ? (
+                            <p>Checks {worker.handoff.checks.join(", ")}</p>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <p className="mt-0.5 text-muted-foreground">
+                          No implementation handoff reported. Idle activity does not settle this
+                          worker.
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           ) : null}
@@ -831,78 +881,80 @@ function WorkflowDetails(props: {
             <div className="mt-2 border-border border-t pt-2">
               <h4 className="font-medium text-xs">Review history</h4>
               <ul className="mt-1 space-y-2">
-                {director.reviews?.map((review) => (
-                  <li
-                    className={cn(
-                      "rounded-sm bg-muted/50 p-1.5 text-xs",
+                {director.reviews?.map((review) => {
+                  const selectedEntryIds = [
+                    `review:${review.reviewId}`,
+                    `review-axis:${review.reviewId}:standards`,
+                    `review-axis:${review.reviewId}:spec`,
+                  ];
+                  const isSelected =
+                    (props.focusedActiveWorkEntryId !== undefined &&
+                      selectedEntryIds.includes(props.focusedActiveWorkEntryId)) ||
+                    (props.focusedProviderThreadId != null &&
                       (review.providerThreadId === props.focusedProviderThreadId ||
                         review.axes.some(
                           (axis) => axis.providerThreadId === props.focusedProviderThreadId,
-                        )) &&
-                        "ring-2 ring-ring",
-                    )}
-                    key={review.reviewId}
-                    aria-current={
-                      review.providerThreadId === props.focusedProviderThreadId ||
-                      review.axes.some(
-                        (axis) => axis.providerThreadId === props.focusedProviderThreadId,
-                      )
-                        ? "true"
-                        : undefined
-                    }
-                  >
-                    {review.providerThreadId === props.focusedProviderThreadId ||
-                    review.axes.some(
-                      (axis) => axis.providerThreadId === props.focusedProviderThreadId,
-                    ) ? (
-                      <p className="mb-1 font-medium text-info">Selected from Active work</p>
-                    ) : null}
-                    <p>
-                      Ticket #{review.ticketNumber} · review {review.status}
-                    </p>
-                    <p className="mt-0.5 break-all text-muted-foreground">
-                      {review.fixedBase}…{review.implementationHead}
-                    </p>
-                    <p className="mt-0.5 text-muted-foreground">
-                      Coordinator {review.providerThreadId ?? "not associated"} · requested{" "}
-                      {review.requestedProfile.model}/{review.requestedProfile.effort} · observed{" "}
-                      {review.observedProfile.model ?? "unknown"}/
-                      {review.observedProfile.effort ?? "unknown"} ({review.observedProfile.match})
-                      {review.settlementEvidence === "native-closed"
-                        ? " · native close observed"
-                        : ""}
-                    </p>
-                    <p className="mt-0.5 text-muted-foreground">
-                      Checks{" "}
-                      {review.checks.map((check) => `${check.label}: ${check.status}`).join(", ")}
-                    </p>
-                    {review.axes.length > 0 ? (
-                      <p className="mt-0.5 text-muted-foreground">
-                        {review.axes
-                          .map(
-                            (axis) =>
-                              `${axis.axis} ${axis.providerThreadId} (${axis.providerStatus}${axis.settlementEvidence === "native-closed" ? ", closed" : ""})`,
-                          )
-                          .join(" · ")}
+                        )));
+                  return (
+                    <li
+                      className={cn(
+                        "rounded-sm bg-muted/50 p-1.5 text-xs",
+                        isSelected && "ring-2 ring-ring",
+                      )}
+                      key={review.reviewId}
+                      aria-current={isSelected ? "true" : undefined}
+                    >
+                      {isSelected ? (
+                        <p className="mb-1 font-medium text-info">Selected from Active work</p>
+                      ) : null}
+                      <p>
+                        Ticket #{review.ticketNumber} · review {review.status}
                       </p>
-                    ) : null}
-                    {review.summary ? (
-                      <p className="mt-0.5 text-muted-foreground">{review.summary}</p>
-                    ) : null}
-                    {review.findings.length > 0 ? (
-                      <ul className="mt-1 space-y-1 border-border border-t pt-1">
-                        {review.findings.map((finding) => (
-                          <li key={finding.id}>
-                            {finding.severity} {finding.axis} · {finding.summary} ·{" "}
-                            {finding.disposition
-                              ? `${finding.disposition.outcome}: ${finding.disposition.rationale}`
-                              : "awaiting director disposition"}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </li>
-                ))}
+                      <p className="mt-0.5 break-all text-muted-foreground">
+                        {review.fixedBase}…{review.implementationHead}
+                      </p>
+                      <p className="mt-0.5 text-muted-foreground">
+                        Coordinator {review.providerThreadId ?? "not associated"} · requested{" "}
+                        {review.requestedProfile.model}/{review.requestedProfile.effort} · observed{" "}
+                        {review.observedProfile.model ?? "unknown"}/
+                        {review.observedProfile.effort ?? "unknown"} ({review.observedProfile.match}
+                        )
+                        {review.settlementEvidence === "native-closed"
+                          ? " · native close observed"
+                          : ""}
+                      </p>
+                      <p className="mt-0.5 text-muted-foreground">
+                        Checks{" "}
+                        {review.checks.map((check) => `${check.label}: ${check.status}`).join(", ")}
+                      </p>
+                      {review.axes.length > 0 ? (
+                        <p className="mt-0.5 text-muted-foreground">
+                          {review.axes
+                            .map(
+                              (axis) =>
+                                `${axis.axis} ${axis.providerThreadId} (${axis.providerStatus}${axis.settlementEvidence === "native-closed" ? ", closed" : ""})`,
+                            )
+                            .join(" · ")}
+                        </p>
+                      ) : null}
+                      {review.summary ? (
+                        <p className="mt-0.5 text-muted-foreground">{review.summary}</p>
+                      ) : null}
+                      {review.findings.length > 0 ? (
+                        <ul className="mt-1 space-y-1 border-border border-t pt-1">
+                          {review.findings.map((finding) => (
+                            <li key={finding.id}>
+                              {finding.severity} {finding.axis} · {finding.summary} ·{" "}
+                              {finding.disposition
+                                ? `${finding.disposition.outcome}: ${finding.disposition.rationale}`
+                                : "awaiting director disposition"}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           ) : null}
@@ -1278,6 +1330,7 @@ export function WorkflowFocusedMap(props: {
   onRefreshRoot: () => void;
   onNavigateMatch: (match: WorkflowSearchMatch) => void;
   onManualNavigation: () => void;
+  focusedActiveWorkEntryId?: string;
   focusedProviderThreadId?: string | null;
 }) {
   const context = workflowMapContextKey({
@@ -1966,6 +2019,9 @@ export function WorkflowFocusedMap(props: {
             {...(selectedCapabilityNumber ? { capabilityNumber: selectedCapabilityNumber } : {})}
             issue={selected}
             refreshRequest={refreshRequest}
+            {...(props.focusedActiveWorkEntryId !== undefined
+              ? { focusedActiveWorkEntryId: props.focusedActiveWorkEntryId }
+              : {})}
             {...(props.focusedProviderThreadId !== undefined
               ? { focusedProviderThreadId: props.focusedProviderThreadId }
               : {})}
