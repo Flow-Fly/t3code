@@ -7,7 +7,6 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
-
 import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
@@ -39,6 +38,12 @@ describe("RPC authorization scopes", () => {
 
   it("requires permission to operate on a thread before uploading feedback", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.providerUploadFeedback)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
+  it("requires operate access for owner handoff acknowledgement", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.workflowDirectorHandoffReconcile)).toBe(
       AuthOrchestrationOperateScope,
     );
   });

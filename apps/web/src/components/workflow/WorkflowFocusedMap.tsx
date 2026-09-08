@@ -147,8 +147,12 @@ function WorkflowDetails(props: {
   const retryDirectorStop = useAtomCommand(workflowEnvironment.directorReassessmentRetry, {
     reportFailure: false,
   });
+  const reconcileDirectorHandoff = useAtomCommand(workflowEnvironment.directorHandoffReconcile, {
+    reportFailure: false,
+  });
   const [startPending, setStartPending] = useState(false);
   const [startMessage, setStartMessage] = useState<string | null>(null);
+  const [handoffSummary, setHandoffSummary] = useState("");
   const query = useEnvironmentQuery(
     workflowEnvironment.issueDetail({
       environmentId: props.environmentId,
@@ -410,6 +414,40 @@ function WorkflowDetails(props: {
       openLinkedThread(result.value.environmentId, result.value.threadId);
     }
   };
+  const handleHandoffReconciliation = async (handoffId: string) => {
+    const target = director?.handoffRecoveryTargets?.find(
+      (candidate) => candidate.handoffId === handoffId,
+    );
+    const summary = handoffSummary.trim();
+    if (!director || !target || startPending || summary.length === 0) return;
+    setStartPending(true);
+    setStartMessage(null);
+    const result = await reconcileDirectorHandoff({
+      environmentId: props.environmentId,
+      input: {
+        projectId: director.projectId,
+        repository: director.repository,
+        capabilityNumber: director.capabilityNumber,
+        expectedDirectorId: director.directorId,
+        expectedObservation: director.observation,
+        handoffId: target.handoffId,
+        expectedTargetObservation: target.targetObservation,
+        summary,
+      },
+    });
+    setStartPending(false);
+    directorQuery.refresh();
+    if (result._tag === "Failure") {
+      const failure = squashAtomCommandFailure(result);
+      setStartMessage(
+        failure instanceof Error
+          ? failure.message
+          : "The predecessor acknowledgement could not be saved.",
+      );
+      return;
+    }
+    setHandoffSummary("");
+  };
   const handleRecovery = async (action: "open" | "resume" | "start-fresh" | "takeover") => {
     const state = recoveryQuery.data;
     if (startPending || !state) return;
@@ -552,7 +590,10 @@ function WorkflowDetails(props: {
               {director.handoff.latestReconciliation ? (
                 <div className="mt-1 text-muted-foreground text-xs">
                   <p>
-                    Latest acknowledgement{" "}
+                    {director.handoff.latestReconciliation.acknowledgementActor?.kind ===
+                    "owner-session"
+                      ? "Latest owner acknowledgement "
+                      : "Latest director acknowledgement "}
                     <time dateTime={director.handoff.latestReconciliation.createdAt}>
                       {new Date(director.handoff.latestReconciliation.createdAt).toLocaleString()}
                     </time>
@@ -571,6 +612,87 @@ function WorkflowDetails(props: {
                 </ul>
               ) : null}
             </div>
+          ) : null}
+          {(director.handoffRecoveryTargets?.length ?? 0) > 0 ? (
+            <section
+              aria-label="Predecessor handoff recovery"
+              className="mt-2 border-border border-t pt-2"
+            >
+              <h4 className="font-medium text-xs">Predecessor recovery</h4>
+              <p className="mt-1 text-muted-foreground text-xs">
+                Review the terminal history, explain why it is settled, then acknowledge the
+                matching batch. A successful acknowledgement may let the monitor resume the saved
+                successor command.
+              </p>
+              <label
+                className="mt-2 block font-medium text-xs"
+                htmlFor={`handoff-summary-${director.directorId}`}
+              >
+                Acknowledgement summary
+              </label>
+              <textarea
+                id={`handoff-summary-${director.directorId}`}
+                className="mt-1 min-h-16 w-full rounded-md border border-input bg-transparent px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                value={handoffSummary}
+                onChange={(event) => setHandoffSummary(event.target.value)}
+                disabled={startPending}
+                placeholder="Describe the terminal evidence you reviewed"
+              />
+              <ul className="mt-2 space-y-2">
+                {director.handoffRecoveryTargets?.map((target) => (
+                  <li className="rounded-sm bg-muted/50 p-1.5 text-xs" key={target.handoffId}>
+                    <p className="font-medium">Batch {target.sourceBatchNumber}</p>
+                    <p className="mt-0.5 text-muted-foreground">
+                      {target.status}
+                      {target.detail ? ` · ${target.detail}` : ""}
+                    </p>
+                    <p className="mt-0.5 text-muted-foreground">
+                      Root {target.rootSettlement?.status ?? "unobserved"}
+                      {target.rootSettlement ? (
+                        <>
+                          {" · "}
+                          <time dateTime={target.rootSettlement.observedAt}>
+                            {new Date(target.rootSettlement.observedAt).toLocaleString()}
+                          </time>
+                        </>
+                      ) : null}
+                      {" · "}
+                      Children {target.childSettlements.settledCount}/
+                      {target.childSettlements.observedCount} settled
+                    </p>
+                    {target.latestReconciliation ? (
+                      <p className="mt-0.5 text-muted-foreground">
+                        Last acknowledged{" "}
+                        <time dateTime={target.latestReconciliation.createdAt}>
+                          {new Date(target.latestReconciliation.createdAt).toLocaleString()}
+                        </time>
+                      </p>
+                    ) : null}
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        onClick={() =>
+                          openLinkedThread(director.environmentId, target.sourceThreadId)
+                        }
+                      >
+                        Open source thread
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={startPending || handoffSummary.trim().length === 0}
+                        onClick={() => void handleHandoffReconciliation(target.handoffId)}
+                      >
+                        {startPending
+                          ? "Acknowledging…"
+                          : `Acknowledge batch ${target.sourceBatchNumber}`}
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </section>
           ) : null}
           {director.reassessment ? (
             <div className="mt-2 border-border border-t pt-2">

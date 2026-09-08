@@ -72,6 +72,7 @@ import Migration0057 from "./Migrations/057_WorkflowCapabilityCompletions.ts";
 import Migration0058 from "./Migrations/058_WorkflowCapabilityCloseOwnership.ts";
 import Migration0059 from "./Migrations/059_WorkflowDirectorHandoffs.ts";
 import Migration0060 from "./Migrations/060_WorkflowDirectorHandoffReconciliations.ts";
+import Migration0061 from "./Migrations/061_WorkflowDirectorHandoffReconciliationActors.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -144,6 +145,7 @@ export const migrationEntries = [
   [58, "WorkflowCapabilityCloseOwnership", Migration0058],
   [59, "WorkflowDirectorHandoffs", Migration0059],
   [60, "WorkflowDirectorHandoffReconciliations", Migration0060],
+  [61, "WorkflowDirectorHandoffReconciliationActors", Migration0061],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

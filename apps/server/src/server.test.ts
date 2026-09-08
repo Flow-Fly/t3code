@@ -39,6 +39,7 @@ import {
   type ServerLifecycleStreamEvent,
   ThreadId,
   TurnId,
+  type WorkflowDirectorStatus,
   WS_METHODS,
   WsRpcGroup,
   EditorId,
@@ -96,7 +97,11 @@ const encodeTestJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unk
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as ServerConfig from "./config.ts";
-import { HTTP_ROUTER_CONFIG, makeRoutesLayer } from "./server.ts";
+import {
+  HTTP_ROUTER_CONFIG,
+  makeRoutesLayer,
+  routesLayerWithoutWorkflowDirector,
+} from "./server.ts";
 import {
   isThreadDetailEvent,
   resolveAvailableEditorsForConfig,
@@ -157,6 +162,7 @@ import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
+import * as WorkflowDirectorService from "./workflow/WorkflowDirectorService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
@@ -542,6 +548,7 @@ const buildAppUnderTest = (options?: {
     desktopTelemetryReceiver?: Partial<
       DesktopTelemetryReceiver.DesktopTelemetryReceiver["Service"]
     >;
+    workflowDirector?: Partial<WorkflowDirectorService.WorkflowDirectorService["Service"]>;
   };
 }) =>
   Effect.gen(function* () {
@@ -732,8 +739,17 @@ const buildAppUnderTest = (options?: {
       Layer.provide(Layer.succeed(HostProcessEnvironment, {})),
     );
 
+    const routesLayer = options?.layers?.workflowDirector
+      ? routesLayerWithoutWorkflowDirector.pipe(
+          Layer.provide(
+            Layer.mock(WorkflowDirectorService.WorkflowDirectorService)(
+              options.layers.workflowDirector,
+            ),
+          ),
+        )
+      : makeRoutesLayer;
     const servedRoutesLayer = HttpRouter.serve(
-      makeRoutesLayer.pipe(Layer.provide(serviceLauncherClientLayer)),
+      routesLayer.pipe(Layer.provide(serviceLauncherClientLayer)),
       {
         disableListenLog: true,
         disableLogger: true,
@@ -4144,6 +4160,124 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       if (rpcError._tag === "EnvironmentAuthorizationError") {
         assert.equal(rpcError.requiredScope, "orchestration:read");
       }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("authorizes no-shell handoff recovery through environment websocket rpc", () =>
+    Effect.gen(function* () {
+      const pendingThreadId = ThreadId.make("workflow-owner-recovery-pending");
+      const sourceThreadId = ThreadId.make("workflow-owner-recovery-source");
+      const timestamp = "2026-09-08T12:00:00.000Z";
+      const status = {
+        directorId: "workflow-owner-recovery-director",
+        batchId: "workflow-owner-recovery-batch",
+        environmentId: testEnvironmentDescriptor.environmentId,
+        projectId: defaultProjectId,
+        repository: "Flow-Fly/t3code",
+        rootNumber: 1,
+        capabilityNumber: 24,
+        threadId: pendingThreadId,
+        worktreePath: "/tmp/workflow-owner-recovery",
+        worktreeBranch: "capability/workflow-owner-recovery",
+        status: "submitting",
+        requestedProfile: { instanceId: "codex", model: "gpt-6-astra", effort: "high" },
+        observedProfile: { model: null, effort: null, match: "unknown" },
+        admissionCount: 0,
+        admissionLimit: 10,
+        workers: [],
+        handoffRecoveryTargets: [
+          {
+            handoffId: "workflow-owner-recovery-handoff",
+            sourceDirectorId: "workflow-owner-recovery-source-director",
+            sourceBatchId: "workflow-owner-recovery-source-batch",
+            sourceBatchNumber: 1,
+            sourceThreadId,
+            status: "held",
+            detail: "New terminal source evidence needs acknowledgement.",
+            rootSettlement: { status: "completed", observedAt: timestamp },
+            childSettlements: { observedCount: 0, settledCount: 0 },
+            targetObservation: "workflow-owner-recovery-target-observation",
+            latestReconciliation: null,
+          },
+        ],
+        observation: "workflow-owner-recovery-current-observation",
+        actions: [],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        message: "The saved successor command is held for predecessor acknowledgement.",
+      } satisfies WorkflowDirectorStatus;
+      let mutationCount = 0;
+      let authenticatedActor: string | null = null;
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.die("Owner recovery must not require a successor thread shell."),
+          },
+          workflowDirector: {
+            status: () => Effect.succeed(status),
+            reconcileHandoffAsOwner: (_input, actorSubject) =>
+              Effect.sync(() => {
+                mutationCount += 1;
+                authenticatedActor = actorSubject;
+                return status;
+              }),
+          },
+        },
+      });
+      const input = {
+        projectId: status.projectId,
+        repository: status.repository,
+        capabilityNumber: status.capabilityNumber,
+        expectedDirectorId: status.directorId,
+        expectedObservation: status.observation,
+        handoffId: status.handoffRecoveryTargets[0]!.handoffId,
+        expectedTargetObservation: status.handoffRecoveryTargets[0]!.targetObservation,
+        summary: "Reviewed the terminal root and child settlement evidence.",
+      };
+
+      const ownerUrl = yield* getWsServerUrl("/ws");
+      const ownerResult = yield* Effect.scoped(
+        withWsRpcClient(ownerUrl, (client) =>
+          Effect.gen(function* () {
+            const observed = yield* client[WS_METHODS.workflowDirectorStatus]({
+              projectId: status.projectId,
+              repository: status.repository,
+              capabilityNumber: status.capabilityNumber,
+            });
+            assert.equal(observed.threadId, pendingThreadId);
+            assert.equal(observed.handoffRecoveryTargets?.[0]?.sourceThreadId, sourceThreadId);
+            return yield* client[WS_METHODS.workflowDirectorHandoffReconcile](input);
+          }),
+        ),
+      );
+      assert.equal(ownerResult.directorId, status.directorId);
+      assert.equal(authenticatedActor, "desktop-bootstrap");
+      assert.equal(mutationCount, 1);
+
+      const reader = yield* exchangeAccessToken(defaultDesktopBootstrapToken, {
+        scope: "orchestration:read",
+      });
+      assert.equal(reader.response.status, 200);
+      const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+        headers: { authorization: `Bearer ${reader.body.access_token ?? ""}` },
+      });
+      const { ticket } = yield* responseJsonEffect<{ readonly ticket: string }>(ticketResponse);
+      const readerUrl = `${yield* getWsServerUrl("/ws", {
+        authenticated: false,
+      })}?wsTicket=${encodeURIComponent(ticket)}`;
+      const denied = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(readerUrl, (client) =>
+            client[WS_METHODS.workflowDirectorHandoffReconcile](input),
+          ),
+        ),
+      );
+      assert.equal(denied._tag, "EnvironmentAuthorizationError");
+      if (denied._tag === "EnvironmentAuthorizationError") {
+        assert.equal(denied.requiredScope, "orchestration:operate");
+      }
+      assert.equal(mutationCount, 1);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

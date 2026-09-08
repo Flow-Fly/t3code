@@ -661,10 +661,31 @@ export const WorkflowDirectorHandoffReconcileInput = Schema.Struct({
 export type WorkflowDirectorHandoffReconcileInput =
   typeof WorkflowDirectorHandoffReconcileInput.Type;
 
+export const WorkflowDirectorHandoffOwnerReconcileInput = Schema.Struct({
+  projectId: ProjectId,
+  repository: WorkflowRepositoryNameWithOwner,
+  capabilityNumber: PositiveInt,
+  expectedDirectorId: TrimmedNonEmptyString,
+  expectedObservation: TrimmedNonEmptyString,
+  handoffId: TrimmedNonEmptyString,
+  expectedTargetObservation: TrimmedNonEmptyString,
+  summary: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorHandoffOwnerReconcileInput =
+  typeof WorkflowDirectorHandoffOwnerReconcileInput.Type;
+
+export const WorkflowDirectorHandoffReconciliationActor = Schema.Struct({
+  kind: Schema.Literals(["director", "owner-session"]),
+  subject: TrimmedNonEmptyString,
+});
+export type WorkflowDirectorHandoffReconciliationActor =
+  typeof WorkflowDirectorHandoffReconciliationActor.Type;
+
 export const WorkflowDirectorHandoffReconciliation = Schema.Struct({
   reconciliationId: TrimmedNonEmptyString,
   sequence: PositiveInt,
   acknowledgedByDirectorId: TrimmedNonEmptyString,
+  acknowledgementActor: Schema.optionalKey(WorkflowDirectorHandoffReconciliationActor),
   implementationHead: TrimmedNonEmptyString,
   settlementCount: Schema.Number,
   summary: TrimmedNonEmptyString,
@@ -692,6 +713,30 @@ export const WorkflowDirectorHandoffStatus = Schema.Struct({
 });
 export type WorkflowDirectorHandoffStatus = typeof WorkflowDirectorHandoffStatus.Type;
 
+export const WorkflowDirectorHandoffRecoveryTarget = Schema.Struct({
+  handoffId: TrimmedNonEmptyString,
+  sourceDirectorId: TrimmedNonEmptyString,
+  sourceBatchId: TrimmedNonEmptyString,
+  sourceBatchNumber: PositiveInt,
+  sourceThreadId: ThreadId,
+  status: Schema.Literals(["waiting-settlement", "submitting", "submitted", "held"]),
+  detail: Schema.NullOr(TrimmedNonEmptyString),
+  rootSettlement: Schema.NullOr(
+    Schema.Struct({
+      status: Schema.Literals(["running", "completed", "failed", "interrupted"]),
+      observedAt: IsoDateTime,
+    }),
+  ),
+  childSettlements: Schema.Struct({
+    observedCount: Schema.Number,
+    settledCount: Schema.Number,
+  }),
+  targetObservation: TrimmedNonEmptyString,
+  latestReconciliation: Schema.NullOr(WorkflowDirectorHandoffReconciliation),
+});
+export type WorkflowDirectorHandoffRecoveryTarget =
+  typeof WorkflowDirectorHandoffRecoveryTarget.Type;
+
 export const WorkflowDirectorStatus = Schema.Struct({
   directorId: TrimmedNonEmptyString,
   batchId: TrimmedNonEmptyString,
@@ -714,6 +759,7 @@ export const WorkflowDirectorStatus = Schema.Struct({
   reassessment: Schema.optionalKey(Schema.NullOr(WorkflowReassessmentStatus)),
   completion: Schema.optionalKey(Schema.NullOr(WorkflowCapabilityCompletionStatus)),
   handoff: Schema.optionalKey(Schema.NullOr(WorkflowDirectorHandoffStatus)),
+  handoffRecoveryTargets: Schema.optionalKey(Schema.Array(WorkflowDirectorHandoffRecoveryTarget)),
   observation: TrimmedNonEmptyString,
   actions: Schema.Array(Schema.Literals(["open", "resume", "retry", "stop"])),
   createdAt: IsoDateTime,

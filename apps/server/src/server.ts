@@ -559,7 +559,7 @@ const commandReadinessLayer = HttpRouter.middleware(
   { global: true },
 );
 
-export const makeRoutesLayer = Layer.mergeAll(
+export const routesLayerWithoutWorkflowDirector = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(authHttpApiLayer),
@@ -583,7 +583,6 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(WorkflowServiceLive),
   Layer.provide(WorkflowAdoptionServiceLive),
   Layer.provide(WorkflowStartServiceLive),
-  Layer.provide(WorkflowDirectorServiceLive),
   Layer.provide(WorkflowMonitorLive),
   Layer.provide(WorkflowRefreshNotifierLive),
   Layer.provide(PreviewAutomationBroker.layer),
@@ -591,6 +590,10 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),
   Layer.provide(httpCompressionLayer),
+);
+
+export const makeRoutesLayer = routesLayerWithoutWorkflowDirector.pipe(
+  Layer.provide(WorkflowDirectorServiceLive),
 );
 
 export const makeServerLayer = Layer.unwrap(

@@ -18,7 +18,10 @@ import {
   type WorkflowDirectorAdmissionInput,
   type WorkflowDirectorAdmissionResult,
   type WorkflowDirectorHandoffPrepareInput,
+  type WorkflowDirectorHandoffOwnerReconcileInput,
+  type WorkflowDirectorHandoffRecoveryTarget,
   type WorkflowDirectorHandoffReconcileInput,
+  type WorkflowDirectorHandoffReconciliationActor,
   type WorkflowDirectorHandoffReconciliation,
   type WorkflowDirectorHandoffStatus,
   type WorkflowDirectorResumeInput,
@@ -224,6 +227,7 @@ const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeStringArrayJson = Schema.decodeUnknownEffect(StringArrayJson);
 const encodeStringArrayJson = Schema.encodeUnknownSync(StringArrayJson);
 const decodeStringArrayJsonSync = Schema.decodeUnknownSync(StringArrayJson);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const ResumeAdmissionScope = Schema.Struct({
   admissionId: Schema.String,
@@ -420,6 +424,8 @@ const HandoffReconciliationRow = Schema.Struct({
   reconciliationId: Schema.String,
   handoffId: Schema.String,
   acknowledgedByDirectorId: Schema.String,
+  actorKind: Schema.Literals(["director", "owner-session"]),
+  actorSubject: Schema.NullOr(Schema.String),
   settlementsJson: Schema.String,
   implementationHead: Schema.String,
   summary: Schema.String,
@@ -427,6 +433,45 @@ const HandoffReconciliationRow = Schema.Struct({
 });
 type HandoffReconciliationRow = typeof HandoffReconciliationRow.Type;
 const decodeHandoffReconciliationRow = Schema.decodeUnknownEffect(HandoffReconciliationRow);
+
+const HandoffRecoveryTargetRow = Schema.Struct({
+  handoffId: Schema.String,
+  sourceDirectorId: Schema.String,
+  sourceBatchId: Schema.String,
+  sourceThreadId: Schema.String,
+  sourceBatchNumber: Schema.Number,
+  status: Schema.String,
+  detail: Schema.NullOr(Schema.String),
+  settlementsJson: Schema.String,
+  latestReconciliationSequence: Schema.NullOr(Schema.Number),
+  latestSettlementsJson: Schema.NullOr(Schema.String),
+});
+type HandoffRecoveryTargetRow = typeof HandoffRecoveryTargetRow.Type;
+const decodeHandoffRecoveryTargetRow = Schema.decodeUnknownEffect(HandoffRecoveryTargetRow);
+
+const HandoffNativeEvidenceRow = Schema.Struct({
+  directorId: Schema.String,
+  kind: Schema.Literals(["director", "child"]),
+  providerThreadId: Schema.NullOr(Schema.String),
+  nativeSessionId: Schema.NullOr(Schema.String),
+  nativeTurnId: Schema.NullOr(Schema.String),
+  nativeStatus: Schema.NullOr(Schema.String),
+  nativeLifecycle: Schema.NullOr(Schema.String),
+  associated: Schema.Number,
+  updatedAt: Schema.String,
+});
+type HandoffNativeEvidenceRow = typeof HandoffNativeEvidenceRow.Type;
+const decodeHandoffNativeEvidenceRow = Schema.decodeUnknownEffect(HandoffNativeEvidenceRow);
+
+function handoffRecoveryTargetObservation(input: {
+  readonly currentDirectorId: string;
+  readonly handoffId: string;
+  readonly handoffStatus: string;
+  readonly latestReconciliationSequence: number | null;
+  readonly evidence: ReadonlyArray<HandoffNativeEvidenceRow>;
+}) {
+  return workflowEvidenceBodyFingerprint(encodeUnknownJson(input));
+}
 
 const HandoffAdmission = Schema.Struct({
   admissionId: Schema.String,
@@ -836,6 +881,10 @@ export class WorkflowDirectorService extends Context.Service<
       providerInstanceId: ProviderInstanceId,
       input: WorkflowDirectorHandoffReconcileInput,
     ) => Effect.Effect<WorkflowDirectorHandoffStatus, WorkflowQueryError | WorkflowDirectorError>;
+    readonly reconcileHandoffAsOwner: (
+      input: WorkflowDirectorHandoffOwnerReconcileInput,
+      actorSubject: string,
+    ) => Effect.Effect<WorkflowDirectorStatus, WorkflowQueryError | WorkflowDirectorError>;
     readonly rotateReady: (
       input: WorkflowDirectorStatusInput,
       dispatch: Dispatch,
@@ -1843,6 +1892,7 @@ export const make = Effect.gen(function* () {
       sql<Record<string, unknown>>`
         SELECT sequence, reconciliation_id AS "reconciliationId", handoff_id AS "handoffId",
           acknowledged_by_director_id AS "acknowledgedByDirectorId",
+          actor_kind AS "actorKind", actor_subject AS "actorSubject",
           settlements_json AS "settlementsJson", implementation_head AS "implementationHead",
           summary, created_at AS "createdAt"
         FROM workflow_director_handoff_reconciliations
@@ -1878,6 +1928,10 @@ export const make = Effect.gen(function* () {
       reconciliationId: row.reconciliationId,
       sequence: row.sequence,
       acknowledgedByDirectorId: row.acknowledgedByDirectorId,
+      acknowledgementActor: {
+        kind: row.actorKind,
+        subject: row.actorSubject ?? row.acknowledgedByDirectorId,
+      },
       implementationHead: row.implementationHead,
       settlementCount: settlements.length,
       summary: row.summary,
@@ -1947,6 +2001,190 @@ export const make = Effect.gen(function* () {
       updatedAt: row.updatedAt,
     } satisfies WorkflowDirectorHandoffStatus;
   });
+
+  const recoveryTargetsForDirector = Effect.fn("WorkflowDirectorService.handoffRecoveryTargets")(
+    function* (current: DirectorRow) {
+      const targetRows = yield* persistence(
+        sql<Record<string, unknown>>`
+        WITH RECURSIVE predecessor_handoffs(handoff_id, source_director_id) AS (
+          SELECT handoff_id, source_director_id FROM workflow_director_handoffs
+          WHERE successor_director_id = ${current.directorId}
+          UNION ALL
+          SELECT h.handoff_id, h.source_director_id FROM workflow_director_handoffs h
+          JOIN predecessor_handoffs p ON h.successor_director_id = p.source_director_id
+        )
+        SELECT h.handoff_id AS "handoffId", h.source_director_id AS "sourceDirectorId",
+          h.source_batch_id AS "sourceBatchId", h.source_thread_id AS "sourceThreadId",
+          (SELECT count(*) FROM workflow_directors d2
+            WHERE d2.environment_id = d.environment_id
+              AND d2.repository COLLATE NOCASE = d.repository
+              AND d2.capability_number = d.capability_number
+              AND (d2.created_at < d.created_at OR
+                (d2.created_at = d.created_at AND d2.director_id <= d.director_id)))
+            AS "sourceBatchNumber",
+          h.status, h.detail, h.settlements_json AS "settlementsJson",
+          r.sequence AS "latestReconciliationSequence",
+          r.settlements_json AS "latestSettlementsJson"
+        FROM predecessor_handoffs p
+        JOIN workflow_director_handoffs h ON h.handoff_id = p.handoff_id
+        JOIN workflow_directors d ON d.director_id = h.source_director_id
+        LEFT JOIN workflow_director_handoff_reconciliations r ON r.sequence = (
+          SELECT max(candidate.sequence) FROM workflow_director_handoff_reconciliations candidate
+          WHERE candidate.handoff_id = h.handoff_id
+        )
+        ORDER BY d.created_at DESC, d.director_id DESC
+      `,
+        "Predecessor handoff recovery targets could not be read.",
+      );
+      const targets = yield* Effect.forEach(targetRows, (row) =>
+        decodeHandoffRecoveryTargetRow(row),
+      ).pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "persistence-failed",
+            "Predecessor handoff recovery targets are invalid.",
+            String(error),
+          ),
+        ),
+      );
+      if (targets.length === 0) return [];
+      const evidenceRows = yield* persistence(
+        sql<Record<string, unknown>>`
+        WITH RECURSIVE predecessor_directors(director_id) AS (
+          SELECT source_director_id FROM workflow_director_handoffs
+          WHERE successor_director_id = ${current.directorId}
+          UNION ALL
+          SELECT h.source_director_id FROM workflow_director_handoffs h
+          JOIN predecessor_directors p ON h.successor_director_id = p.director_id
+        )
+        SELECT t.director_id AS "directorId", 'director' AS kind,
+          NULL AS "providerThreadId", t.native_session_id AS "nativeSessionId",
+          t.native_turn_id AS "nativeTurnId", t.status AS "nativeStatus",
+          NULL AS "nativeLifecycle", 1 AS associated, t.updated_at AS "updatedAt"
+        FROM workflow_director_native_turns t
+        JOIN predecessor_directors p ON p.director_id = t.director_id
+        UNION ALL
+        SELECT o.director_id AS "directorId", 'child' AS kind,
+          o.provider_thread_id AS "providerThreadId", o.native_session_id AS "nativeSessionId",
+          o.native_turn_id AS "nativeTurnId", o.native_turn_status AS "nativeStatus",
+          o.native_lifecycle AS "nativeLifecycle",
+          CASE WHEN EXISTS (
+            SELECT 1 FROM workflow_worker_dispatches d
+            WHERE d.director_id = o.director_id AND d.provider_thread_id = o.provider_thread_id
+          ) OR EXISTS (
+            SELECT 1 FROM workflow_ticket_reviews r
+            WHERE r.director_id = o.director_id AND r.provider_thread_id = o.provider_thread_id
+          ) OR EXISTS (
+            SELECT 1 FROM workflow_review_axes a JOIN workflow_ticket_reviews r ON r.review_id = a.review_id
+            WHERE r.director_id = o.director_id AND a.provider_thread_id = o.provider_thread_id
+          ) THEN 1 ELSE 0 END AS associated,
+          o.updated_at AS "updatedAt"
+        FROM workflow_worker_observations o
+        JOIN predecessor_directors p ON p.director_id = o.director_id
+        ORDER BY "directorId", kind, "providerThreadId"
+      `,
+        "Predecessor native recovery evidence could not be read.",
+      );
+      const evidence = yield* Effect.forEach(evidenceRows, (row) =>
+        decodeHandoffNativeEvidenceRow(row),
+      ).pipe(
+        Effect.mapError((error) =>
+          directorError(
+            "persistence-failed",
+            "Predecessor native recovery evidence is invalid.",
+            String(error),
+          ),
+        ),
+      );
+      const recoveryTargets: Array<WorkflowDirectorHandoffRecoveryTarget> = [];
+      for (const target of targets) {
+        const saved = yield* decodeHandoffSettlementsJson(
+          target.latestSettlementsJson ?? target.settlementsJson,
+        ).pipe(
+          Effect.mapError((error) =>
+            directorError(
+              "persistence-failed",
+              "Predecessor settlement recovery evidence is invalid.",
+              String(error),
+            ),
+          ),
+        );
+        const targetEvidence = evidence.filter(
+          (candidate) => candidate.directorId === target.sourceDirectorId,
+        );
+        const root = targetEvidence.find((candidate) => candidate.kind === "director");
+        const savedRoot = saved.find((settlement) => settlement.kind === "director");
+        const children = targetEvidence.filter((candidate) => candidate.kind === "child");
+        const savedChildren = new Map(
+          saved
+            .filter((settlement) => settlement.kind === "child")
+            .map((settlement) => [settlement.providerThreadId, settlement]),
+        );
+        const rootChanged =
+          !root ||
+          !savedRoot ||
+          savedRoot.nativeSessionId !== root.nativeSessionId ||
+          savedRoot.nativeTurnId !== root.nativeTurnId ||
+          savedRoot.observedAt !== root.updatedAt ||
+          (savedRoot.mode === "interrupted"
+            ? root.nativeStatus !== "interrupted"
+            : !["completed", "failed"].includes(root.nativeStatus ?? ""));
+        const childChanged =
+          savedChildren.size !== children.length ||
+          children.some((child) => {
+            const savedChild = savedChildren.get(child.providerThreadId ?? "");
+            return (
+              child.associated !== 1 ||
+              !savedChild ||
+              savedChild.nativeSessionId !== child.nativeSessionId ||
+              savedChild.nativeTurnId !== child.nativeTurnId ||
+              savedChild.observedAt !== child.updatedAt ||
+              (savedChild.mode === "closed"
+                ? child.nativeLifecycle !== "closed"
+                : child.nativeStatus !== "interrupted")
+            );
+          });
+        if (!rootChanged && !childChanged && target.status !== "held") continue;
+        const settledChildCount = children.filter(
+          (child) =>
+            child.associated === 1 &&
+            (child.nativeLifecycle === "closed" || child.nativeStatus === "interrupted"),
+        ).length;
+        const latestReconciliation = yield* latestHandoffReconciliation(target.handoffId);
+        recoveryTargets.push({
+          handoffId: target.handoffId,
+          sourceDirectorId: target.sourceDirectorId,
+          sourceBatchId: target.sourceBatchId,
+          sourceBatchNumber: target.sourceBatchNumber,
+          sourceThreadId: ThreadId.make(target.sourceThreadId),
+          status: target.status as WorkflowDirectorHandoffRecoveryTarget["status"],
+          detail: target.detail,
+          rootSettlement:
+            root?.nativeStatus === "running" ||
+            root?.nativeStatus === "completed" ||
+            root?.nativeStatus === "failed" ||
+            root?.nativeStatus === "interrupted"
+              ? { status: root.nativeStatus, observedAt: root.updatedAt }
+              : null,
+          childSettlements: {
+            observedCount: children.length,
+            settledCount: settledChildCount,
+          },
+          targetObservation: handoffRecoveryTargetObservation({
+            currentDirectorId: current.directorId,
+            handoffId: target.handoffId,
+            handoffStatus: target.status,
+            latestReconciliationSequence: target.latestReconciliationSequence,
+            evidence: targetEvidence,
+          }),
+          latestReconciliation: latestReconciliation
+            ? yield* handoffReconciliationStatus(latestReconciliation)
+            : null,
+        });
+      }
+      return recoveryTargets;
+    },
+  );
 
   const activeReassessment = Effect.fn("WorkflowDirectorService.activeReassessment")(function* (
     directorId: string,
@@ -2753,6 +2991,7 @@ export const make = Effect.gen(function* () {
     const completion = yield* completionForStatus(row);
     const handoffRow = yield* handoffForDirector(row.directorId);
     const handoff = handoffRow ? yield* handoffStatusFromRow(handoffRow) : null;
+    const handoffRecoveryTargets = yield* recoveryTargetsForDirector(row);
     const admissionRows = yield* admissions(row.directorId);
     const admissionCount = new Set(admissionRows.map((admission) => admission.slotTicketNumber))
       .size;
@@ -2858,6 +3097,7 @@ export const make = Effect.gen(function* () {
       reassessment,
       completion,
       handoff,
+      handoffRecoveryTargets,
       observation,
       actions,
       createdAt: row.createdAt,
@@ -5058,13 +5298,14 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const reconcileHandoffUnlocked = Effect.fn("WorkflowDirectorService.reconcileHandoff")(function* (
-    environmentId: EnvironmentId,
-    threadId: ThreadId,
-    providerInstanceId: ProviderInstanceId,
+  const reconcileHandoffForCurrent = Effect.fn(
+    "WorkflowDirectorService.reconcileHandoffForCurrent",
+  )(function* (
+    current: DirectorRow,
     input: WorkflowDirectorHandoffReconcileInput,
+    actor: WorkflowDirectorHandoffReconciliationActor,
+    expectedTargetObservation?: string,
   ) {
-    const current = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
     const handoff = yield* loadHandoffById(input.handoffId);
     const source = yield* loadDirectorHistoryById(handoff.sourceDirectorId);
     if (
@@ -5165,16 +5406,124 @@ export const make = Effect.gen(function* () {
     const snapshot = yield* settledHandoffSnapshot(source, handoff);
     const reconciliationId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
     const createdAt = DateTime.formatIso(yield* DateTime.now);
-    yield* persistence(
+    const saveDecision = yield* persistence(
       sql.withTransaction(
         Effect.gen(function* () {
+          if (expectedTargetObservation) {
+            // Acquire SQLite's writer lock before the final evidence read. Native ingestion writes
+            // through another service and does not share the director semaphore.
+            yield* sql`UPDATE workflow_directors SET director_id = director_id
+              WHERE director_id = ${current.directorId}`;
+            const lockedHandoffRows = yield* sql<{
+              readonly status: string;
+              readonly latestReconciliationSequence: number | null;
+            }>`SELECT h.status,
+                (SELECT max(r.sequence) FROM workflow_director_handoff_reconciliations r
+                  WHERE r.handoff_id = h.handoff_id) AS "latestReconciliationSequence"
+              FROM workflow_director_handoffs h WHERE h.handoff_id = ${handoff.handoffId}`;
+            const lockedEvidenceRows = yield* sql<Record<string, unknown>>`
+              SELECT t.director_id AS "directorId", 'director' AS kind,
+                NULL AS "providerThreadId", t.native_session_id AS "nativeSessionId",
+                t.native_turn_id AS "nativeTurnId", t.status AS "nativeStatus",
+                NULL AS "nativeLifecycle", 1 AS associated, t.updated_at AS "updatedAt"
+              FROM workflow_director_native_turns t
+              WHERE t.director_id = ${source.directorId}
+              UNION ALL
+              SELECT o.director_id AS "directorId", 'child' AS kind,
+                o.provider_thread_id AS "providerThreadId", o.native_session_id AS "nativeSessionId",
+                o.native_turn_id AS "nativeTurnId", o.native_turn_status AS "nativeStatus",
+                o.native_lifecycle AS "nativeLifecycle",
+                CASE WHEN EXISTS (
+                  SELECT 1 FROM workflow_worker_dispatches d
+                  WHERE d.director_id = o.director_id AND d.provider_thread_id = o.provider_thread_id
+                ) OR EXISTS (
+                  SELECT 1 FROM workflow_ticket_reviews r
+                  WHERE r.director_id = o.director_id AND r.provider_thread_id = o.provider_thread_id
+                ) OR EXISTS (
+                  SELECT 1 FROM workflow_review_axes a JOIN workflow_ticket_reviews r ON r.review_id = a.review_id
+                  WHERE r.director_id = o.director_id AND a.provider_thread_id = o.provider_thread_id
+                ) THEN 1 ELSE 0 END AS associated,
+                o.updated_at AS "updatedAt"
+              FROM workflow_worker_observations o
+              WHERE o.director_id = ${source.directorId}
+              ORDER BY kind, "providerThreadId"`;
+            const lockedEvidence = yield* Effect.forEach(lockedEvidenceRows, (row) =>
+              decodeHandoffNativeEvidenceRow(row),
+            );
+            const lockedHandoff = lockedHandoffRows[0];
+            if (
+              !lockedHandoff ||
+              handoffRecoveryTargetObservation({
+                currentDirectorId: current.directorId,
+                handoffId: handoff.handoffId,
+                handoffStatus: lockedHandoff.status,
+                latestReconciliationSequence: lockedHandoff.latestReconciliationSequence,
+                evidence: lockedEvidence,
+              }) !== expectedTargetObservation
+            ) {
+              return "target-changed" as const;
+            }
+            const lockedRoot = lockedEvidence.find((entry) => entry.kind === "director");
+            const lockedChildren = lockedEvidence.filter((entry) => entry.kind === "child");
+            if (
+              !lockedRoot ||
+              !["completed", "failed", "interrupted"].includes(lockedRoot.nativeStatus ?? "") ||
+              lockedChildren.some(
+                (child) =>
+                  child.providerThreadId === null ||
+                  child.associated !== 1 ||
+                  (child.nativeLifecycle !== "closed" && child.nativeStatus !== "interrupted"),
+              )
+            ) {
+              return "target-changed" as const;
+            }
+            const lockedSettlements = [
+              {
+                kind: "director" as const,
+                providerThreadId: source.threadId,
+                nativeSessionId: lockedRoot.nativeSessionId,
+                nativeTurnId: lockedRoot.nativeTurnId,
+                mode: lockedRoot.nativeStatus === "interrupted" ? "interrupted" : "closed",
+                observedAt: lockedRoot.updatedAt,
+              },
+              ...lockedChildren.map((child) => ({
+                kind: "child" as const,
+                providerThreadId: child.providerThreadId!,
+                nativeSessionId: child.nativeSessionId,
+                nativeTurnId: child.nativeTurnId,
+                mode:
+                  child.nativeLifecycle === "closed"
+                    ? ("closed" as const)
+                    : ("interrupted" as const),
+                observedAt: child.updatedAt,
+              })),
+            ].toSorted((left, right) =>
+              `${left.kind}:${left.providerThreadId}`.localeCompare(
+                `${right.kind}:${right.providerThreadId}`,
+              ),
+            );
+            const snapshotSettlements = (yield* decodeHandoffSettlementsJson(
+              snapshot.settlementsJson,
+            )).toSorted((left, right) =>
+              `${left.kind}:${left.providerThreadId}`.localeCompare(
+                `${right.kind}:${right.providerThreadId}`,
+              ),
+            );
+            if (
+              encodeHandoffSettlementsJson(lockedSettlements) !==
+              encodeHandoffSettlementsJson(snapshotSettlements)
+            ) {
+              return "target-changed" as const;
+            }
+          }
           yield* sql`
             INSERT INTO workflow_director_handoff_reconciliations (
               reconciliation_id, handoff_id, acknowledged_by_director_id, settlements_json,
-              implementation_head, summary, created_at
+              implementation_head, summary, created_at, actor_kind, actor_subject
             ) VALUES (
               ${reconciliationId}, ${handoff.handoffId}, ${current.directorId},
-              ${snapshot.settlementsJson}, ${snapshot.implementationHead}, ${input.summary}, ${createdAt}
+              ${snapshot.settlementsJson}, ${snapshot.implementationHead}, ${input.summary}, ${createdAt},
+              ${actor.kind}, ${actor.subject}
             )
           `;
           if (handoff.successorDirectorId === current.directorId && handoff.status === "held") {
@@ -5183,11 +5532,82 @@ export const make = Effect.gen(function* () {
             yield* sql`UPDATE workflow_directors SET status = 'submitting', detail = NULL,
               updated_at = ${createdAt} WHERE director_id = ${current.directorId} AND is_current = 1`;
           }
+          return "saved" as const;
         }),
       ),
       "The handoff reconciliation acknowledgement could not be saved.",
     );
+    if (saveDecision === "target-changed") {
+      return yield* directorError(
+        "not-ready",
+        "The selected predecessor evidence changed before handoff acknowledgement.",
+        "Refresh Workflow and review the current batch history before trying again.",
+      );
+    }
     return yield* handoffStatusFromRow(yield* loadHandoffById(handoff.handoffId));
+  });
+
+  const reconcileHandoffUnlocked = Effect.fn("WorkflowDirectorService.reconcileHandoff")(function* (
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    input: WorkflowDirectorHandoffReconcileInput,
+  ) {
+    const current = yield* directorForMcpScope(environmentId, threadId, providerInstanceId);
+    return yield* reconcileHandoffForCurrent(current, input, {
+      kind: "director",
+      subject: current.directorId,
+    });
+  });
+
+  const reconcileHandoffAsOwnerUnlocked = Effect.fn(
+    "WorkflowDirectorService.reconcileHandoffAsOwner",
+  )(function* (input: WorkflowDirectorHandoffOwnerReconcileInput, actorSubject: string) {
+    const environmentId = yield* environment.getEnvironmentId.pipe(
+      Effect.mapError((error) =>
+        directorError(
+          "workspace-unavailable",
+          "The environment identity could not be read.",
+          String(error),
+        ),
+      ),
+    );
+    const current = yield* loadDirectorByCapability(input, environmentId);
+    if (
+      !current ||
+      current.projectId !== input.projectId ||
+      current.directorId !== input.expectedDirectorId
+    ) {
+      return yield* directorError(
+        "not-ready",
+        "The selected capability director changed before handoff acknowledgement.",
+      );
+    }
+    const currentStatus = yield* statusFromRow(current);
+    if (currentStatus.observation !== input.expectedObservation) {
+      return yield* directorError(
+        "not-ready",
+        "The capability director changed before handoff acknowledgement.",
+        "Refresh Workflow and review the current director status before trying again.",
+      );
+    }
+    const target = currentStatus.handoffRecoveryTargets?.find(
+      (candidate) => candidate.handoffId === input.handoffId,
+    );
+    if (!target || target.targetObservation !== input.expectedTargetObservation) {
+      return yield* directorError(
+        "not-ready",
+        "The selected predecessor evidence changed before handoff acknowledgement.",
+        "Refresh Workflow and review the current batch history before trying again.",
+      );
+    }
+    yield* reconcileHandoffForCurrent(
+      current,
+      { handoffId: input.handoffId, summary: input.summary },
+      { kind: "owner-session", subject: actorSubject },
+      input.expectedTargetObservation,
+    );
+    return yield* statusFromRow(yield* loadDirectorById(current.directorId));
   });
 
   const successorReceiptState = Effect.fn("WorkflowDirectorService.successorReceiptState")(
@@ -5559,6 +5979,7 @@ export const make = Effect.gen(function* () {
       );
     }
     const source = yield* loadDirectorHistoryById(handoff.sourceDirectorId);
+    yield* ensurePredecessorExecutionSettled(source);
     const expectedSnapshot = yield* effectiveHandoffSettlement(handoff);
     const currentSnapshot = yield* settledHandoffSnapshot(source, handoff).pipe(Effect.result);
     if (
@@ -6045,6 +6466,7 @@ export const make = Effect.gen(function* () {
         WHERE environment_id = ${row.environmentId}
           AND repository COLLATE NOCASE = ${row.repository}
           AND capability_number = ${row.capabilityNumber}
+          AND is_current = 0
           AND director_id != ${row.directorId}
       `,
       "Predecessor execution history could not be read.",
@@ -8361,6 +8783,8 @@ export const make = Effect.gen(function* () {
       lock.withPermits(1)(
         reconcileHandoffUnlocked(environmentId, threadId, providerInstanceId, input),
       ),
+    reconcileHandoffAsOwner: (input, actorSubject) =>
+      lock.withPermits(1)(reconcileHandoffAsOwnerUnlocked(input, actorSubject)),
     rotateReady: (input, dispatch) => lock.withPermits(1)(rotateReadyUnlocked(input, dispatch)),
     prepareWorker: (environmentId, threadId, providerInstanceId, input) =>
       lock.withPermits(1)(
