@@ -1300,6 +1300,76 @@ describe("WorkflowPanel browsing", () => {
     }
   });
 
+  it("preserves a newer same-issue Active work selection after a delayed Start result", async () => {
+    query.startReady = true;
+    let releaseStart = () => {};
+    query.deferredStart = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const threadId = ThreadId.make("workflow-thread-15");
+    const threadRef = { environmentId, threadId };
+    const store = useWorkflowMapStore.getState();
+    store.setThreadLocation(threadRef, {
+      projectId,
+      repository: "Flow-Fly/t3code",
+      rootNumber: 10,
+    });
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <WorkflowPanel
+            environmentId={environmentId}
+            environmentLabel="Remote environment"
+            projectId={projectId}
+            projectTitle="Draft project"
+            planningThreadId={threadId}
+            supported
+          />,
+        );
+      });
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow decision" });
+      await act(() => start.findByType("button").props.onClick());
+
+      await act(() => {
+        store.setNavigationTarget(threadRef, {
+          requestId: "newer-active-work-selection",
+          projectId,
+          repository: "Flow-Fly/t3code",
+          rootNumber: 10,
+          issueNumber: 11,
+          activeWorkEntryId: "review:review-2",
+          providerThreadId: "review-provider-2",
+        });
+      });
+
+      await act(async () => {
+        releaseStart();
+        await query.deferredStart;
+      });
+
+      expect(
+        useWorkflowMapStore.getState().navigationTargetByThread[`${environmentId}:${threadId}`],
+      ).toMatchObject({
+        requestId: "newer-active-work-selection",
+        activeWorkEntryId: "review:review-2",
+        providerThreadId: "review-provider-2",
+      });
+      expect(query.navigateCalls).toEqual([]);
+    } finally {
+      releaseStart();
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("opens a delayed Start result while its initiating context remains current", async () => {
     query.startReady = true;
     let releaseStart = () => {};

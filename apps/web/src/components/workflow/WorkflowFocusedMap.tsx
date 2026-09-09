@@ -1490,6 +1490,8 @@ export function WorkflowFocusedMap(props: {
         selected.repository,
         selected.id,
         selected.number,
+        props.focusedActiveWorkEntryId ?? null,
+        props.focusedProviderThreadId ?? null,
       ])
     : null;
   const selectionHidden = Boolean(view.selectedId && !nodeById.has(view.selectedId));
