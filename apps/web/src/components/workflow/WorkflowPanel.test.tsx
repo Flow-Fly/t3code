@@ -1988,17 +1988,54 @@ describe("WorkflowPanel browsing", () => {
 
     const node = renderer!.root.findAllByProps({ "data-workflow-node": true })[0]!;
     const rootPosition = useWorkflowMapStore.getState().views[scope]!.positions["issue-10"]!;
+    const viewportBeforeButtonPress = useWorkflowMapStore.getState().views[scope]!.viewport;
+    const nodeButtonCapture = vi.fn();
+    const canvasButtonCapture = vi.fn();
+    const buttonTarget = { closest: () => ({ tagName: "BUTTON" }) };
     await act(() => {
       node.props.onPointerDown({
-        currentTarget: { setPointerCapture: () => undefined },
-        stopPropagation: () => undefined,
+        target: buttonTarget,
+        currentTarget: { setPointerCapture: nodeButtonCapture },
+        stopPropagation: vi.fn(),
         pointerId: 2,
+        clientX: 50,
+        clientY: 50,
+      });
+      canvas.props.onPointerDown({
+        target: buttonTarget,
+        currentTarget: { setPointerCapture: canvasButtonCapture },
+        pointerId: 2,
+        clientX: 50,
+        clientY: 50,
+      });
+      node.props.onPointerMove({ clientX: 70, clientY: 80 });
+      canvas.props.onPointerMove({ clientX: 70, clientY: 80 });
+      node.props.onPointerUp({ clientX: 70, clientY: 80 });
+      canvas.props.onPointerUp({ clientX: 70, clientY: 80 });
+    });
+    expect(nodeButtonCapture).not.toHaveBeenCalled();
+    expect(canvasButtonCapture).not.toHaveBeenCalled();
+    expect(useWorkflowMapStore.getState().views[scope]!.positions["issue-10"]).toEqual(
+      rootPosition,
+    );
+    expect(useWorkflowMapStore.getState().views[scope]!.viewport).toEqual(
+      viewportBeforeButtonPress,
+    );
+
+    const nodeBackgroundCapture = vi.fn();
+    await act(() => {
+      node.props.onPointerDown({
+        target: { closest: () => null },
+        currentTarget: { setPointerCapture: nodeBackgroundCapture },
+        stopPropagation: () => undefined,
+        pointerId: 3,
         clientX: 50,
         clientY: 50,
       });
       node.props.onPointerMove({ clientX: 70, clientY: 80 });
       node.props.onPointerUp({ clientX: 70, clientY: 80 });
     });
+    expect(nodeBackgroundCapture).toHaveBeenCalledWith(3);
     expect(useWorkflowMapStore.getState().views[scope]!.positions["issue-10"]).not.toEqual(
       rootPosition,
     );

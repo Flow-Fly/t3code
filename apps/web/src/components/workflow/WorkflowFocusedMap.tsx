@@ -1651,6 +1651,8 @@ export function WorkflowFocusedMap(props: {
     setTransientViewport(null);
   };
   const dragStart = (id: string, event: ReactPointerEvent<HTMLDivElement>) => {
+    const target = event.target as { closest?: (selector: string) => unknown };
+    if (target.closest?.("button, input, a")) return;
     const position = view.positions[id] ?? { x: 0, y: 0 };
     dragRef.current = {
       id,
