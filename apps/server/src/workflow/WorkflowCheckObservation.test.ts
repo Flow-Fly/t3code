@@ -90,9 +90,19 @@ layer("WorkflowCheckObservation", (it) => {
           status: "inProgress",
           data: {
             item: {
+              id: "check-item",
               type: "commandExecution",
               command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
+              status: "inProgress",
+              commandActions: [
+                {
+                  type: "unknown",
+                  command: "/tmp/node/bin/node --test test/check-summary.test.mjs",
+                },
+              ],
+              aggregatedOutput: null,
+              exitCode: null,
             },
           },
         },
@@ -107,10 +117,17 @@ layer("WorkflowCheckObservation", (it) => {
           status: "completed",
           data: {
             item: {
+              id: "check-item",
               type: "commandExecution",
               command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
               status: "completed",
+              commandActions: [
+                {
+                  type: "unknown",
+                  command: "/tmp/node/bin/node --test test/check-summary.test.mjs",
+                },
+              ],
               exitCode: 0,
               aggregatedOutput: "1 passed",
             },
@@ -127,9 +144,19 @@ layer("WorkflowCheckObservation", (it) => {
           status: "inProgress",
           data: {
             item: {
+              id: "check-item",
               type: "commandExecution",
               command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
+              status: "inProgress",
+              commandActions: [
+                {
+                  type: "unknown",
+                  command: "/tmp/node/bin/node --test test/check-summary.test.mjs",
+                },
+              ],
+              aggregatedOutput: null,
+              exitCode: null,
             },
           },
         },

@@ -11,7 +11,7 @@ const NativeCommandData = Schema.Struct({
     cwd: Schema.optional(Schema.NullOr(Schema.String)),
     exitCode: Schema.optional(Schema.NullOr(Schema.Number)),
     status: Schema.optional(Schema.String),
-    aggregatedOutput: Schema.optional(Schema.String),
+    aggregatedOutput: Schema.optional(Schema.NullOr(Schema.String)),
   }),
 });
 const decodeNativeCommandData = Schema.decodeUnknownEffect(NativeCommandData);
