@@ -19,6 +19,8 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkflowService from "./WorkflowService.ts";
+// @ts-expect-error The subprocess fixture is intentionally a plain Node module.
+import * as FixtureState from "../testUtils/workflowGitHubFixture/fixture.mjs";
 
 const fixtureDirectory = NodePath.resolve(
   import.meta.dirname,
@@ -113,9 +115,50 @@ function gh(fixture: Fixture, ...args: ReadonlyArray<string>) {
   return run(fixture.ghPath, args, { env: fixtureEnv(fixture) });
 }
 
+async function startLockHolder(fixture: Fixture) {
+  const child = NodeChildProcess.spawn(
+    process.execPath,
+    [controlPath, "hold-lock", "--state", fixture.statePath],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const owner = await new Promise<{ readonly pid: number; readonly token: string }>(
+    (resolve, reject) => {
+      const onExit = (code: number | null) => {
+        reject(new Error(`Fixture lock holder exited ${code}: ${stderr}`));
+      };
+      child.once("exit", onExit);
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        const newline = stdout.indexOf("\n");
+        if (newline === -1) return;
+        child.off("exit", onExit);
+        resolve(JSON.parse(stdout.slice(0, newline)));
+      });
+    },
+  );
+  return { child, owner };
+}
+
+async function killLockHolder(child: NodeChildProcess.ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+  });
+  child.kill("SIGKILL");
+  await exited;
+}
+
 describe("Workflow GitHub subprocess fixture", () => {
-  it("keeps synthetic reads and writes closed, stateful, and recoverable", () => {
+  it("keeps synthetic reads and writes closed, stateful, and recoverable", async () => {
     const fixture = createFixture();
+    let lockHolder: NodeChildProcess.ChildProcess | undefined;
     try {
       const stateBeforeLauncherInstall = NodeFS.readFileSync(fixture.statePath, "utf8");
       expect(
@@ -129,6 +172,43 @@ describe("Workflow GitHub subprocess fixture", () => {
         ).status,
       ).toBe(0);
       expect(NodeFS.readFileSync(fixture.statePath, "utf8")).toBe(stateBeforeLauncherInstall);
+
+      const lockPath = `${fixture.statePath}.lock`;
+      NodeFS.mkdirSync(lockPath);
+      NodeFS.utimesSync(lockPath, 0, 0);
+      const ownerlessAttempt = gh(fixture, "--version");
+      expect(ownerlessAttempt.status).not.toBe(0);
+      expect(ownerlessAttempt.stderr).toContain("Fixture state lock is stale");
+      expect(NodeFS.existsSync(lockPath)).toBe(true);
+      NodeFS.rmdirSync(lockPath);
+
+      const held = await startLockHolder(fixture);
+      lockHolder = held.child;
+      NodeFS.utimesSync(lockPath, 0, 0);
+      const liveOwnerAttempt = gh(fixture, "--version");
+      expect(liveOwnerAttempt.status).not.toBe(0);
+      expect(liveOwnerAttempt.stderr).toContain("Fixture state is busy");
+
+      await killLockHolder(lockHolder);
+      lockHolder = undefined;
+      expect(gh(fixture, "--version").stdout).toContain("gh version 2.83.0");
+
+      const successor = FixtureState.acquireFixtureStateLock(fixture.statePath);
+      try {
+        const recoveryPath = `${lockPath}.recovery`;
+        NodeFS.mkdirSync(recoveryPath);
+        expect(FixtureState.tryRecoverFixtureStateLock(fixture.statePath, held.owner)).toBe(false);
+        expect(
+          JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8")),
+        ).toMatchObject({ token: successor.owner.token });
+        NodeFS.rmdirSync(recoveryPath);
+        expect(FixtureState.tryRecoverFixtureStateLock(fixture.statePath, held.owner)).toBe(false);
+        expect(
+          JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8")),
+        ).toMatchObject({ token: successor.owner.token });
+      } finally {
+        FixtureState.releaseFixtureStateLock(successor);
+      }
 
       expect(gh(fixture, "--version").stdout).toContain("gh version 2.83.0");
       expect(
@@ -251,6 +331,7 @@ describe("Workflow GitHub subprocess fixture", () => {
           .status,
       ).not.toBe(0);
     } finally {
+      if (lockHolder) await killLockHolder(lockHolder);
       NodeFS.rmSync(fixture.directory, { recursive: true, force: true });
     }
   });

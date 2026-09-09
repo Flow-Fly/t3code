@@ -1,5 +1,6 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeCrypto from "node:crypto";
 
 const LOCK_WAIT_MS = 2_000;
 const STALE_LOCK_MS = 30_000;
@@ -382,15 +383,102 @@ function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function acquireLock(statePath) {
+function readLockOwner(lockPath) {
+  try {
+    const value = JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8"));
+    if (
+      typeof value?.pid !== "number" ||
+      !Number.isInteger(value.pid) ||
+      value.pid <= 0 ||
+      typeof value.token !== "string" ||
+      value.token.length === 0 ||
+      typeof value.createdAt !== "string"
+    ) {
+      return null;
+    }
+    return value;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+export function tryRecoverFixtureStateLock(statePath, expectedOwner) {
+  const lockPath = `${statePath}.lock`;
+  const recoveryPath = `${lockPath}.recovery`;
+  try {
+    NodeFS.mkdirSync(recoveryPath);
+  } catch (error) {
+    if (error?.code === "EEXIST") return false;
+    throw error;
+  }
+
+  try {
+    const currentOwner = readLockOwner(lockPath);
+    if (
+      currentOwner === null ||
+      currentOwner.token !== expectedOwner.token ||
+      processIsAlive(currentOwner.pid)
+    ) {
+      return false;
+    }
+
+    const abandonedPath = `${lockPath}.abandoned-${currentOwner.token}`;
+    try {
+      NodeFS.renameSync(lockPath, abandonedPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+    NodeFS.rmSync(abandonedPath, { recursive: true, force: true });
+    return true;
+  } finally {
+    NodeFS.rmdirSync(recoveryPath);
+  }
+}
+
+export function acquireFixtureStateLock(statePath) {
   const lockPath = `${statePath}.lock`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   while (true) {
     try {
       NodeFS.mkdirSync(lockPath);
-      return lockPath;
+      const owner = {
+        pid: process.pid,
+        token: NodeCrypto.randomUUID(),
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        NodeFS.writeFileSync(
+          NodePath.join(lockPath, "owner.json"),
+          `${JSON.stringify(owner)}\n`,
+          "utf8",
+        );
+      } catch (error) {
+        NodeFS.rmSync(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      return { path: lockPath, owner };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
+      const lockOwner = readLockOwner(lockPath);
+      if (
+        lockOwner !== null &&
+        !processIsAlive(lockOwner.pid) &&
+        tryRecoverFixtureStateLock(statePath, lockOwner)
+      ) {
+        continue;
+      }
       let age;
       try {
         age = Date.now() - NodeFS.statSync(lockPath).mtimeMs;
@@ -398,7 +486,7 @@ function acquireLock(statePath) {
         if (statError?.code === "ENOENT") continue;
         throw statError;
       }
-      if (age > STALE_LOCK_MS) {
+      if (lockOwner === null && age > STALE_LOCK_MS) {
         throw new Error(
           `Fixture state lock is stale at ${lockPath}. Verify no fixture process is running, then remove that lock directory.`,
           { cause: error },
@@ -415,6 +503,13 @@ function acquireLock(statePath) {
   }
 }
 
+export function releaseFixtureStateLock(lock) {
+  const currentOwner = readLockOwner(lock.path);
+  if (currentOwner?.token !== lock.owner.token) return false;
+  NodeFS.rmSync(lock.path, { recursive: true });
+  return true;
+}
+
 function saveState(statePath, state) {
   const temporaryPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   NodeFS.writeFileSync(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
@@ -426,14 +521,14 @@ export function readState(statePath) {
 }
 
 export function updateState(statePath, update) {
-  const lockPath = acquireLock(statePath);
+  const lock = acquireFixtureStateLock(statePath);
   try {
     const state = readState(statePath);
     const result = update(state);
     saveState(statePath, state);
     return result;
   } finally {
-    NodeFS.rmdirSync(lockPath);
+    releaseFixtureStateLock(lock);
   }
 }
 

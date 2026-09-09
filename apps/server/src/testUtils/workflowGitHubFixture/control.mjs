@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
 import {
+  acquireFixtureStateLock,
   addReassessment,
   initialize,
   inspectIssue,
   installLauncher,
   readState,
+  releaseFixtureStateLock,
   setFailure,
   setOffline,
 } from "./fixture.mjs";
@@ -52,6 +55,14 @@ try {
       realShellPath,
     );
     process.stdout.write(`${JSON.stringify({ launchers })}\n`);
+  } else if (command === "hold-lock") {
+    const lock = acquireFixtureStateLock(statePath);
+    try {
+      NodeFS.writeSync(process.stdout.fd, `${JSON.stringify(lock.owner)}\n`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    } finally {
+      releaseFixtureStateLock(lock);
+    }
   } else if (command === "offline") {
     if (args[1] !== "on" && args[1] !== "off") throw new Error("Use offline on or offline off.");
     setOffline(statePath, args[1] === "on");
