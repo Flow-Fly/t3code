@@ -25,6 +25,7 @@ const query = vi.hoisted(() => {
     heldAfterRefresh: false,
     planningKind: null as "map" | "capability" | null,
     startFailure: false,
+    deferredStart: null as Promise<void> | null,
     startCalls: new Array<unknown>(),
     refreshCalls: new Array<unknown>(),
     syncStatus: "fresh" as "fresh" | "stale" | "rate-limited" | "unavailable",
@@ -102,6 +103,7 @@ vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: { label: string }) => async (request: unknown) => {
     query.startCalls.push(request);
     if (command.label === "workflow:refresh") query.refreshCalls.push(request);
+    if (command.label === "workflow:start" && query.deferredStart) await query.deferredStart;
     if (command.label === "workflow:start" && query.startFailure) {
       return { _tag: "Failure", cause: Cause.fail(new Error("Planning link is unavailable.")) };
     }
@@ -850,6 +852,7 @@ beforeEach(() => {
   query.heldAfterRefresh = false;
   query.planningKind = null;
   query.startFailure = false;
+  query.deferredStart = null;
   query.startCalls.length = 0;
   query.refreshCalls.length = 0;
   query.syncStatus = "fresh";
@@ -1149,6 +1152,216 @@ describe("WorkflowPanel browsing", () => {
       expect(start.findByType("button").children.join("")).toBe("Create capability");
       expect(start.findByType("button").props.disabled).toBe(false);
     } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("ignores a delayed Start result after the receiving thread moves to a newer root", async () => {
+    query.startReady = true;
+    let releaseStart = () => {};
+    query.deferredStart = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const sourceThread = ThreadId.make("source-thread");
+    const destinationThread = ThreadId.make("workflow-thread-15");
+    const destinationScope = "remote-environment:project-draft:flow-fly/t3code:issue-20";
+    const store = useWorkflowMapStore.getState();
+    store.setThreadLocation(
+      { environmentId, threadId: sourceThread },
+      { projectId, repository: "Flow-Fly/t3code", rootNumber: 10 },
+    );
+    store.patchView(destinationScope, {
+      selectedId: "issue-20",
+      selectedIssue: {
+        id: "issue-20",
+        repository: "Flow-Fly/t3code",
+        number: 20,
+      },
+      viewport: { x: 12, y: 24, zoom: 0.7 },
+    });
+    const props = {
+      environmentId,
+      environmentLabel: "Remote environment",
+      projectId,
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<WorkflowPanel {...props} planningThreadId={sourceThread} />);
+      });
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow decision" });
+      await act(() => start.findByType("button").props.onClick());
+      expect(query.startCalls).toHaveLength(1);
+
+      await act(() => {
+        store.setThreadLocation(
+          { environmentId, threadId: destinationThread },
+          { projectId, repository: "Flow-Fly/t3code", rootNumber: 20 },
+        );
+        renderer!.update(<WorkflowPanel {...props} planningThreadId={destinationThread} />);
+      });
+      expect(
+        renderer!.root.findByProps({ "aria-label": "Choose another workflow root" }).children,
+      ).toContain("20");
+
+      await act(async () => {
+        releaseStart();
+        await query.deferredStart;
+      });
+
+      expect(
+        useWorkflowMapStore.getState().locationByThread[`${environmentId}:${destinationThread}`]
+          ?.rootNumber,
+      ).toBe(20);
+      expect(useWorkflowMapStore.getState().views[destinationScope]).toMatchObject({
+        selectedId: "issue-20",
+        viewport: { x: 12, y: 24, zoom: 0.7 },
+      });
+      expect(query.navigateCalls).toEqual([]);
+    } finally {
+      releaseStart();
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("keeps a delayed Start result stale after navigating away and back", async () => {
+    query.startReady = true;
+    let releaseStart = () => {};
+    query.deferredStart = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const sourceThread = ThreadId.make("source-thread");
+    const destinationThread = ThreadId.make("workflow-thread-15");
+    const store = useWorkflowMapStore.getState();
+    store.setThreadLocation(
+      { environmentId, threadId: sourceThread },
+      { projectId, repository: "Flow-Fly/t3code", rootNumber: 10 },
+    );
+    const props = {
+      environmentId,
+      environmentLabel: "Remote environment",
+      projectId,
+      projectTitle: "Draft project",
+      supported: true,
+    };
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<WorkflowPanel {...props} planningThreadId={sourceThread} />);
+      });
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow decision" });
+      await act(() => start.findByType("button").props.onClick());
+
+      await act(() => {
+        store.setThreadLocation(
+          { environmentId, threadId: destinationThread },
+          { projectId, repository: "Flow-Fly/t3code", rootNumber: 20 },
+        );
+        renderer!.update(<WorkflowPanel {...props} planningThreadId={destinationThread} />);
+      });
+      await act(() => {
+        renderer!.update(<WorkflowPanel {...props} planningThreadId={sourceThread} />);
+      });
+      expect(
+        renderer!.root.findByProps({ "aria-label": "Choose another workflow root" }).children,
+      ).toContain("10");
+
+      await act(async () => {
+        releaseStart();
+        await query.deferredStart;
+      });
+
+      expect(
+        useWorkflowMapStore.getState().locationByThread[`${environmentId}:${destinationThread}`]
+          ?.rootNumber,
+      ).toBe(20);
+      expect(query.navigateCalls).toEqual([]);
+    } finally {
+      releaseStart();
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("opens a delayed Start result while its initiating context remains current", async () => {
+    query.startReady = true;
+    let releaseStart = () => {};
+    query.deferredStart = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const environmentId = EnvironmentId.make("remote-environment");
+    const projectId = ProjectId.make("project-draft");
+    const sourceThread = ThreadId.make("source-thread");
+    useWorkflowMapStore
+      .getState()
+      .setThreadLocation(
+        { environmentId, threadId: sourceThread },
+        { projectId, repository: "Flow-Fly/t3code", rootNumber: 10 },
+      );
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <WorkflowPanel
+            environmentId={environmentId}
+            environmentLabel="Remote environment"
+            projectId={projectId}
+            projectTitle="Draft project"
+            planningThreadId={sourceThread}
+            supported
+          />,
+        );
+      });
+      const issueButton = renderer!.root
+        .findAllByType("button")
+        .find((button) =>
+          button.findAllByType("span").some((span) => span.children.join("").includes("#11")),
+        );
+      await act(() => issueButton!.props.onClick());
+      const start = renderer!.root.findByProps({ "aria-label": "Start workflow decision" });
+      await act(() => start.findByType("button").props.onClick());
+      expect(query.navigateCalls).toEqual([]);
+
+      await act(async () => {
+        releaseStart();
+        await query.deferredStart;
+      });
+
+      expect(query.navigateCalls).toEqual([
+        {
+          to: "/$environmentId/$threadId",
+          params: { environmentId, threadId: "workflow-thread-15" },
+        },
+      ]);
+      expect(
+        useWorkflowMapStore.getState().navigationTargetByThread[
+          `${environmentId}:workflow-thread-15`
+        ],
+      ).toMatchObject({
+        projectId,
+        repository: "Flow-Fly/t3code",
+        rootNumber: 10,
+        issueNumber: 11,
+      });
+    } finally {
+      releaseStart();
       await act(() => renderer?.unmount());
     }
   });

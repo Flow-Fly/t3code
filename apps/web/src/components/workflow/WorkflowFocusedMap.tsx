@@ -25,6 +25,7 @@ import {
   type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -155,6 +156,14 @@ function WorkflowDetails(props: {
   const [startPending, setStartPending] = useState(false);
   const [startMessage, setStartMessage] = useState<string | null>(null);
   const [handoffSummary, setHandoffSummary] = useState("");
+  const lifetimeRef = useRef({ active: false });
+  useLayoutEffect(() => {
+    const lifetime = { active: true };
+    lifetimeRef.current = lifetime;
+    return () => {
+      lifetime.active = false;
+    };
+  }, []);
   const query = useEnvironmentQuery(
     workflowEnvironment.issueDetail({
       environmentId: props.environmentId,
@@ -327,6 +336,7 @@ function WorkflowDetails(props: {
   const handleStart = async () => {
     const selection = hasBreakdownApproval ? directorSelection.selection : startSelection.selection;
     if (startPending || !selection) return;
+    const lifetime = lifetimeRef.current;
     setStartPending(true);
     setStartMessage(null);
     if (hasBreakdownApproval) {
@@ -340,6 +350,7 @@ function WorkflowDetails(props: {
           modelSelection: selection,
         },
       });
+      if (!lifetime.active) return;
       setStartPending(false);
       directorQuery.refresh();
       if (result._tag === "Failure") {
@@ -380,6 +391,7 @@ function WorkflowDetails(props: {
         modelSelection: selection,
       },
     });
+    if (!lifetime.active) return;
     setStartPending(false);
     recoveryQuery.refresh();
     if (result._tag === "Failure") {
@@ -414,6 +426,7 @@ function WorkflowDetails(props: {
       await handleStart();
       return;
     }
+    const lifetime = lifetimeRef.current;
     setStartPending(true);
     setStartMessage(null);
     const common = {
@@ -432,6 +445,7 @@ function WorkflowDetails(props: {
               input: { ...common, modelSelection: directorSelection.selection },
             })
           : null;
+    if (!lifetime.active) return;
     setStartPending(false);
     directorQuery.refresh();
     if (!result) return;
@@ -459,6 +473,7 @@ function WorkflowDetails(props: {
     );
     const summary = handoffSummary.trim();
     if (!director || !target || startPending || summary.length === 0) return;
+    const lifetime = lifetimeRef.current;
     setStartPending(true);
     setStartMessage(null);
     const result = await reconcileDirectorHandoff({
@@ -474,6 +489,7 @@ function WorkflowDetails(props: {
         summary,
       },
     });
+    if (!lifetime.active) return;
     setStartPending(false);
     directorQuery.refresh();
     if (result._tag === "Failure") {
@@ -499,6 +515,7 @@ function WorkflowDetails(props: {
     ) {
       return;
     }
+    const lifetime = lifetimeRef.current;
     setStartPending(true);
     setStartMessage(null);
     const result = await recoverWorkflow({
@@ -515,6 +532,7 @@ function WorkflowDetails(props: {
         ...(startSelection.selection ? { modelSelection: startSelection.selection } : {}),
       },
     });
+    if (!lifetime.active) return;
     setStartPending(false);
     recoveryQuery.refresh();
     if (result._tag === "Failure") {
@@ -1462,6 +1480,18 @@ export function WorkflowFocusedMap(props: {
   }, [map.nodes, scope, store, view.positions]);
 
   const selected = view.selectedId ? currentNodes[view.selectedId] : undefined;
+  const selectedDetailsKey = selected
+    ? JSON.stringify([
+        props.environmentId,
+        props.projectId,
+        props.planningThreadId ?? null,
+        props.root.repository,
+        props.root.number,
+        selected.repository,
+        selected.id,
+        selected.number,
+      ])
+    : null;
   const selectionHidden = Boolean(view.selectedId && !nodeById.has(view.selectedId));
   const searchQuery = useEnvironmentQuery(
     submittedSearch
@@ -2012,6 +2042,7 @@ export function WorkflowFocusedMap(props: {
         </div>
         {selected ? (
           <WorkflowDetails
+            key={selectedDetailsKey}
             environmentId={props.environmentId}
             projectId={props.projectId}
             {...(props.planningThreadId ? { planningThreadId: props.planningThreadId } : {})}
