@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { fixPath } from "../os-jank.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -31,6 +32,8 @@ interface Fixture {
   readonly statePath: string;
   readonly binDirectory: string;
   readonly ghPath: string;
+  readonly loginShellPath: string;
+  readonly profileShellPath: string;
 }
 
 function run(
@@ -53,6 +56,19 @@ function createFixture(): Fixture {
   const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-workflow-gh-"));
   const statePath = NodePath.join(directory, "state.json");
   const binDirectory = NodePath.join(directory, "bin");
+  const decoyBinDirectory = NodePath.join(directory, "decoy-bin");
+  const profileShellPath = NodePath.join(directory, "profile-shell");
+  NodeFS.mkdirSync(decoyBinDirectory);
+  NodeFS.writeFileSync(
+    NodePath.join(decoyBinDirectory, "gh"),
+    "#!/bin/sh\nprintf '%s\\n' 'gh version 0.0.0 (decoy)'\n",
+    { encoding: "utf8", mode: 0o755 },
+  );
+  NodeFS.writeFileSync(
+    profileShellPath,
+    `#!/bin/sh\nexport PATH='${decoyBinDirectory}:/usr/bin:/bin'\ncase "$1" in\n  -ilc|-lc|-c) exec /bin/sh -c "$2" ;;\n  *) exec /bin/sh "$@" ;;\nesac\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
   const initialized = run(process.execPath, [
     controlPath,
     "init",
@@ -60,6 +76,8 @@ function createFixture(): Fixture {
     statePath,
     "--bin",
     binDirectory,
+    "--shell",
+    profileShellPath,
   ]);
   expect(initialized.status, initialized.stderr).toBe(0);
   expect(JSON.parse(initialized.stdout)).toMatchObject({
@@ -78,6 +96,8 @@ function createFixture(): Fixture {
       binDirectory,
       HostProcessPlatform.defaultValue() === "win32" ? "gh.cmd" : "gh",
     ),
+    loginShellPath: NodePath.join(binDirectory, "login-shell"),
+    profileShellPath,
   };
 }
 
@@ -97,6 +117,19 @@ describe("Workflow GitHub subprocess fixture", () => {
   it("keeps synthetic reads and writes closed, stateful, and recoverable", () => {
     const fixture = createFixture();
     try {
+      const stateBeforeLauncherInstall = NodeFS.readFileSync(fixture.statePath, "utf8");
+      expect(
+        control(
+          fixture,
+          "install-launcher",
+          "--bin",
+          fixture.binDirectory,
+          "--shell",
+          fixture.profileShellPath,
+        ).status,
+      ).toBe(0);
+      expect(NodeFS.readFileSync(fixture.statePath, "utf8")).toBe(stateBeforeLauncherInstall);
+
       expect(gh(fixture, "--version").stdout).toContain("gh version 2.83.0");
       expect(
         JSON.parse(gh(fixture, "auth", "status", "--json", "hosts").stdout).hosts["github.com"][0],
@@ -222,11 +255,13 @@ describe("Workflow GitHub subprocess fixture", () => {
     }
   });
 
-  it.effect("feeds the actual Workflow service through the gh process boundary", () => {
+  it.effect("keeps fixture gh selected through startup hydration", () => {
     const fixture = createFixture();
     const previousPath = process.env.PATH;
+    const previousShell = process.env.SHELL;
     const previousState = process.env.T3_WORKFLOW_FIXTURE_STATE;
     process.env.PATH = fixtureEnv(fixture).PATH;
+    process.env.SHELL = fixture.profileShellPath;
     process.env.T3_WORKFLOW_FIXTURE_STATE = fixture.statePath;
 
     const processLayer = ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer));
@@ -255,6 +290,24 @@ describe("Workflow GitHub subprocess fixture", () => {
     );
 
     return Effect.gen(function* () {
+      if (HostProcessPlatform.defaultValue() !== "win32") {
+        yield* fixPath().pipe(Effect.provide(NodeServices.layer));
+        expect(run("gh", ["--version"], { env: process.env }).stdout).toContain("(decoy)");
+
+        expect(NodeFS.existsSync(fixture.loginShellPath)).toBe(true);
+        process.env.PATH = fixtureEnv(fixture).PATH;
+        process.env.SHELL = fixture.loginShellPath;
+        yield* fixPath().pipe(Effect.provide(NodeServices.layer));
+        expect(run("gh", ["--version"], { env: process.env }).stdout).toContain(
+          "(workflow fixture)",
+        );
+        for (const mode of ["-lc", "-c"] as const) {
+          expect(
+            run(fixture.loginShellPath, [mode, "gh --version"], { env: process.env }).stdout,
+          ).toContain("(workflow fixture)");
+        }
+      }
+
       const service = yield* WorkflowService.WorkflowService;
       const roots = yield* service.roots({
         projectId,
@@ -270,6 +323,19 @@ describe("Workflow GitHub subprocess fixture", () => {
       expect(rootChildren.children.map((child) => child.number)).toEqual(
         expect.arrayContaining([2, 10]),
       );
+
+      const adoptionChildren = yield* service.children({
+        projectId,
+        repository: "fixture/workflow-demo",
+        parentNumber: 700,
+      });
+      expect(adoptionChildren.children.map((child) => child.number)).toEqual([701]);
+      const nestedAdoptionChildren = yield* service.children({
+        projectId,
+        repository: "fixture/workflow-demo",
+        parentNumber: 701,
+      });
+      expect(nestedAdoptionChildren.children.map((child) => child.number)).toEqual([702]);
 
       const largeCapability = yield* service.issueDetail({
         projectId,
@@ -378,12 +444,20 @@ describe("Workflow GitHub subprocess fixture", () => {
         ["scope-change", "superseded", "current", "verified"],
         ["cleared", "current", "current", "verified"],
       ]);
+      expect(
+        (HostProcessPlatform.defaultValue() === "win32"
+          ? gh(fixture, "repo", "delete", "fixture/workflow-demo")
+          : run("gh", ["repo", "delete", "fixture/workflow-demo"], { env: process.env })
+        ).stderr,
+      ).toContain("Fixture denies unsupported gh command");
     }).pipe(
       Effect.provide(workflowLayer),
       Effect.ensuring(
         Effect.sync(() => {
           if (previousPath === undefined) delete process.env.PATH;
           else process.env.PATH = previousPath;
+          if (previousShell === undefined) delete process.env.SHELL;
+          else process.env.SHELL = previousShell;
           if (previousState === undefined) delete process.env.T3_WORKFLOW_FIXTURE_STATE;
           else process.env.T3_WORKFLOW_FIXTURE_STATE = previousState;
           NodeFS.rmSync(fixture.directory, { recursive: true, force: true });

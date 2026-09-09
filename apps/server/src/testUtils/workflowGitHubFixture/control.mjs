@@ -8,6 +8,7 @@ import {
   initialize,
   inspectIssue,
   installLauncher,
+  readState,
   setFailure,
   setOffline,
 } from "./fixture.mjs";
@@ -30,12 +31,27 @@ try {
     const binDirectory = argumentValue(args, "--bin");
     if (!binDirectory) throw new Error("Pass --bin <directory> when initializing the fixture.");
     const summary = initialize(statePath);
-    installLauncher(
+    const launchers = installLauncher(
       binDirectory,
       statePath,
       NodePath.join(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "gh.mjs"),
+      argumentValue(args, "--shell") ?? process.env.SHELL ?? "/bin/sh",
     );
-    process.stdout.write(`${JSON.stringify(summary)}\n`);
+    process.stdout.write(`${JSON.stringify({ ...summary, launchers })}\n`);
+  } else if (command === "install-launcher") {
+    const binDirectory = argumentValue(args, "--bin");
+    const realShellPath = argumentValue(args, "--shell");
+    if (!binDirectory || !realShellPath) {
+      throw new Error("Use install-launcher --bin <directory> --shell <real-shell>.");
+    }
+    readState(statePath);
+    const launchers = installLauncher(
+      binDirectory,
+      statePath,
+      NodePath.join(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "gh.mjs"),
+      realShellPath,
+    );
+    process.stdout.write(`${JSON.stringify({ launchers })}\n`);
   } else if (command === "offline") {
     if (args[1] !== "on" && args[1] !== "off") throw new Error("Use offline on or offline off.");
     setOffline(statePath, args[1] === "on");

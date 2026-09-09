@@ -268,7 +268,7 @@ function buildLargeRepository() {
     number: 700,
     title: "Existing unlabeled delivery branch",
     parent: { repository, number: 1 },
-    children: [701, 702],
+    children: [701],
     body: "## Summary\n\nPreview this branch before adoption.",
   });
   issues[701] = issue({
@@ -450,22 +450,41 @@ export function initialize(statePath) {
   };
 }
 
-export function installLauncher(binDirectory, statePath, ghModulePath) {
+function quotePosixShell(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+export function installLauncher(
+  binDirectory,
+  statePath,
+  ghModulePath,
+  realShellPath,
+  nodePath = process.execPath,
+) {
   NodeFS.mkdirSync(binDirectory, { recursive: true });
   const posixPath = NodePath.join(binDirectory, "gh");
-  const quotedModule = `'${ghModulePath.replaceAll("'", `'\\''`)}'`;
-  const quotedState = `'${statePath.replaceAll("'", `'\\''`)}'`;
+  const quotedModule = quotePosixShell(ghModulePath);
+  const quotedNode = quotePosixShell(nodePath);
+  const quotedState = quotePosixShell(statePath);
   NodeFS.writeFileSync(
     posixPath,
-    `#!/bin/sh\nexport T3_WORKFLOW_FIXTURE_STATE=${quotedState}\nexec node ${quotedModule} "$@"\n`,
+    `#!/bin/sh\nexport T3_WORKFLOW_FIXTURE_STATE=${quotedState}\nexec ${quotedNode} ${quotedModule} "$@"\n`,
     { encoding: "utf8", mode: 0o755 },
   );
   const windowsPath = NodePath.join(binDirectory, "gh.cmd");
   NodeFS.writeFileSync(
     windowsPath,
-    `@echo off\r\nset "T3_WORKFLOW_FIXTURE_STATE=${statePath}"\r\nnode "${ghModulePath}" %*\r\nexit /b %ERRORLEVEL%\r\n`,
+    `@echo off\r\nset "T3_WORKFLOW_FIXTURE_STATE=${statePath}"\r\n"${nodePath}" "${ghModulePath}" %*\r\nexit /b %ERRORLEVEL%\r\n`,
     "utf8",
   );
+  const loginShellPath = NodePath.join(binDirectory, "login-shell");
+  const fixturePath = `${binDirectory}:${NodePath.dirname(nodePath)}`;
+  NodeFS.writeFileSync(
+    loginShellPath,
+    `#!/bin/sh\nreal_shell=${quotePosixShell(realShellPath)}\nfixture_path=${quotePosixShell(fixturePath)}\ncase "$1" in\n  -ilc|-lc|-c)\n    mode=$1\n    command=$2\n    shift 2\n    wrapped_command='export PATH="$T3_WORKFLOW_FIXTURE_PATH:$PATH"; '"$command"\n    T3_WORKFLOW_FIXTURE_PATH="$fixture_path" exec "$real_shell" "$mode" "$wrapped_command" "$@"\n    ;;\n  *) exec "$real_shell" "$@" ;;\nesac\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  return { posixPath, windowsPath, loginShellPath };
 }
 
 function repositoryFor(state, nameWithOwner) {
