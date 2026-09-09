@@ -279,10 +279,10 @@ describe("Workflow GitHub subprocess fixture", () => {
       expect(
         largeCapability.evidence?.records
           .filter((record) => record.kind === "approval")
-          .map((record) => [record.approvalKind, record.scope]),
+          .map((record) => [record.approvalKind, record.scope, record.sourceAccess]),
       ).toEqual([
-        ["specification", "current"],
-        ["ticket-breakdown", "not-applicable"],
+        ["specification", "current", "verified"],
+        ["ticket-breakdown", "not-applicable", "verified"],
       ]);
 
       const slices = yield* service.children({
@@ -324,10 +324,10 @@ describe("Workflow GitHub subprocess fixture", () => {
       expect(
         liveCapability.evidence?.records
           .filter((record) => record.kind === "approval")
-          .map((record) => [record.approvalKind, record.scope]),
+          .map((record) => [record.approvalKind, record.scope, record.sourceAccess]),
       ).toEqual([
-        ["specification", "current"],
-        ["ticket-breakdown", "not-applicable"],
+        ["specification", "current", "verified"],
+        ["ticket-breakdown", "not-applicable", "verified"],
       ]);
       const liveTicket = yield* service.issueDetail({
         projectId,
@@ -342,8 +342,42 @@ describe("Workflow GitHub subprocess fixture", () => {
       expect(
         liveTicket.evidence?.records.find(
           (record) => record.kind === "approval" && record.approvalKind === "ticket-breakdown",
-        )?.scope,
-      ).toBe("current");
+        ),
+      ).toMatchObject({ scope: "current", sourceAccess: "verified" });
+
+      expect(
+        control(
+          fixture,
+          "reassessment",
+          "fixture/workflow-demo",
+          "10",
+          "scope-change",
+          "Outside preparation reopened.",
+        ).status,
+      ).toBe(0);
+      expect(
+        control(
+          fixture,
+          "reassessment",
+          "fixture/workflow-demo",
+          "10",
+          "cleared",
+          "Outside preparation restored.",
+        ).status,
+      ).toBe(0);
+      const reassessedCapability = yield* service.issueDetail({
+        projectId,
+        repository: "fixture/workflow-demo",
+        number: 10,
+      });
+      expect(
+        reassessedCapability.evidence?.records
+          .filter((record) => record.kind === "reassessment")
+          .map((record) => [record.outcome, record.state, record.scope, record.sourceAccess]),
+      ).toEqual([
+        ["scope-change", "superseded", "current", "verified"],
+        ["cleared", "current", "current", "verified"],
+      ]);
     }).pipe(
       Effect.provide(workflowLayer),
       Effect.ensuring(

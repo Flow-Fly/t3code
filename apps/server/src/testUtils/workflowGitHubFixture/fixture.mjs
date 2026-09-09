@@ -20,16 +20,17 @@ function resolutionBody(summary, outcome = "resolved") {
   ].join("\n");
 }
 
-function reassessmentBody(outcome, summary) {
+function reassessmentBody(outcome, summary, sourceUrl, supersededUrls) {
   return [
     "## Reassessment",
     "<!-- t3-workflow:v1 reassessment -->",
-    "Trigger: [Synthetic prerequisite change](https://example.invalid/workflow-fixture/change)",
+    `Trigger: [Synthetic owner evidence](${sourceUrl})`,
     `Outcome: ${outcome}`,
+    ...supersededUrls.map((url) => `Supersedes: ${url}`),
     "### Changes",
     summary,
     "### Evidence",
-    "[Synthetic verification](https://example.invalid/workflow-fixture/reassessment)",
+    `[Synthetic owner evidence](${sourceUrl})`,
   ].join("\n");
 }
 
@@ -66,6 +67,13 @@ function comment(id, body, createdAt = now) {
   };
 }
 
+function commentOnIssue(repository, issueNumber, id, body, createdAt = now) {
+  return {
+    ...comment(id, body, createdAt),
+    url: `https://github.com/${repository}/issues/${issueNumber}#issuecomment-${id}`,
+  };
+}
+
 function issue(input) {
   return {
     databaseId: input.databaseId ?? 10_000 + input.number,
@@ -89,6 +97,20 @@ function issue(input) {
 }
 
 function approvalComments(repository, capabilityNumber, capabilityBody, slices) {
+  const specificationSource = commentOnIssue(
+    repository,
+    capabilityNumber,
+    `${repository.replaceAll("/", "-")}-specification-source`,
+    "I approve this synthetic capability specification for the isolated Workflow exercise.",
+    "2026-09-02T11:55:00.000Z",
+  );
+  const breakdownSource = commentOnIssue(
+    repository,
+    capabilityNumber,
+    `${repository.replaceAll("/", "-")}-breakdown-source`,
+    "I approve this synthetic ticket breakdown for the isolated Workflow exercise.",
+    "2026-09-02T12:00:00.000Z",
+  );
   const specification = comment(
     `${repository.replaceAll("/", "-")}-specification`,
     [
@@ -96,7 +118,7 @@ function approvalComments(repository, capabilityNumber, capabilityBody, slices) 
       "<!-- t3-workflow:v1 approval -->",
       "Kind: specification",
       `Approved by: ${owner}`,
-      "Source: T3 thread `synthetic-planning-thread`, message `synthetic-owner-approval`.",
+      `Source: [Owner specification approval](${specificationSource.url})`,
       "### Approved content",
       capabilityBody,
     ].join("\n"),
@@ -109,7 +131,7 @@ function approvalComments(repository, capabilityNumber, capabilityBody, slices) 
       "<!-- t3-workflow:v1 approval -->",
       "Kind: ticket-breakdown",
       `Approved by: ${owner}`,
-      "Source: T3 thread `synthetic-planning-thread`, message `synthetic-breakdown-approval`.",
+      `Source: [Owner breakdown approval](${breakdownSource.url})`,
       "### Approved content",
       ...slices.flatMap((slice) => [
         "<details>",
@@ -122,7 +144,7 @@ function approvalComments(repository, capabilityNumber, capabilityBody, slices) 
   );
   specification.url = `https://github.com/${repository}/issues/${capabilityNumber}#issuecomment-specification`;
   breakdown.url = `https://github.com/${repository}/issues/${capabilityNumber}#issuecomment-breakdown`;
-  return [specification, breakdown];
+  return [specificationSource, breakdownSource, specification, breakdown];
 }
 
 function buildLargeRepository() {
@@ -369,7 +391,13 @@ function acquireLock(statePath) {
       return lockPath;
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
-      const age = Date.now() - NodeFS.statSync(lockPath).mtimeMs;
+      let age;
+      try {
+        age = Date.now() - NodeFS.statSync(lockPath).mtimeMs;
+      } catch (statError) {
+        if (statError?.code === "ENOENT") continue;
+        throw statError;
+      }
       if (age > STALE_LOCK_MS) {
         throw new Error(
           `Fixture state lock is stale at ${lockPath}. Verify no fixture process is running, then remove that lock directory.`,
@@ -985,17 +1013,43 @@ export function setFailure(statePath, timing, operation) {
 }
 
 export function addReassessment(statePath, repository, number, outcome, summary) {
+  if (outcome !== "scope-change" && outcome !== "cleared") {
+    throw new Error("Reassessment outcome must be scope-change or cleared.");
+  }
   updateState(statePath, (state) => {
     const selected = issueFor(state, repository, number);
+    const supersededUrls =
+      outcome === "cleared"
+        ? selected.comments
+            .filter(
+              (value) =>
+                value.body.includes("<!-- t3-workflow:v1 reassessment -->") &&
+                /^Outcome:\s*scope-change\s*$/imu.test(value.body),
+            )
+            .map((value) => value.url)
+        : [];
+    const latestCreatedAt = Math.max(
+      Date.now(),
+      ...selected.comments.map((value) => Date.parse(value.createdAt)),
+    );
+    state.nextCommentId += 1;
+    const source = commentOnIssue(
+      repository,
+      number,
+      `fixture-${state.nextCommentId}`,
+      `Synthetic owner evidence: ${summary}`,
+      new Date(latestCreatedAt + 1).toISOString(),
+    );
+    selected.comments.push(source);
     state.nextCommentId += 1;
     selected.comments.push(
-      comment(
+      commentOnIssue(
+        repository,
+        number,
         `fixture-${state.nextCommentId}`,
-        reassessmentBody(outcome, summary),
-        new Date().toISOString(),
+        reassessmentBody(outcome, summary, source.url, supersededUrls),
+        new Date(latestCreatedAt + 2).toISOString(),
       ),
     );
-    selected.comments.at(-1).url =
-      `https://github.com/${repository}/issues/${number}#issuecomment-${state.nextCommentId}`;
   });
 }
