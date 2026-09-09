@@ -24,9 +24,16 @@ T3 Code verifies the current specification, every published delivery slice, Astr
 reasoning effort, and the implementation and review skills in a dedicated capability worktree.
 The director and its worktree survive reconnects. **Open director** returns to its thread,
 **Resume** continues confirmed interrupted work, and **Retry setup** recovers setup that was
-recorded but never submitted. A director admits up to ten delivery slices in one batch; blocked
-or failed slices still count, while retries, review, and nested tasks reuse their slice's slot.
-At ten, finish or settle admitted work and wait for a successor before admitting more.
+recorded but never submitted. Resume rechecks the current assignment, approval and readiness before
+sending one continuation. A director admits up to ten delivery slices in one batch; blocked or
+failed slices still count, while retries, review, and nested tasks reuse their slice's slot. At ten,
+Workflow stops new admissions, settles the batch and saves a handoff before starting one successor
+in the same worktree. Blocked or approval-waiting work waits without starting idle successors.
+
+Use **Active work** to find ongoing capabilities and unresolved director, worker and review
+activity in the selected environment. Opening an entry switches to its project and owning T3
+thread, restores that root's Workflow view and shows the new target. If the destination is
+unavailable, the entry stays visible so you can return after the project or thread is restored.
 
 Workflow details show each admitted worker's ticket, write ownership, requested and observed
 model settings, provider state, and reported implementation handoff. An unassociated child or
@@ -36,6 +43,11 @@ ready for review. Write ownership remains reserved until the native worker and e
 descendant close. An idle or finished turn, a handoff alone, or a child with an unknown outcome
 keeps overlapping work held. Later execution or status activity makes stale close evidence
 inapplicable; metadata-only updates preserve it.
+
+Before a successor starts, Workflow checks the saved handoff against current tracker, thread and
+child activity. If earlier work changed after settlement, open the named source thread and inspect
+the new activity. An owner can acknowledge that exact settled state and retry the saved successor;
+new activity makes the acknowledgement stale again.
 
 After a successful implementation handoff, the director registers the agreed checks against the
 exact committed head. Run those commands through Codex normally so any provider approval still
@@ -50,6 +62,18 @@ fresh tracker data, and refreshes the capability frontier. If a write result is 
 resolution stays pending. Retry it to reconcile the same evidence record; Workflow does not infer
 completion from a label or closed issue alone.
 
+When every approved delivery slice is resolved, the director registers the combined acceptance
+commands against the resulting head. Run them through Codex like the ticket checks. Failed checks,
+reopened work, unsettled children or uncertain tracker writes keep the capability open. After the
+matching commands pass, retry any pending evidence write so Workflow can confirm the evidence and
+completed closure from fresh GitHub data.
+
+If a scope or prerequisite change invalidates active work, Workflow holds new starts and asks the
+director and its observed children to stop. Check each child outcome: a stopped director does not
+prove its workers or reviewers stopped. Record a cleared reassessment after the prerequisite is
+restored, or renew the affected approval when scope changed, then choose **Resume**. Refresh alone
+never restarts reassessed work.
+
 If the issue is already assigned, Start holds the new attempt. Arrange an explicit handoff before
 trying again, or use **Take over here** after checking the other environment. Takeover changes the
 GitHub assignment; it does not stop another agent or make the assignment an atomic lock.
@@ -60,8 +84,8 @@ automatically; inspect the original thread and GitHub assignment before taking f
 
 Linked attempts survive server restarts and client reconnects. **Open linked work** returns to the
 preserved thread. **Resume** submits one continuation only when the original turn is durably
-accepted and the linked work is interrupted. **Start fresh** creates a new thread while retaining
-the previous attempt and thread history. Actions that start or continue work refresh the target
-project, readiness, provider and required skills first.
+accepted, the linked work is interrupted and its GitHub assignment still matches. **Start fresh**
+creates a new thread while retaining the previous attempt and thread history. Actions that start or
+continue work refresh the target project, readiness, provider and required skills first.
 
 Other providers can browse Workflow, but this launch flow currently uses Codex.
