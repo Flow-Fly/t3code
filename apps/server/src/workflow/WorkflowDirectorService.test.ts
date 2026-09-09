@@ -2955,7 +2955,7 @@ describe("WorkflowDirectorService", () => {
           test.dispatch,
         );
         resumeThreadId = started.director.threadId;
-        yield* seedDirectorProviderIdentity(sql, started.director.directorId);
+        yield* seedProjectedDirectorProviderIdentity(sql, started.director.directorId);
         yield* recordWorkflowWorkerObservation({
           type: "turn.started",
           eventId: EventId.make("director-native-running"),
@@ -3793,6 +3793,7 @@ describe("workflowTicketResolutionBody", () => {
             label: "focused tests",
             command: "vp test run focused.test.ts",
             toolCallId: "tool-1",
+            candidateToolCallIds: [],
             exitCode: 0,
             output: "passed",
             startedHead: "b".repeat(40),
@@ -3893,7 +3894,23 @@ function claimTicket(
   Object.assign(detail, reinterpretTicket(detail, approvalComments, { assignees: ["Flow-Fly"] }));
 }
 
-function seedDirectorProviderIdentity(sql: SqlClient.SqlClient, directorId: string) {
+function seedDirectorNativeIdentity(sql: SqlClient.SqlClient, directorId: string) {
+  return sql`
+    INSERT INTO workflow_director_native_turns (
+      director_id, native_session_id, native_turn_id, status, updated_at
+    ) VALUES (
+      ${directorId}, 'provider-director', 'provider-director-turn', 'running',
+      '2026-09-07T09:00:00.000Z'
+    )
+    ON CONFLICT(director_id) DO UPDATE SET
+      native_session_id = excluded.native_session_id,
+      native_turn_id = excluded.native_turn_id,
+      status = excluded.status,
+      updated_at = excluded.updated_at
+  `;
+}
+
+function seedProjectedDirectorProviderIdentity(sql: SqlClient.SqlClient, directorId: string) {
   return sql`
     INSERT INTO projection_thread_sessions (
       thread_id, status, provider_name, provider_session_id, provider_thread_id,
@@ -3939,7 +3956,7 @@ function seedReportedReview(
   const specId = `spec-${input.suffix}`;
   const createdAt = input.createdAt ?? "2026-09-07T09:03:00.000Z";
   return Effect.gen(function* () {
-    yield* seedDirectorProviderIdentity(sql, input.directorId);
+    yield* seedDirectorNativeIdentity(sql, input.directorId);
     if (!input.admissionId) {
       yield* sql`
         INSERT INTO workflow_director_admissions (
@@ -4301,6 +4318,17 @@ describe("delivery ticket review resolution", () => {
             cwd: started.director.worktreePath,
             ...scenario,
           });
+          if (scenario.suffix === "success") {
+            const pending = yield* service.status({
+              projectId,
+              repository,
+              capabilityNumber: 17,
+            });
+            expect(
+              pending.reviews?.find((review) => review.reviewId === seeded.reviewId)?.checks[0]
+                ?.candidateToolCallIds,
+            ).toEqual(["native-success"]);
+          }
           outcomes.push(
             yield* workflowDirectorHandlers
               .workflow_record_review_checks({
@@ -4340,6 +4368,21 @@ describe("delivery ticket review resolution", () => {
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(prepared.disposition).toBe("held");
         expect(prepared.review.status).toBe("checks-failed");
+        yield* observeReviewCheck({
+          threadId: started.director.threadId,
+          toolCallId: "native-exit-retry",
+          cwd: started.director.worktreePath,
+          exitCode: 0,
+        });
+        const retryStatus = yield* service.status({
+          projectId,
+          repository,
+          capabilityNumber: 17,
+        });
+        expect(
+          retryStatus.reviews?.find((review) => review.reviewId === failedExit.success.reviewId)
+            ?.checks[0]?.candidateToolCallIds,
+        ).toEqual(["native-exit-retry"]);
         const resolve = yield* workflowDirectorHandlers
           .workflow_resolve_ticket({ reviewId: failedExit.success.reviewId })
           .pipe(
@@ -4542,8 +4585,8 @@ describe("delivery ticket review resolution", () => {
           .pipe(Effect.provideService(McpInvocationContext.McpInvocationContext, invocation));
         expect(disposed.findings[0]?.disposition?.outcome).toBe("dismissed");
         yield* sql`
-          UPDATE projection_thread_sessions SET provider_thread_id = 'changed-director-root'
-          WHERE thread_id = ${started.director.threadId}
+          UPDATE workflow_director_native_turns SET native_session_id = 'changed-director-root'
+          WHERE director_id = ${started.director.directorId}
         `;
         const changedDirectorIdentity = yield* workflowDirectorHandlers
           .workflow_resolve_ticket({ reviewId: reported.reviewId })
@@ -4553,8 +4596,8 @@ describe("delivery ticket review resolution", () => {
           );
         expect(changedDirectorIdentity._tag).toBe("Failure");
         yield* sql`
-          UPDATE projection_thread_sessions SET provider_thread_id = 'provider-director'
-          WHERE thread_id = ${started.director.threadId}
+          UPDATE workflow_director_native_turns SET native_session_id = 'provider-director'
+          WHERE director_id = ${started.director.directorId}
         `;
         const handlerResolution = yield* workflowDirectorHandlers
           .workflow_resolve_ticket({ reviewId: reported.reviewId })
@@ -4602,7 +4645,7 @@ describe("delivery ticket review resolution", () => {
       );
       const ticket = fixture.ticketDetails[0]!;
       const sql = yield* SqlClient.SqlClient;
-      yield* seedDirectorProviderIdentity(sql, started.director.directorId);
+      yield* seedDirectorNativeIdentity(sql, started.director.directorId);
       const invocation: McpInvocationContext.McpInvocationScope = {
         environmentId,
         threadId: started.director.threadId,
@@ -5509,6 +5552,11 @@ describe("capability combined acceptance", () => {
               },
             ]);
             yield* ingestion.drain;
+            const candidate = yield* complete([]);
+            expect(candidate.completion.checks[0]?.candidateToolCallIds).toEqual([
+              "combined-tool-call",
+            ]);
+            expect(candidate.completion.requiredAction).toContain("candidateToolCallIds");
             const completedResult = yield* complete([
               { label: "combined", toolCallId: "combined-tool-call" },
             ]);
@@ -5601,7 +5649,11 @@ describe("capability combined acceptance", () => {
         status: "checks-failed",
         authority: "historical",
       });
-      expect(failed.completion.checks[0]).toMatchObject({ status: "failed", exitCode: 1 });
+      expect(failed.completion.checks[0]).toMatchObject({
+        status: "failed",
+        exitCode: 1,
+        candidateToolCallIds: [],
+      });
       expect(fixture.capability.state).toBe("open");
       expect(trackerWrites).toBe(0);
 

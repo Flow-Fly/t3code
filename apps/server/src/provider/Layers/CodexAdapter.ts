@@ -1122,6 +1122,9 @@ function mapCollabAgentEvent(
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     ...(agentPath ? { agentPath } : {}),
+    ...(typeof payload.parentThreadId === "string"
+      ? { parentAgentId: payload.parentThreadId }
+      : {}),
     timelineBypass: true,
     ...(nativeTurn ? { nativeTurn } : {}),
     ...(nativeInterruption ? { nativeInterruption } : {}),
@@ -1148,9 +1151,6 @@ function mapCollabAgentEvent(
             description: title,
             title,
             ...linkage,
-            ...(typeof payload.parentThreadId === "string"
-              ? { parentAgentId: payload.parentThreadId }
-              : {}),
           },
         },
       ];

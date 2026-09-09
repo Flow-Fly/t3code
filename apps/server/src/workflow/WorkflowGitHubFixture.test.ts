@@ -4,6 +4,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProjectId, type OrchestrationProjectShell } from "@t3tools/contracts";
@@ -27,6 +28,7 @@ const fixtureDirectory = NodePath.resolve(
   "../testUtils/workflowGitHubFixture",
 );
 const controlPath = NodePath.join(fixtureDirectory, "control.mjs");
+const fixtureModuleUrl = NodeURL.pathToFileURL(NodePath.join(fixtureDirectory, "fixture.mjs")).href;
 const projectId = ProjectId.make("project-1");
 
 interface Fixture {
@@ -155,6 +157,33 @@ async function killLockHolder(child: NodeChildProcess.ChildProcess) {
   await exited;
 }
 
+async function startPausedFixtureLockStep(source: string) {
+  const child = NodeChildProcess.spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stderr = "";
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  await new Promise<void>((resolve, reject) => {
+    const onExit = (code: number | null) => {
+      reject(new Error(`Fixture lock step exited ${code}: ${stderr}`));
+    };
+    child.once("exit", onExit);
+    child.stdout.once("data", () => {
+      child.off("exit", onExit);
+      resolve();
+    });
+  });
+  return child;
+}
+
 describe("Workflow GitHub subprocess fixture", () => {
   it("keeps synthetic reads and writes closed, stateful, and recoverable", async () => {
     const fixture = createFixture();
@@ -182,8 +211,27 @@ describe("Workflow GitHub subprocess fixture", () => {
       expect(NodeFS.existsSync(lockPath)).toBe(true);
       NodeFS.rmdirSync(lockPath);
 
+      const beforePublish = await startPausedFixtureLockStep(`
+        const fixture = await import(${JSON.stringify(fixtureModuleUrl)});
+        fixture.acquireFixtureStateLock(${JSON.stringify(fixture.statePath)}, {
+          beforePublish() {
+            process.stdout.write("ready\\n");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+          },
+        });
+      `);
+      await killLockHolder(beforePublish);
+      expect(NodeFS.existsSync(lockPath)).toBe(false);
+      for (const entry of NodeFS.readdirSync(fixture.directory)) {
+        if (entry.startsWith("state.json.lock.candidate-")) {
+          NodeFS.rmSync(NodePath.join(fixture.directory, entry), { force: true });
+        }
+      }
+
       const held = await startLockHolder(fixture);
       lockHolder = held.child;
+      expect(NodeFS.lstatSync(lockPath).isFile()).toBe(true);
+      expect(JSON.parse(NodeFS.readFileSync(lockPath, "utf8"))).toMatchObject(held.owner);
       NodeFS.utimesSync(lockPath, 0, 0);
       const liveOwnerAttempt = gh(fixture, "--version");
       expect(liveOwnerAttempt.status).not.toBe(0);
@@ -193,19 +241,45 @@ describe("Workflow GitHub subprocess fixture", () => {
       lockHolder = undefined;
       expect(gh(fixture, "--version").stdout).toContain("gh version 2.83.0");
 
+      const abandoned = await startLockHolder(fixture);
+      await killLockHolder(abandoned.child);
+      const recoveryPath = `${lockPath}.recovery`;
+      const pausedRecovery = await startPausedFixtureLockStep(`
+        const fixture = await import(${JSON.stringify(fixtureModuleUrl)});
+        fixture.tryRecoverFixtureStateLock(
+          ${JSON.stringify(fixture.statePath)},
+          ${JSON.stringify(abandoned.owner)},
+          {
+            afterRecoveryGuardPublish() {
+              process.stdout.write("ready\\n");
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+            },
+          },
+        );
+      `);
+      await killLockHolder(pausedRecovery);
+      expect(NodeFS.lstatSync(recoveryPath).isFile()).toBe(true);
+      expect(JSON.parse(NodeFS.readFileSync(recoveryPath, "utf8"))).toMatchObject({
+        pid: pausedRecovery.pid,
+      });
+      expect(FixtureState.tryRecoverFixtureStateLock(fixture.statePath, abandoned.owner)).toBe(
+        false,
+      );
+      NodeFS.unlinkSync(recoveryPath);
+      expect(gh(fixture, "--version").stdout).toContain("gh version 2.83.0");
+
       const successor = FixtureState.acquireFixtureStateLock(fixture.statePath);
       try {
-        const recoveryPath = `${lockPath}.recovery`;
         NodeFS.mkdirSync(recoveryPath);
         expect(FixtureState.tryRecoverFixtureStateLock(fixture.statePath, held.owner)).toBe(false);
-        expect(
-          JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8")),
-        ).toMatchObject({ token: successor.owner.token });
+        expect(JSON.parse(NodeFS.readFileSync(lockPath, "utf8"))).toMatchObject({
+          token: successor.owner.token,
+        });
         NodeFS.rmdirSync(recoveryPath);
         expect(FixtureState.tryRecoverFixtureStateLock(fixture.statePath, held.owner)).toBe(false);
-        expect(
-          JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8")),
-        ).toMatchObject({ token: successor.owner.token });
+        expect(JSON.parse(NodeFS.readFileSync(lockPath, "utf8"))).toMatchObject({
+          token: successor.owner.token,
+        });
       } finally {
         FixtureState.releaseFixtureStateLock(successor);
       }

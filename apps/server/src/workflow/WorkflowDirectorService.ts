@@ -787,10 +787,10 @@ export function workflowDirectorInstructions(input: {
     "",
     "Before every implementation delegation, call the host workflow_prepare_worker MCP tool with the durable ticket number, a plain ownership summary, and exact repository-relative write paths. It persists readiness, admission, slot and ownership before returning native spawn instructions.",
     "After native spawn, call workflow_associate_worker with the returned token and exact child provider thread id. When the child returns, call workflow_report_worker_handoff with its result, commits and checks. Provider idle or a finished turn is not a handoff, ticket resolution or proof that descendants settled.",
-    "After a successful implementation handoff, immediately call workflow_prepare_ticket_review with the fixed base, exact final implementation head and agreed command checks. Run its registered checks through the normal Codex command and approval path, bind their exact native item ids with workflow_record_review_checks, then repeat preparation. The host never runs those checks for you.",
+    "After a successful implementation handoff, immediately call workflow_prepare_ticket_review with the fixed base, exact final implementation head and agreed command checks. Run its registered checks through the normal Codex command and approval path, repeat preparation to read candidateToolCallIds, bind those exact native item ids with workflow_record_review_checks, then repeat preparation. The host never runs those checks for you.",
     "Use the prepared instructions to spawn one fresh Astra/medium $code-review coordinator, associate its exact child identity with workflow_associate_ticket_review, and require it to delegate fresh independent Standards and Spec axes. Report the coordinator and both exact axis identities with workflow_report_ticket_review.",
     "Validate every reported finding against the source. Record each director judgment separately with workflow_record_review_dispositions. A fixed finding cites the later fresh review of its changed head. For owner acceptance, first send a readable decision prompt that includes the returned review and finding references, then cite the owner's exact user reply. Close the implementation and review child trees natively, then call workflow_resolve_ticket; retry a pending result so its stable GitHub evidence and closure can reconcile before treating the ticket as resolved.",
-    "After every approved ticket and nested task has current resolution evidence and every native child is closed, call workflow_complete_capability with the exact clean result head, the combined acceptance commands, and no receipts. Run those registered commands through the normal provider path, then repeat the call with each exact native toolCallId. Retry pending tracker results so saved comment, close, or compensating reopen intent can reconcile; only completed/current is present completion authority.",
+    "After every approved ticket and nested task has current resolution evidence and every native child is closed, call workflow_complete_capability with the exact clean result head, the combined acceptance commands, and no receipts. Run those registered commands through the normal provider path, repeat the call without receipts to read candidateToolCallIds, then repeat it with each exact native toolCallId. Retry pending tracker results so saved comment, close, or compensating reopen intent can reconcile; only completed/current is present completion authority.",
     `This batch admits at most ${ADMISSION_LIMIT} distinct delivery slices. Failed or blocked admitted slices keep their slot; retry and review reuse it; nested tasks reuse their parent slice. At the limit, stop new admissions, finish or exactly interrupt admitted child work, call workflow_prepare_director_handoff with useful lessons, unresolved context, and suggested skills/staffing, then settle this turn. T3 persists and verifies the handoff before starting a successor.`,
     "Re-read live tracker state before each admission. Do not infer approval from labels, assignment, closure, silence or unavailable evidence.",
     "GitHub assignment is observational and is not a cross-environment atomic lock.",
@@ -2521,16 +2521,16 @@ export const make = Effect.gen(function* () {
     implementationProviderThreadId: string,
   ) {
     const directorIdentities = yield* persistence(
-      sql<{ readonly providerThreadId: string | null }>`
-        SELECT provider_thread_id AS "providerThreadId"
-        FROM projection_thread_sessions
-        WHERE thread_id = ${row.threadId}
-          AND provider_instance_id = ${row.requestedInstanceId}
-        LIMIT 1
+      sql<{ readonly providerThreadId: string }>`
+        SELECT native_session_id AS "providerThreadId"
+        FROM workflow_director_native_turns
+        WHERE director_id = ${row.directorId}
+        LIMIT 2
       `,
       "The director's native provider identity could not be read.",
     );
-    const directorProviderThreadId = directorIdentities[0]?.providerThreadId;
+    const directorProviderThreadId =
+      directorIdentities.length === 1 ? directorIdentities[0]?.providerThreadId : undefined;
     if (!directorProviderThreadId) {
       return yield* directorError(
         "review-incomplete",
@@ -2569,6 +2569,52 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const nativeToolCallCandidates = Effect.fn("WorkflowDirectorService.nativeToolCallCandidates")(
+    function* (directorId: string, check: CheckRow | CompletionCheckRow, includeFailed: boolean) {
+      if (check.verificationStatus === "passed") return [];
+      if (check.verificationStatus === "failed" && !includeFailed) return [];
+      const rows = yield* persistence(
+        sql<{ readonly toolCallId: string }>`
+        SELECT started.tool_call_id AS "toolCallId"
+        FROM workflow_native_command_observations started
+        JOIN workflow_native_command_observations completed
+          ON completed.thread_id = started.thread_id
+          AND completed.provider_instance_id = started.provider_instance_id
+          AND completed.tool_call_id = started.tool_call_id
+          AND completed.lifecycle = 'completed'
+        JOIN workflow_directors d
+          ON d.thread_id = started.thread_id
+          AND d.requested_instance_id = started.provider_instance_id
+        WHERE d.director_id = ${directorId}
+          AND d.is_current = 1
+          AND started.lifecycle = 'started'
+          AND started.command = ${check.command}
+          AND completed.command = ${check.command}
+          AND started.cwd = d.worktree_path
+          AND completed.cwd = d.worktree_path
+          AND started.created_at > ${check.createdAt}
+          AND completed.created_at >= started.created_at
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_review_checks bound
+            WHERE bound.thread_id = started.thread_id
+              AND bound.provider_instance_id = started.provider_instance_id
+              AND bound.tool_call_id = started.tool_call_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_capability_checks bound
+            WHERE bound.thread_id = started.thread_id
+              AND bound.provider_instance_id = started.provider_instance_id
+              AND bound.tool_call_id = started.tool_call_id
+          )
+        ORDER BY completed.created_at DESC, started.tool_call_id DESC
+        LIMIT 3
+      `,
+        "Native command receipt candidates could not be read.",
+      );
+      return rows.map((candidate) => candidate.toolCallId);
+    },
+  );
+
   const reviewStatusFromRow = Effect.fn("WorkflowDirectorService.reviewStatusFromRow")(function* (
     row: ReviewRow,
   ): Effect.fn.Return<WorkflowTicketReviewStatus, WorkflowDirectorError> {
@@ -2597,21 +2643,24 @@ export const make = Effect.gen(function* () {
         directorError("persistence-failed", "Review check evidence is invalid.", String(error)),
       ),
     );
-    const checks = checkRows.map((check) => {
-      return {
-        label: check.label,
-        command: check.command,
-        toolCallId: check.toolCallId,
-        exitCode: check.exitCode,
-        output: check.output,
-        startedHead: check.startedHead,
-        finishedHead: check.finishedHead,
-        startedClean: check.startedClean === 1,
-        finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
-        status: check.verificationStatus as "pending" | "passed" | "failed",
-        verificationError: check.verificationError,
-      };
-    });
+    const checks = yield* Effect.forEach(checkRows, (check) =>
+      Effect.gen(function* () {
+        return {
+          label: check.label,
+          command: check.command,
+          toolCallId: check.toolCallId,
+          candidateToolCallIds: yield* nativeToolCallCandidates(row.directorId, check, true),
+          exitCode: check.exitCode,
+          output: check.output,
+          startedHead: check.startedHead,
+          finishedHead: check.finishedHead,
+          startedClean: check.startedClean === 1,
+          finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
+          status: check.verificationStatus as "pending" | "passed" | "failed",
+          verificationError: check.verificationError,
+        };
+      }),
+    );
     const rawAxes = yield* persistence(
       sql<{ readonly axis: string; readonly providerThreadId: string }>`
           SELECT axis, provider_thread_id AS "providerThreadId"
@@ -2857,19 +2906,24 @@ export const make = Effect.gen(function* () {
 
   const completionStatusFromRow = Effect.fn("WorkflowDirectorService.completionStatusFromRow")(
     function* (row: CompletionRow, authority: WorkflowCapabilityCompletionStatus["authority"]) {
-      const checks = (yield* completionChecks(row.completionId)).map((check) => ({
-        label: check.label,
-        command: check.command,
-        toolCallId: check.toolCallId,
-        exitCode: check.exitCode,
-        output: check.output,
-        startedHead: check.startedHead,
-        finishedHead: check.finishedHead,
-        startedClean: check.startedClean === 1,
-        finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
-        status: check.verificationStatus as "pending" | "passed" | "failed",
-        verificationError: check.verificationError,
-      }));
+      const checks = yield* Effect.forEach(yield* completionChecks(row.completionId), (check) =>
+        Effect.gen(function* () {
+          return {
+            label: check.label,
+            command: check.command,
+            toolCallId: check.toolCallId,
+            candidateToolCallIds: yield* nativeToolCallCandidates(row.directorId, check, false),
+            exitCode: check.exitCode,
+            output: check.output,
+            startedHead: check.startedHead,
+            finishedHead: check.finishedHead,
+            startedClean: check.startedClean === 1,
+            finishedClean: check.finishedClean === null ? null : check.finishedClean === 1,
+            status: check.verificationStatus as "pending" | "passed" | "failed",
+            verificationError: check.verificationError,
+          };
+        }),
+      );
       return {
         completionId: row.completionId,
         resultingHead: row.resultingHead,
@@ -7542,7 +7596,7 @@ export const make = Effect.gen(function* () {
                       ...review.checks
                         .filter((check) => check.status !== "passed")
                         .map((check) => `- ${check.label}: ${check.command}`),
-                      `Then call workflow_record_review_checks for review ${review.reviewId} with each exact native toolCallId, and repeat workflow_prepare_ticket_review.`,
+                      `Repeat workflow_prepare_ticket_review to read candidateToolCallIds, then call workflow_record_review_checks for review ${review.reviewId} with each exact native toolCallId and repeat preparation.`,
                     ].join("\n"),
           review,
         } satisfies WorkflowTicketReviewPrepareResult;
@@ -7615,7 +7669,7 @@ export const make = Effect.gen(function* () {
         instructions: [
           "Run each registered check through the normal Codex command path and approve it according to the provider policy.",
           ...input.checks.map((check) => `- ${check.label}: ${check.command}`),
-          `Then call workflow_record_review_checks for review ${reviewId} with each exact native toolCallId, and repeat workflow_prepare_ticket_review.`,
+          `Repeat workflow_prepare_ticket_review to read candidateToolCallIds, then call workflow_record_review_checks for review ${reviewId} with each exact native toolCallId and repeat preparation.`,
         ].join("\n"),
         review,
       } satisfies WorkflowTicketReviewPrepareResult;
@@ -9065,7 +9119,7 @@ export const make = Effect.gen(function* () {
               ${completionId}, ${director.directorId}, ${director.repository},
               ${director.capabilityNumber}, ${input.resultingHead},
               ${gate.specificationFingerprint}, ${gate.breakdownFingerprint}, ${commentBody},
-              'checks-pending', 'Run every registered combined acceptance command through the native provider path, then bind its exact receipt.',
+              'checks-pending', 'Run every registered combined acceptance command through the native provider path, repeat workflow_complete_capability without receipts to read candidateToolCallIds, then bind each exact native receipt.',
               ${createdAt}, ${createdAt}
             )`;
               yield* Effect.forEach(

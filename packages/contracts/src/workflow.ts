@@ -532,6 +532,7 @@ export const WorkflowReviewCheck = Schema.Struct({
   label: TrimmedNonEmptyString,
   command: TrimmedNonEmptyString,
   toolCallId: Schema.NullOr(TrimmedNonEmptyString),
+  candidateToolCallIds: Schema.Array(TrimmedNonEmptyString),
   exitCode: Schema.NullOr(Schema.Number),
   output: Schema.String,
   startedHead: TrimmedNonEmptyString,

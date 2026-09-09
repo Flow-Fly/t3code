@@ -21,6 +21,18 @@ type CommandEvent = Extract<
   { readonly type: "item.started" | "item.completed" }
 >;
 
+const literalPosixShells = ["/bin/zsh", "/bin/bash", "/bin/sh"] as const;
+
+function quotePosixLiteral(command: string) {
+  return `'${command.replaceAll("'", "'\\''")}'`;
+}
+
+function matchesRegisteredCommand(observed: string, registered: string) {
+  if (observed === registered) return true;
+  const literal = quotePosixLiteral(registered);
+  return literalPosixShells.some((shell) => observed === `${shell} -c ${literal}`);
+}
+
 /** Retains compact native command evidence with its provider session identity. */
 export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservation.record")(
   function* (event: CommandEvent) {
@@ -96,14 +108,11 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
           )
         )
     `;
-    const active = yield* sql<{
-      readonly eligible: number;
-      readonly registered: number;
+    const registeredRows = yield* sql<{
+      readonly command: string;
+      readonly registeredAt: string;
     }>`
-    SELECT COUNT(*) AS registered,
-      COUNT(CASE WHEN ${event.createdAt} > candidate.registered_at THEN 1 END) AS eligible
-    FROM (
-      SELECT c.created_at AS registered_at
+      SELECT c.command, c.created_at AS "registeredAt"
       FROM workflow_directors d
       JOIN workflow_ticket_reviews r ON r.director_id = d.director_id
       JOIN workflow_review_checks c ON c.review_id = r.review_id
@@ -111,7 +120,6 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
         AND d.requested_instance_id = ${event.providerInstanceId}
         AND d.is_current = 1
         AND c.verification_status <> 'passed'
-        AND c.command = ${item.command}
         AND d.worktree_path = ${cwd}
         AND NOT EXISTS (
           SELECT 1 FROM workflow_ticket_reviews newer
@@ -123,7 +131,7 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
             )
         )
       UNION ALL
-      SELECT c.created_at AS registered_at
+      SELECT c.command, c.created_at AS "registeredAt"
       FROM workflow_directors d
       JOIN workflow_capability_completions completion
         ON completion.director_id = d.director_id
@@ -133,13 +141,20 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
         AND d.is_current = 1
         AND completion.status IN ('checks-pending', 'checks-failed')
         AND c.verification_status <> 'passed'
-        AND c.command = ${item.command}
         AND d.worktree_path = ${cwd}
-    ) candidate
-  `;
-    const registered = active[0]?.registered ?? 0;
-    const eligible = active[0]?.eligible ?? 0;
-    if (eligible === 0) return;
+    `;
+    const matchingRows = registeredRows.filter((candidate) =>
+      matchesRegisteredCommand(item.command, candidate.command),
+    );
+    const matchingCommands = new Set(matchingRows.map((candidate) => candidate.command));
+    if (
+      matchingCommands.size !== 1 ||
+      !matchingRows.some((candidate) => event.createdAt > candidate.registeredAt)
+    ) {
+      return;
+    }
+    const command = matchingRows[0]!.command;
+    const registered = matchingRows.length;
     if (event.type === "item.completed") {
       const started = yield* sql<{ readonly observed: number }>`
         SELECT 1 AS observed FROM workflow_native_command_observations
@@ -147,7 +162,7 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
           AND provider_instance_id = ${event.providerInstanceId}
           AND tool_call_id = ${event.itemId}
           AND lifecycle = 'started'
-          AND command = ${item.command}
+          AND command = ${command}
           AND cwd = ${cwd}
         LIMIT 1
       `;
@@ -159,7 +174,7 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
         status, exit_code, output, created_at
       ) VALUES (
         ${event.threadId}, ${event.providerInstanceId}, ${event.itemId},
-        ${event.type === "item.started" ? "started" : "completed"}, ${item.command},
+        ${event.type === "item.started" ? "started" : "completed"}, ${command},
         ${cwd}, ${event.payload.status ?? item.status ?? null},
         ${item.exitCode ?? null}, ${(item.aggregatedOutput ?? "").slice(-4_000)}, ${event.createdAt}
       )
@@ -179,14 +194,14 @@ export const recordWorkflowCheckObservation = Effect.fn("WorkflowCheckObservatio
         DELETE FROM workflow_native_command_observations
         WHERE thread_id = ${event.threadId}
           AND provider_instance_id = ${event.providerInstanceId}
-          AND command = ${item.command}
+          AND command = ${command}
           AND cwd = ${cwd}
           AND tool_call_id IN (
             SELECT candidate.tool_call_id
             FROM workflow_native_command_observations candidate
             WHERE candidate.thread_id = ${event.threadId}
               AND candidate.provider_instance_id = ${event.providerInstanceId}
-              AND candidate.command = ${item.command}
+              AND candidate.command = ${command}
               AND candidate.cwd = ${cwd}
               AND NOT EXISTS (
                 SELECT 1 FROM workflow_review_checks bound

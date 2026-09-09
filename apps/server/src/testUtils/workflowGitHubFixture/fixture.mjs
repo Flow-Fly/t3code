@@ -383,9 +383,33 @@ function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
+function newLockOwner() {
+  return {
+    pid: process.pid,
+    token: NodeCrypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function publishLockOwner(lockPath, owner, beforePublish) {
+  const candidatePath = `${lockPath}.candidate-${owner.pid}-${owner.token}`;
+  NodeFS.writeFileSync(candidatePath, `${JSON.stringify(owner)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    beforePublish?.();
+    NodeFS.linkSync(candidatePath, lockPath);
+  } finally {
+    NodeFS.rmSync(candidatePath, { force: true });
+  }
+}
+
 function readLockOwner(lockPath) {
   try {
-    const value = JSON.parse(NodeFS.readFileSync(NodePath.join(lockPath, "owner.json"), "utf8"));
+    const stat = NodeFS.lstatSync(lockPath);
+    const ownerPath = stat.isDirectory() ? NodePath.join(lockPath, "owner.json") : lockPath;
+    const value = JSON.parse(NodeFS.readFileSync(ownerPath, "utf8"));
     if (
       typeof value?.pid !== "number" ||
       !Number.isInteger(value.pid) ||
@@ -403,6 +427,18 @@ function readLockOwner(lockPath) {
   }
 }
 
+function releaseLockOwner(lockPath, owner) {
+  const currentOwner = readLockOwner(lockPath);
+  if (currentOwner?.token !== owner.token) return false;
+  try {
+    NodeFS.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -413,17 +449,19 @@ function processIsAlive(pid) {
   }
 }
 
-export function tryRecoverFixtureStateLock(statePath, expectedOwner) {
+export function tryRecoverFixtureStateLock(statePath, expectedOwner, hooks = {}) {
   const lockPath = `${statePath}.lock`;
   const recoveryPath = `${lockPath}.recovery`;
+  const recoveryOwner = newLockOwner();
   try {
-    NodeFS.mkdirSync(recoveryPath);
+    publishLockOwner(recoveryPath, recoveryOwner, hooks.beforeRecoveryGuardPublish);
   } catch (error) {
     if (error?.code === "EEXIST") return false;
     throw error;
   }
 
   try {
+    hooks.afterRecoveryGuardPublish?.();
     const currentOwner = readLockOwner(lockPath);
     if (
       currentOwner === null ||
@@ -433,41 +471,32 @@ export function tryRecoverFixtureStateLock(statePath, expectedOwner) {
       return false;
     }
 
-    const abandonedPath = `${lockPath}.abandoned-${currentOwner.token}`;
     try {
-      NodeFS.renameSync(lockPath, abandonedPath);
+      if (NodeFS.lstatSync(lockPath).isDirectory()) {
+        const abandonedPath = `${lockPath}.abandoned-${currentOwner.token}`;
+        NodeFS.renameSync(lockPath, abandonedPath);
+        NodeFS.rmSync(abandonedPath, { recursive: true, force: true });
+      } else {
+        NodeFS.unlinkSync(lockPath);
+      }
     } catch (error) {
       if (error?.code === "ENOENT") return false;
       throw error;
     }
-    NodeFS.rmSync(abandonedPath, { recursive: true, force: true });
     return true;
   } finally {
-    NodeFS.rmdirSync(recoveryPath);
+    releaseLockOwner(recoveryPath, recoveryOwner);
   }
 }
 
-export function acquireFixtureStateLock(statePath) {
+export function acquireFixtureStateLock(statePath, hooks = {}) {
   const lockPath = `${statePath}.lock`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   while (true) {
+    const owner = newLockOwner();
     try {
-      NodeFS.mkdirSync(lockPath);
-      const owner = {
-        pid: process.pid,
-        token: NodeCrypto.randomUUID(),
-        createdAt: new Date().toISOString(),
-      };
-      try {
-        NodeFS.writeFileSync(
-          NodePath.join(lockPath, "owner.json"),
-          `${JSON.stringify(owner)}\n`,
-          "utf8",
-        );
-      } catch (error) {
-        NodeFS.rmSync(lockPath, { recursive: true, force: true });
-        throw error;
-      }
+      publishLockOwner(lockPath, owner, hooks.beforePublish);
+      hooks.afterPublish?.();
       return { path: lockPath, owner };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
@@ -488,7 +517,7 @@ export function acquireFixtureStateLock(statePath) {
       }
       if (lockOwner === null && age > STALE_LOCK_MS) {
         throw new Error(
-          `Fixture state lock is stale at ${lockPath}. Verify no fixture process is running, then remove that lock directory.`,
+          `Fixture state lock is stale at ${lockPath}. Verify no fixture process is running, then remove that lock.`,
           { cause: error },
         );
       }
@@ -504,10 +533,7 @@ export function acquireFixtureStateLock(statePath) {
 }
 
 export function releaseFixtureStateLock(lock) {
-  const currentOwner = readLockOwner(lock.path);
-  if (currentOwner?.token !== lock.owner.token) return false;
-  NodeFS.rmSync(lock.path, { recursive: true });
-  return true;
+  return releaseLockOwner(lock.path, lock.owner);
 }
 
 function saveState(statePath, state) {

@@ -15,7 +15,7 @@ import { recordWorkflowCheckObservation } from "./WorkflowCheckObservation.ts";
 const layer = it.layer(SqlitePersistenceMemory);
 
 layer("WorkflowCheckObservation", (it) => {
-  it.effect("retains compact native completion through exact start replay", () =>
+  it.effect("retains compact native completion through a literal shell wrapper", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`
@@ -70,7 +70,7 @@ layer("WorkflowCheckObservation", (it) => {
           review_id, label, command, output, started_head, started_clean,
           verification_status, created_at, updated_at
         ) VALUES (
-          'review', 'focused', 'vp test run focused.test.ts', '', 'head', 1,
+          'review', 'focused', '/tmp/node/bin/node --test test/check-summary.test.mjs', '', 'head', 1,
           'pending', '2026-09-07T09:30:00.000Z', '2026-09-07T09:30:00.000Z'
         )
       `;
@@ -91,7 +91,7 @@ layer("WorkflowCheckObservation", (it) => {
           data: {
             item: {
               type: "commandExecution",
-              command: "vp test run focused.test.ts",
+              command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
             },
           },
@@ -108,7 +108,7 @@ layer("WorkflowCheckObservation", (it) => {
           data: {
             item: {
               type: "commandExecution",
-              command: "vp test run focused.test.ts",
+              command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
               status: "completed",
               exitCode: 0,
@@ -128,12 +128,32 @@ layer("WorkflowCheckObservation", (it) => {
           data: {
             item: {
               type: "commandExecution",
-              command: "vp test run focused.test.ts",
+              command: "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs'",
               cwd: "/tmp/capability",
             },
           },
         },
       });
+      for (const [itemId, command] of [
+        ["double-quoted", '/bin/zsh -c "/tmp/node/bin/node --test test/check-summary.test.mjs"'],
+        [
+          "extra-command",
+          "/bin/zsh -c '/tmp/node/bin/node --test test/check-summary.test.mjs; git status'",
+        ],
+      ] as const) {
+        yield* recordWorkflowCheckObservation({
+          ...base,
+          itemId: RuntimeItemId.make(itemId),
+          type: "item.started",
+          eventId: EventId.make(`${itemId}-started`),
+          createdAt: "2026-09-07T10:00:02.000Z",
+          payload: {
+            itemType: "command_execution",
+            status: "inProgress",
+            data: { item: { type: "commandExecution", command, cwd: "/tmp/capability" } },
+          },
+        });
+      }
 
       const rows = yield* sql<{
         readonly lifecycle: string;
@@ -149,13 +169,13 @@ layer("WorkflowCheckObservation", (it) => {
         {
           lifecycle: "started",
           providerInstanceId: "codex-review",
-          command: "vp test run focused.test.ts",
+          command: "/tmp/node/bin/node --test test/check-summary.test.mjs",
           exitCode: null,
         },
         {
           lifecycle: "completed",
           providerInstanceId: "codex-review",
-          command: "vp test run focused.test.ts",
+          command: "/tmp/node/bin/node --test test/check-summary.test.mjs",
           exitCode: 0,
         },
       ]);

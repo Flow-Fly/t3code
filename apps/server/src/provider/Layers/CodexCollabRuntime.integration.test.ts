@@ -28,6 +28,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 const ROOT = wireFixture.rootThreadId;
 const [CHILD_A, CHILD_B] = wireFixture.childThreadIds as [string, string];
+const COORDINATOR = "review-coordinator-thread";
 const MEMORY = "memory-consolidation-thread";
 const decodeMcpElicitationResponse = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
@@ -166,8 +167,9 @@ const peerPath = NodePath.join(
 );
 
 describe("CodexSessionRuntime collab integration", () => {
-  it.effect("looks up child model metadata once after activity registration", () =>
+  it.effect("looks up child model and exact parent metadata after activity registration", () =>
     Effect.gen(function* () {
+      assert.equal(capturedStartedActivity().params.threadId, ROOT);
       const script = {
         rootThreadId: ROOT,
         recordRequests: true,
@@ -185,7 +187,22 @@ describe("CodexSessionRuntime collab integration", () => {
           capturedSpawnedThread(ROOT),
         ],
         childResumeSnapshots: {
-          [CHILD_A]: { model: "gpt-5.6-luna", reasoningEffort: "low" },
+          [CHILD_A]: {
+            model: "gpt-5.6-luna",
+            reasoningEffort: "low",
+            thread: {
+              parentThreadId: COORDINATOR,
+              source: {
+                subAgent: {
+                  thread_spawn: {
+                    agent_path: "/root/model-check",
+                    depth: 1,
+                    parent_thread_id: COORDINATOR,
+                  },
+                },
+              },
+            },
+          },
         },
       };
       // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -224,6 +241,7 @@ describe("CodexSessionRuntime collab integration", () => {
         agentThreadId: CHILD_A,
         model: "gpt-5.6-luna",
         effort: "low",
+        parentThreadId: COORDINATOR,
       });
       assert.deepEqual(readRecordedRequests(), [
         {
@@ -276,6 +294,7 @@ describe("CodexSessionRuntime collab integration", () => {
           [CHILD_A]: {
             model: "stale-snapshot",
             reasoningEffort: "low",
+            thread: { parentThreadId: COORDINATOR },
             notifications: [statusChanged],
           },
         },
@@ -321,6 +340,7 @@ describe("CodexSessionRuntime collab integration", () => {
         agentThreadId: CHILD_A,
         model: "child-rerouted",
         effort: "high",
+        parentThreadId: ROOT,
       });
       assert.isTrue(
         events.some(

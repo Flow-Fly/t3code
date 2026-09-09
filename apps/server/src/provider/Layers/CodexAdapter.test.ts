@@ -1075,6 +1075,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
           turnId: asTurnId("turn-1"),
           payload: {
             agentThreadId: "child-model",
+            parentThreadId: "parent-model",
             agentPath: "/root/model-check",
             model: " gpt-5.6-sol ",
             effort: " high ",
@@ -1117,6 +1118,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         const payload = event.payload as Record<string, unknown>;
         NodeAssert.equal(payload.model, "gpt-5.6-sol");
         NodeAssert.equal(payload.effort, "high");
+        NodeAssert.equal(payload.parentAgentId, "parent-model");
       }
 
       const metadataPayload = events[8]?.payload as Record<string, unknown>;

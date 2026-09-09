@@ -106,6 +106,7 @@ rl.on("line", (line) => {
             ...fixture.responses.threadStart.thread,
             id: threadId,
             sessionId: threadId,
+            ...childSnapshot.thread,
           },
         },
       });

@@ -139,7 +139,11 @@ const decodeCodexTurnStartParamsWithCollaborationMode = Schema.decodeUnknownEffe
   CodexTurnStartParamsWithCollaborationMode,
 );
 const CodexChildResumeMetadata = Schema.Struct({
-  thread: Schema.Struct({ id: Schema.String }),
+  thread: Schema.Struct({
+    id: Schema.String,
+    parentThreadId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    source: Schema.optionalKey(Schema.Unknown),
+  }),
   model: Schema.String,
   reasoningEffort: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
@@ -935,6 +939,7 @@ function collabChildIdentity(
     ...(child.nickname ? { nickname: child.nickname } : {}),
     ...(child.role ? { role: child.role } : {}),
     ...(child.agentPath ? { agentPath: child.agentPath } : {}),
+    ...(child.parentThreadId ? { parentThreadId: child.parentThreadId } : {}),
     ...(metadata?.model ? { model: metadata.model } : {}),
     ...(metadata?.effort ? { effort: metadata.effort } : {}),
   };
@@ -948,7 +953,19 @@ function nonEmptyMetadataValue(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function readThreadSpawnSource(thread: { readonly source: unknown }):
+function exactResumeParentThreadId(thread: {
+  readonly id: string;
+  readonly parentThreadId?: string | null;
+  readonly source?: unknown;
+}) {
+  const sourceParent = readThreadSpawnSource(thread)?.parentThreadId;
+  const directParent = nonEmptyMetadataValue(thread.parentThreadId);
+  if (sourceParent && directParent && sourceParent !== directParent) return undefined;
+  const parentThreadId = sourceParent ?? directParent;
+  return parentThreadId && parentThreadId !== thread.id ? parentThreadId : undefined;
+}
+
+function readThreadSpawnSource(thread: { readonly source?: unknown }):
   | {
       nickname: string | undefined;
       role: string | undefined;
@@ -1395,7 +1412,7 @@ export const makeCodexSessionRuntime = (
               }
               const model = nonEmptyMetadataValue(response.model);
               const effort = nonEmptyMetadataValue(response.reasoningEffort);
-              const changed = yield* updateCollabChildMetadata(
+              const metadataChanged = yield* updateCollabChildMetadata(
                 agentThreadId,
                 {
                   ...(model ? { model } : {}),
@@ -1403,7 +1420,17 @@ export const makeCodexSessionRuntime = (
                 },
                 false,
               );
-              if (changed) {
+              const parentThreadId = exactResumeParentThreadId(response.thread);
+              const parentChanged = parentThreadId
+                ? yield* Ref.modify(collabChildAgentsRef, (current) => {
+                    const previous = current.get(agentThreadId);
+                    if (!previous || previous.parentThreadId) return [false, current] as const;
+                    const next = new Map(current);
+                    next.set(agentThreadId, { ...previous, parentThreadId });
+                    return [true, next] as const;
+                  })
+                : false;
+              if (metadataChanged || parentChanged) {
                 yield* emitCollabChildMetadataUpdated(agentThreadId);
               }
             }),
